@@ -83,7 +83,46 @@ export default function DashboardPage() {
     router.push("/login");
   }
 
-  useEffect(() => () => clearIntervals(), []);
+  // 페이지 로드 시 활성 세션 복원
+  useEffect(() => {
+    async function restoreSession() {
+      try {
+        const res = await fetch("/api/session");
+        const data = await res.json();
+        if (data.status === "ready" && data.url) {
+          setSessionId(data.session_id);
+          setUrl(data.url);
+          setStatus("ready");
+        } else if (data.status === "starting" && data.session_id) {
+          setSessionId(data.session_id);
+          setStatus("starting");
+          // 폴링 재개
+          pollRef.current = setInterval(async () => {
+            try {
+              const r = await fetch(`/api/session/${data.session_id}`);
+              const d = await r.json();
+              if (d.status === "ready") {
+                setUrl(d.url);
+                setStatus("ready");
+                clearIntervals();
+              } else if (d.status === "error") {
+                setErrorMsg(d.message || "알 수 없는 오류");
+                setStatus("error");
+                clearIntervals();
+              }
+            } catch {
+              // keep polling
+            }
+          }, 3000);
+        }
+      } catch {
+        // 복원 실패 시 idle 유지
+      }
+    }
+    restoreSession();
+    return () => clearIntervals();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const progressPct = Math.min(elapsed * 3, 92);
 

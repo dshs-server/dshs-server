@@ -1,3 +1,14 @@
-.next/
-node_modules/
-.env.local
+# Dependencies
+frontend/node_modules/
+frontend/.next/
+
+# Env
+frontend/.env.local
+backend/.env
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

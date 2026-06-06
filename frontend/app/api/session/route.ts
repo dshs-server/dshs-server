@@ -3,6 +3,24 @@ import { NextResponse } from "next/server";
 const BACKEND_URL = process.env.BACKEND_URL!;
 const API_KEY = process.env.API_KEY!;
 
+export async function GET() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/session`, {
+      headers: { "x-api-key": API_KEY },
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      return NextResponse.json({ status: "none" });
+    }
+
+    return NextResponse.json(await res.json());
+  } catch (e) {
+    console.error("session get error:", e);
+    return NextResponse.json({ status: "none" });
+  }
+}
+
 export async function POST() {
   try {
     const res = await fetch(`${BACKEND_URL}/session`, {
