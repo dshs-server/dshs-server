@@ -126,10 +126,27 @@ bash ~/start_backend.sh
 
 ---
 
+## 세션 복원 동작 방식
+
+로그인 후 대시보드 진입 시 활성 세션을 자동으로 복원한다.
+
+### 런타임 중
+`session_store` (인메모리 dict)에 세션 정보 보관. `GET /session` 호출 시 dict 확인 후 Docker inspect로 컨테이너 실행 여부를 재검증한다.
+
+### 백엔드 재시작 후
+`lifespan` 훅에서 두 단계로 복원:
+1. `_cleanup_stopped_containers()` — exited/dead 상태 Kasm 컨테이너 자동 제거
+2. `_restore_session_from_container()` — `active_session` 컨테이너가 실행 중이면 `/tmp/session_cf.log`에서 cloudflared URL을 읽어 session_store 재구성
+
+### 보안 구조
+사용자 브라우저는 백엔드에 직접 접근 불가. Next.js API 라우트가 프록시 역할을 하며, 백엔드 호출 시 `x-api-key` 헤더를 주입한다. API 키는 Vercel 환경변수에만 저장되어 브라우저에 노출되지 않는다.
+
+---
+
 ## 알려진 이슈 및 미결 사항
 
 - Quick Tunnel 재시작 시 URL이 바뀌므로 Vercel `BACKEND_URL` 수동 업데이트 필요
-- `/tmp/runtime-ubuntu` 권한 문제 (chmod 755 임시 대책 적용 중)
-- 세션 정보가 인메모리 dict — 서버 재시작 시 초기화됨 (DB 연동 미완료)
+- 세션 정보가 인메모리 dict — 서버 재시작 시 `_restore_session_from_container()`로 복원되나 DB 연동 미완료
+- 실제 VNC 접속 여부(사용자가 브라우저로 접속 중인지)는 확인하지 않음 — 컨테이너 실행 여부만 체크
 - 스케줄러(자동 세션 회수) 미구현
 - 나머지 14대 노드 세팅 미완료

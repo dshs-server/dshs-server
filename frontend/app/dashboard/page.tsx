@@ -209,13 +209,7 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          {/* Checking state */}
-          {status === "checking" && (
-            <div style={{ display: "flex", alignItems: "center", gap: "12px", color: "#718096" }}>
-              <Spinner />
-              <span>세션 상태를 확인하는 중...</span>
-            </div>
-          )}
+          {/* Checking state: 아무것도 표시하지 않음 */}
 
           {/* Idle state */}
           {status === "idle" && (
