@@ -21,9 +21,16 @@ export async function GET() {
   }
 }
 
-export async function POST() {
+export async function POST(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const resume = searchParams.get("resume");
+  const backendPath =
+    resume === "true"
+      ? `${BACKEND_URL}/session?resume=true`
+      : `${BACKEND_URL}/session`;
+
   try {
-    const res = await fetch(`${BACKEND_URL}/session`, {
+    const res = await fetch(backendPath, {
       method: "POST",
       headers: { "x-api-key": API_KEY },
     });

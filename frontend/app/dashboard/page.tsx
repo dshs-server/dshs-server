@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 
-type Status = "checking" | "idle" | "starting" | "ready" | "error";
+type Status = "checking" | "idle" | "suspended" | "starting" | "ready" | "error";
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -19,6 +19,26 @@ export default function DashboardPage() {
   function clearIntervals() {
     if (pollRef.current) clearInterval(pollRef.current);
     if (timerRef.current) clearInterval(timerRef.current);
+  }
+
+  function startPolling(session_id: string) {
+    pollRef.current = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/session/${session_id}`);
+        const data = await r.json();
+        if (data.status === "ready") {
+          setUrl(data.url);
+          setStatus("ready");
+          clearIntervals();
+        } else if (data.status === "error") {
+          setErrorMsg(data.message || "알 수 없는 오류");
+          setStatus("error");
+          clearIntervals();
+        }
+      } catch {
+        // keep polling
+      }
+    }, 3000);
   }
 
   async function handleRent() {
@@ -38,26 +58,32 @@ export default function DashboardPage() {
       }
       const { session_id } = await res.json();
       setSessionId(session_id);
+      startPolling(session_id);
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e instanceof Error ? e.message : "오류 발생");
+      clearIntervals();
+    }
+  }
 
-      // Poll every 3 seconds for URL
-      pollRef.current = setInterval(async () => {
-        try {
-          const r = await fetch(`/api/session/${session_id}`);
-          const data = await r.json();
+  async function handleResume() {
+    setStatus("starting");
+    setErrorMsg(null);
+    setUrl(null);
+    setElapsed(0);
+    setSessionId(null);
 
-          if (data.status === "ready") {
-            setUrl(data.url);
-            setStatus("ready");
-            clearIntervals();
-          } else if (data.status === "error") {
-            setErrorMsg(data.message || "알 수 없는 오류");
-            setStatus("error");
-            clearIntervals();
-          }
-        } catch {
-          // keep polling
-        }
-      }, 3000);
+    timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
+
+    try {
+      const res = await fetch("/api/session?resume=true", { method: "POST" });
+      if (!res.ok) {
+        const d = await res.json();
+        throw new Error(d.error || "세션 재시작 실패");
+      }
+      const { session_id } = await res.json();
+      setSessionId(session_id);
+      startPolling(session_id);
     } catch (e) {
       setStatus("error");
       setErrorMsg(e instanceof Error ? e.message : "오류 발생");
@@ -72,7 +98,7 @@ export default function DashboardPage() {
     } catch {
       // ignore
     }
-    setStatus("idle");
+    setStatus("suspended");
     setSessionId(null);
     setUrl(null);
     clearIntervals();
@@ -97,24 +123,9 @@ export default function DashboardPage() {
         } else if (data.status === "starting" && data.session_id) {
           setSessionId(data.session_id);
           setStatus("starting");
-          // 폴링 재개
-          pollRef.current = setInterval(async () => {
-            try {
-              const r = await fetch(`/api/session/${data.session_id}`);
-              const d = await r.json();
-              if (d.status === "ready") {
-                setUrl(d.url);
-                setStatus("ready");
-                clearIntervals();
-              } else if (d.status === "error") {
-                setErrorMsg(d.message || "알 수 없는 오류");
-                setStatus("error");
-                clearIntervals();
-              }
-            } catch {
-              // keep polling
-            }
-          }, 3000);
+          startPolling(data.session_id);
+        } else if (data.status === "suspended") {
+          setStatus("suspended");
         }
       } catch {
         // 복원 실패 시 idle로
@@ -210,6 +221,60 @@ export default function DashboardPage() {
           </div>
 
           {/* Checking state: 아무것도 표시하지 않음 */}
+
+          {/* Suspended state */}
+          {status === "suspended" && (
+            <div>
+              <div
+                style={{
+                  background: "#fffbeb",
+                  border: "1px solid #f6e05e",
+                  borderRadius: "8px",
+                  padding: "16px",
+                  marginBottom: "20px",
+                  fontSize: "14px",
+                  color: "#744210",
+                }}
+              >
+                이전에 사용하던 데스크톱 환경이 저장되어 있습니다.
+                이어서 사용하거나 새로 시작할 수 있습니다.
+              </div>
+              <div style={{ display: "flex", gap: "12px" }}>
+                <button
+                  onClick={handleResume}
+                  style={{
+                    flex: 1,
+                    padding: "12px",
+                    background: "#3182ce",
+                    color: "white",
+                    border: "none",
+                    borderRadius: "8px",
+                    fontSize: "15px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  이어서 사용하기
+                </button>
+                <button
+                  onClick={handleRent}
+                  style={{
+                    flex: 1,
+                    padding: "12px",
+                    background: "transparent",
+                    color: "#e53e3e",
+                    border: "1px solid #fc8181",
+                    borderRadius: "8px",
+                    fontSize: "15px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  새로 시작하기
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Idle state */}
           {status === "idle" && (
