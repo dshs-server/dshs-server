@@ -3,20 +3,12 @@ import re
 import subprocess
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 API_KEY = os.environ.get("API_KEY", "dev-secret-change-me")
 
@@ -26,6 +18,78 @@ ACTIVE_CONTAINER = "active_session"
 
 # In-memory session store (single session MVP)
 session_store: dict = {}
+
+
+KASM_IMAGE = "kasmweb/ubuntu-jammy-desktop"
+
+
+def _cleanup_stopped_containers() -> list[str]:
+    """중단된 Kasm 컨테이너를 제거하고 삭제된 이름 목록을 반환한다."""
+    result = subprocess.run(
+        ["docker", "ps", "-a",
+         "--filter", f"ancestor={KASM_IMAGE}:1.16.0",
+         "--filter", "status=exited",
+         "--format", "{{.Names}}"],
+        capture_output=True, text=True,
+    )
+    # exited가 아닌 dead/created 상태도 포함
+    result2 = subprocess.run(
+        ["docker", "ps", "-a",
+         "--filter", f"ancestor={KASM_IMAGE}:1.16.0",
+         "--filter", "status=dead",
+         "--filter", "status=created",
+         "--format", "{{.Names}}"],
+        capture_output=True, text=True,
+    )
+    names = set(
+        (result.stdout + result2.stdout).strip().splitlines()
+    )
+    removed = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        r = subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        if r.returncode == 0:
+            removed.append(name)
+    return removed
+
+
+def _restore_session_from_container():
+    """서버 재시작 후 실행 중인 컨테이너가 있으면 session_store를 복원한다."""
+    check = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", ACTIVE_CONTAINER],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0 or check.stdout.strip() != "true":
+        return
+
+    session_id = uuid.uuid4().hex[:8]
+    url = _get_cf_url(SESSION_CF_LOG)
+    session_store[session_id] = {
+        "session_id": session_id,
+        "container": ACTIVE_CONTAINER,
+        "log_path": SESSION_CF_LOG,
+        "tunnel_url": url,
+        "created_at": time.time(),
+    }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _cleanup_stopped_containers()
+    _restore_session_from_container()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 async def require_key(x_api_key: str = Header(...)):
@@ -183,3 +247,10 @@ async def delete_session(session_id: str):
     session_store.clear()
 
     return {"status": "terminated"}
+
+
+@app.post("/admin/cleanup", dependencies=[Depends(require_key)])
+async def admin_cleanup():
+    """중단된 Kasm 컨테이너를 즉시 정리한다."""
+    removed = _cleanup_stopped_containers()
+    return {"removed": removed, "count": len(removed)}

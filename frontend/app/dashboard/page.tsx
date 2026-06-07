@@ -3,11 +3,11 @@
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 
-type Status = "idle" | "starting" | "ready" | "error";
+type Status = "checking" | "idle" | "starting" | "ready" | "error";
 
 export default function DashboardPage() {
   const router = useRouter();
-  const [status, setStatus] = useState<Status>("idle");
+  const [status, setStatus] = useState<Status>("checking");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -93,6 +93,7 @@ export default function DashboardPage() {
           setSessionId(data.session_id);
           setUrl(data.url);
           setStatus("ready");
+          return;
         } else if (data.status === "starting" && data.session_id) {
           setSessionId(data.session_id);
           setStatus("starting");
@@ -116,7 +117,9 @@ export default function DashboardPage() {
           }, 3000);
         }
       } catch {
-        // 복원 실패 시 idle 유지
+        // 복원 실패 시 idle로
+      } finally {
+        setStatus((prev) => (prev === "checking" ? "idle" : prev));
       }
     }
     restoreSession();
@@ -205,6 +208,14 @@ export default function DashboardPage() {
               </div>
             </div>
           </div>
+
+          {/* Checking state */}
+          {status === "checking" && (
+            <div style={{ display: "flex", alignItems: "center", gap: "12px", color: "#718096" }}>
+              <Spinner />
+              <span>세션 상태를 확인하는 중...</span>
+            </div>
+          )}
 
           {/* Idle state */}
           {status === "idle" && (
