@@ -12,6 +12,8 @@ from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 API_KEY = os.environ.get("API_KEY", "dev-secret-change-me")
+# 학교 내부망 직접 접속 URL. 설정 시 cloudflared 없이 이 URL을 세션 URL로 사용.
+SESSION_BASE_URL = os.environ.get("SESSION_BASE_URL")
 
 SESSION_CF_LOG = "/tmp/session_cf.log"
 SESSION_CF_PID = "/tmp/session_cf.pid"
@@ -68,6 +70,20 @@ def _is_container_exited(name: str) -> bool:
     return check.stdout.strip() == "exited"
 
 
+def _is_nginx_ready() -> bool:
+    """nginx가 Kasm 세션을 서빙 중인지 확인한다 (내부망 모드)."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "-H", "Authorization: Basic a2FzbV91c2VyOnRlc3QxMjM0",
+             "http://localhost:80/"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() == "200"
+    except Exception:
+        return False
+
+
 def _get_container_state(name: str) -> tuple[bool, bool]:
     """컨테이너의 (running, restarting) 상태를 반환한다."""
     check = subprocess.run(
@@ -115,7 +131,10 @@ def _restore_session_from_container():
         return
 
     session_id = uuid.uuid4().hex[:8]
-    url = _get_cf_url(SESSION_CF_LOG) if running else None
+    if SESSION_BASE_URL:
+        url = SESSION_BASE_URL if running else None
+    else:
+        url = _get_cf_url(SESSION_CF_LOG) if running else None
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
@@ -130,7 +149,8 @@ async def _monitor_and_restart():
     """컨테이너 재시작 및 cloudflared 장애를 감지하여 자동 복구한다."""
     while True:
         await asyncio.sleep(10)
-        if not session_store:
+        # 내부망 모드에서는 cloudflared 모니터링 불필요
+        if not session_store or SESSION_BASE_URL:
             continue
 
         _, s = next(iter(session_store.items()))
@@ -232,6 +252,11 @@ async def get_active_session():
         return {"status": "starting", "session_id": session_id}
 
     if s["tunnel_url"]:
+        if SESSION_BASE_URL:
+            # 내부망 모드: nginx가 실제로 응답하는지 확인
+            if _is_nginx_ready():
+                return {"status": "ready", "session_id": session_id, "url": s["tunnel_url"]}
+            return {"status": "starting", "session_id": session_id}
         return {"status": "ready", "session_id": session_id, "url": s["tunnel_url"]}
 
     url = _get_cf_url(s["log_path"])
@@ -264,14 +289,15 @@ async def create_session(resume: bool = Query(False)):
                     detail=f"docker start error: {result.stderr.strip()}",
                 )
         time.sleep(2)
-        _kill_session_cf()
-        _start_cf_tunnel()
+        if not SESSION_BASE_URL:
+            _kill_session_cf()
+            _start_cf_tunnel()
         session_store.clear()
         session_store[session_id] = {
             "session_id": session_id,
             "container": ACTIVE_CONTAINER,
             "log_path": SESSION_CF_LOG,
-            "tunnel_url": None,
+            "tunnel_url": SESSION_BASE_URL or None,
             "restarting": False,
             "created_at": time.time(),
         }
@@ -306,14 +332,15 @@ async def create_session(resume: bool = Query(False)):
     # Give container a moment to bind port before nginx retries
     time.sleep(2)
 
-    # Start cloudflared → nginx:80 → kasm
-    _start_cf_tunnel()
+    if not SESSION_BASE_URL:
+        # Start cloudflared → nginx:80 → kasm
+        _start_cf_tunnel()
 
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
         "log_path": SESSION_CF_LOG,
-        "tunnel_url": None,
+        "tunnel_url": SESSION_BASE_URL or None,
         "restarting": False,
         "created_at": time.time(),
     }
@@ -333,6 +360,11 @@ async def get_session(session_id: str):
         return {"status": "starting"}
 
     if s["tunnel_url"]:
+        if SESSION_BASE_URL:
+            # 내부망 모드: nginx가 실제로 응답하는지 확인
+            if _is_nginx_ready():
+                return {"status": "ready", "url": s["tunnel_url"]}
+            return {"status": "starting"}
         return {"status": "ready", "url": s["tunnel_url"]}
 
     url = _get_cf_url(s["log_path"])
