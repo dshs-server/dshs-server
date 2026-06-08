@@ -1,7 +1,7 @@
 # 학교 전산실 컴퓨팅 자원 대여 시스템 — 통합 설계 및 진행 기록
 
 > 설계 문서 + 노드 세팅 완료 기록 + Cloudflare Tunnel 테스트 진행 기록을 통합한 최종 문서입니다.
-> 마지막 업데이트: 2026-06-06 (§17 §18 §19 §20 §21 §22 §23 추가)
+> 마지막 업데이트: 2026-06-07 (§25 추가 — 세션 일시 중지·재개 구현 / §26 추가 — 학교망 DNS 차단 이슈)
 
 ---
 
@@ -30,6 +30,9 @@
 21. [Cloudflare Quick Tunnel 운영 방식 확정 (2026-06-06)](#21-cloudflare-quick-tunnel-운영-방식-확정-2026-06-06)
 22. [FastAPI 백엔드 구현 완료 (2026-06-06)](#22-fastapi-백엔드-구현-완료-2026-06-06)
 23. [Next.js 프론트엔드 구현 및 Vercel 배포 준비 (2026-06-06)](#23-nextjs-프론트엔드-구현-및-vercel-배포-준비-2026-06-06)
+24. [컨테이너 자동 재시작 및 모니터링 구현 (2026-06-07)](#24-컨테이너-자동-재시작-및-모니터링-구현-2026-06-07)
+25. [세션 일시 중지(Suspend) 및 재개(Resume) 구현 (2026-06-07)](#25-세션-일시-중지suspend-및-재개resume-구현-2026-06-07)
+26. [학교망 DNS 차단 이슈 및 VPN 우회 확인 (2026-06-07)](#26-학교망-dns-차단-이슈-및-vpn-우회-확인-2026-06-07)
 
 ---
 
@@ -1129,6 +1132,11 @@ docker exec -u abc test_gui bash /tmp/set_panels.sh
 - [ ] 나머지 14대 동일 세팅 적용 (스크립트화 예정)
 - [ ] 메인 서버(node01) 지정 및 SSH Key 배포 (14대에 `ssh-copy-id`)
 - [x] 섹션 생성 시 URL 자동 캡처 → DB 저장 → 포털 표시 구현 (2026-06-06, §22 §23)
+- [x] 컨테이너 내부 종료/재부팅 시 자동 재시작 (`--restart unless-stopped`) 구현 (2026-06-07, §24)
+- [x] cloudflared 장애 자동 복구 + 재시작 중 상태 모니터링 백그라운드 태스크 구현 (2026-06-07, §24)
+- [x] 세션 일시 중지(docker stop) 및 재개(docker start) 기능 구현 (2026-06-07, §25)
+- [x] 학교망 DNS가 `*.trycloudflare.com` 차단 이슈 확인 — VPN 우회로 해결 (2026-06-07, §26)
+- [ ] 고정 도메인 Named Tunnel 도입으로 학교망 VPN 의존성 해결
 - [ ] 24/7 운영을 위한 전산실 PC 전원 정책 확인 (학교 측 협의)
 
 ### 개발 전 결정 필요
@@ -1469,14 +1477,14 @@ def start_session_tunnel(node_ip: str, session_id: str) -> str:
 
 섹션이 만료되거나 컨테이너가 재시작되면, 포털에서 "재연결 중..." 후 새 URL을 다시 표시.
 
-### 현재 노드 운영 상태 (2026-06-06 기준)
+### 현재 노드 운영 상태 (2026-06-07 기준)
 
 | 항목 | 값 |
 |------|-----|
 | 노드 내부 IP | `10.72.117.24` |
 | nginx | 포트 80, 부팅 시 자동 시작 |
-| Kasm 컨테이너 | `--restart unless-stopped` |
-| cloudflared | Quick Tunnel, `nohup` 실행 (재부팅 시 수동 재시작 필요) |
+| Kasm 컨테이너 | `--restart unless-stopped` (컨테이너 내부 종료 시 Docker가 자동 재기동) |
+| cloudflared | Quick Tunnel, `nohup` 실행 (재부팅 시 수동 재시작 필요, 장애 시 백엔드 모니터링이 자동 복구) |
 | GDM | 영구 비활성화 (`multi-user.target`) |
 
 > **운영 시 개선 사항:** cloudflared를 systemd 서비스로 등록하면 재부팅 시 자동으로 새 URL을 발급하고, 백엔드가 이를 감지해 DB를 갱신하는 구조로 발전 가능.
@@ -1503,9 +1511,11 @@ backend/
 | 메서드 | 경로 | 설명 |
 |--------|------|------|
 | `GET` | `/health` | 헬스체크 |
+| `GET` | `/session` | 활성 세션 조회 (대시보드 진입 시 복원용) |
 | `POST` | `/session` | 컨테이너 생성 + 터널 시작 |
-| `GET` | `/session/{id}` | 세션 상태·URL 조회 |
+| `GET` | `/session/{id}` | 세션 상태·URL 조회 (starting / ready / error) |
 | `DELETE` | `/session/{id}` | 세션 종료 |
+| `POST` | `/admin/cleanup` | 중단된 Kasm 컨테이너 즉시 정리 |
 
 모든 엔드포인트는 `x-api-key` 헤더로 인증. 환경변수 `API_KEY`와 비교.
 
@@ -1514,7 +1524,7 @@ backend/
 ```
 1. 기존 session cloudflared 종료 (PID 파일 /tmp/session_cf.pid)
 2. 기존 컨테이너 삭제 (test_kasm, active_session)
-3. docker run kasmweb/ubuntu-jammy-desktop:1.16.0 -p 8080:6901
+3. docker run --restart unless-stopped kasmweb/ubuntu-jammy-desktop:1.16.0 -p 8080:6901
 4. cloudflared tunnel --url http://localhost:80 → /tmp/session_cf.log
 5. session_id 반환 (즉시)
 ```
@@ -1647,3 +1657,258 @@ npm run dev
 | URL 폴링 (3초 이내 ready) | ✅ |
 | 빌드 경고 없음 | ✅ |
 | GitHub 업로드 | ✅ |
+
+---
+
+## 24. 컨테이너 자동 재시작 및 모니터링 구현 (2026-06-07)
+
+### 배경
+
+사용자가 KasmVNC 데스크톱 안에서 `shutdown -h now` 또는 재시작 명령을 실행하면 컨테이너의 메인 프로세스가 종료된다. 기존에는 restart 정책이 `no`였기 때문에 컨테이너가 영구 중단되어 세션을 다시 생성해야 했다.
+
+### 해결책
+
+#### 1. Docker `--restart unless-stopped` 정책
+
+`create_session()` 의 `docker run` 명령에 `--restart unless-stopped` 추가.
+
+```bash
+docker run -d \
+  --name active_session \
+  --restart unless-stopped \   # 추가
+  --gpus all \
+  --shm-size=2gb \
+  -p 8080:6901 \
+  -e VNC_PW=test1234 \
+  kasmweb/ubuntu-jammy-desktop:1.16.0
+```
+
+**`unless-stopped` 동작 규칙:**
+
+| 종료 원인 | 재시작 여부 |
+|-----------|------------|
+| 컨테이너 내부 프로세스 자체 종료 (사용자 shutdown/reboot) | ✅ 자동 재시작 |
+| `docker stop container` (외부 명령) | ❌ 재시작 안 함 |
+| `docker rm -f container` (세션 종료 API) | ❌ 컨테이너 삭제 |
+
+→ 사용자의 데스크톱 내 종료는 자동 재기동되고, 관리자/포털의 명시적 종료는 정상 작동.
+
+> **검증:** alpine 컨테이너로 내부 프로세스 종료 테스트 → `RestartCount: 1`, `Status: running` 확인 ✅
+
+#### 2. 백그라운드 모니터링 태스크 (`_monitor_and_restart`)
+
+FastAPI `lifespan` 훅에서 `asyncio.create_task()`로 시작. 10초 주기로 실행.
+
+```
+컨테이너 상태 확인 (docker inspect)
+  ├─ Restarting == true
+  │    └─ session_store["restarting"] = True
+  │         → GET /session → {"status": "starting"}  (포털 로딩 화면 표시)
+  │
+  └─ Running == true
+       ├─ restarting 플래그가 True였던 경우
+       │    └─ 로그에서 URL 복원, restarting = False
+       │         → GET /session → {"status": "ready", "url": ...}
+       │
+       └─ cloudflared 프로세스가 죽은 경우
+            └─ cloudflared 재시작 (새 로그, 새 URL)
+                 session_store["tunnel_url"] = None, restarting = True
+                 → 새 URL 발급 후 ready 전환
+```
+
+#### 3. session_store 구조 변경
+
+```python
+session_store[session_id] = {
+    "session_id": session_id,
+    "container": "active_session",
+    "log_path": "/tmp/session_cf.log",
+    "tunnel_url": str | None,   # None이면 로그에서 재파싱
+    "restarting": bool,         # True: 재시작 중 → starting 반환
+    "created_at": float,
+}
+```
+
+#### 4. 신규/변경 헬퍼 함수
+
+| 함수 | 역할 |
+|------|------|
+| `_get_container_state(name)` | `(running: bool, restarting: bool)` 반환 |
+| `_is_cf_alive()` | PID 파일로 cloudflared 생존 여부 확인 |
+| `_start_cf_tunnel()` | 로그 초기화 후 cloudflared Popen, PID 파일 기록 |
+
+#### 5. `_restore_session_from_container()` 개선
+
+기존: `Running == true`인 경우에만 복원.  
+변경: `Running == true` **또는** `Restarting == true`인 경우에도 복원. 재시작 중이면 `tunnel_url = None`, `restarting = True`로 저장.
+
+#### 6. GET 엔드포인트 개선
+
+`GET /session`과 `GET /session/{id}` 모두 `restarting` 플래그를 우선 확인한다.
+- `restarting == True` → `{"status": "starting", ...}` 반환 (URL 무효 기간 동안 폴링 유도)
+- docker inspect에서 `Restarting` 감지 시에도 `"starting"` 반환 (`"none"` 또는 `"error"` 반환 방지)
+
+### 사용자 경험 흐름
+
+```
+[평상시]
+사용자 → KasmVNC 데스크톱 shutdown/reboot 실행
+  → 컨테이너 프로세스 종료 (exit code 0 or non-zero)
+  → Docker: --restart unless-stopped → 즉시 재기동 시작 (Restarting 상태)
+  → 모니터링 태스크: restarting = True 감지
+  → 포털 새로고침 → GET /session → {"status": "starting"}
+  → 프로그레스 바 + 폴링 시작
+  → 컨테이너 재기동 완료 (~30-60초)
+  → 모니터링 태스크: running 감지, URL 복원
+  → GET /session/{id} 폴링 → {"status": "ready", "url": "https://..."}
+  → 동일 URL로 접속 재개 (cloudflared 유지되어 URL 불변)
+```
+
+### 현재 운영 상태 (2026-06-07 기준)
+
+| 항목 | 값 |
+|------|-----|
+| `active_session` restart 정책 | `unless-stopped` (기존 컨테이너 `docker update`로 즉시 적용) |
+| 모니터링 주기 | 10초 |
+| cloudflared 자동 복구 | ✅ (running 중 dead 감지 → 자동 재시작) |
+| 내부 종료 → 자동 재기동 | ✅ (검증 완료) |
+| 포털 새로고침 후 상태 반영 | ✅ |
+
+---
+
+## 25. 세션 일시 중지(Suspend) 및 재개(Resume) 구현 (2026-06-07)
+
+### 배경
+
+기존 "세션 종료" 동작은 `docker rm -f active_session`으로 컨테이너를 완전 삭제했다. 사용자가 설치한 패키지, 작업 중이던 파일 등 컨테이너 레이어에 저장된 데이터가 모두 사라지는 문제가 있었다.
+
+> `/data/students/{id}:/config` 볼륨이 없는 현재 MVP 구조에서는 컨테이너 레이어가 유일한 저장소이므로 삭제 시 데이터 완전 소멸.
+
+### 해결: docker stop → docker start
+
+| 동작 | 기존 | 변경 후 |
+|------|------|---------|
+| 세션 종료 (포털 버튼) | `docker rm -f active_session` | `docker stop active_session` |
+| 재사용 | 새 컨테이너 생성 필요 | `docker start active_session` |
+| 데이터 보존 | ❌ | ✅ |
+
+### 세션 상태 추가: `suspended`
+
+`GET /session` 응답에 새 상태 추가:
+
+```json
+{"status": "suspended"}
+```
+
+감지 방법: `docker inspect -f '{{.State.Status}}' active_session` → `"exited"` 이면 suspended 반환.
+
+### API 변경
+
+#### DELETE /session/{id} — 일시 중지
+
+```python
+# 변경 전
+subprocess.run(["docker", "rm", "-f", ACTIVE_CONTAINER])
+
+# 변경 후
+subprocess.run(["docker", "stop", ACTIVE_CONTAINER])
+return {"status": "suspended"}
+```
+
+#### POST /session?resume=true — 재개
+
+```python
+# docker start로 기존 컨테이너 재기동
+subprocess.run(["docker", "start", ACTIVE_CONTAINER])
+time.sleep(2)
+_kill_session_cf()
+_start_cf_tunnel()   # 새 cloudflared URL 발급
+```
+
+#### POST /session (resume=false, 기본값) — 새 세션
+
+기존과 동일: `docker rm -f` → `docker run` (기존 컨테이너 삭제 후 새 생성).
+
+### 프론트엔드 변경
+
+**`Status` 타입 추가:**
+```typescript
+type Status = "checking" | "idle" | "suspended" | "starting" | "ready" | "error";
+```
+
+**`suspended` 상태 UI:**
+
+```
+┌─────────────────────────────────────────┐
+│ ⚠ 이전에 사용하던 데스크톱 환경이       │
+│   저장되어 있습니다.                     │
+├────────────────┬────────────────────────┤
+│ 이어서 사용하기 │    새로 시작하기        │
+└────────────────┴────────────────────────┘
+```
+
+- **이어서 사용하기**: `POST /api/session?resume=true` → cloudflared URL 재발급 후 폴링
+- **새로 시작하기**: `POST /api/session` → 기존 컨테이너 삭제 후 새 생성
+- 세션 종료 후 상태: `"idle"` → `"suspended"` (바로 선택 UI 표시)
+
+### 백엔드 재시작 시 suspended 상태 보존
+
+`_cleanup_stopped_containers()` 함수가 기존에는 exited 상태 Kasm 컨테이너를 모두 삭제했다. `active_session`을 예외 처리해 일시 중지 상태를 보존하도록 변경:
+
+```python
+for name in names:
+    if not name or name == ACTIVE_CONTAINER:   # active_session 보존
+        continue
+    subprocess.run(["docker", "rm", "-f", name])
+```
+
+---
+
+## 26. 학교망 DNS 차단 이슈 및 VPN 우회 확인 (2026-06-07)
+
+### 증상
+
+포털에서 "데스크톱이 준비되었습니다!" 표시 후 URL 클릭 시:
+
+```
+xxx.trycloudflare.com의 서버 IP 주소를 찾을 수 없습니다.
+ERR_NAME_NOT_RESOLVED
+```
+
+### 원인
+
+학교 네트워크 DNS 리졸버가 `*.trycloudflare.com` 도메인 조회를 차단한다.
+
+**왜 백엔드 API는 정상 동작하는가?**
+
+| 구간 | DNS 조회 주체 | 차단 영향 |
+|------|--------------|----------|
+| 사용자 브라우저 → Vercel | 사용자 PC DNS | `vercel.app` → 정상 |
+| Vercel → 백엔드 Quick Tunnel | Vercel 서버 DNS | 학교망 무관 → 정상 |
+| 사용자 브라우저 → 세션 VNC URL | 사용자 PC DNS | `trycloudflare.com` → **차단** |
+
+세션 VNC URL만 사용자 브라우저가 직접 접근하므로 학교 DNS 차단의 영향을 받는다.
+
+### 확인 과정
+
+1. 서버에서 `curl https://xxx.trycloudflare.com` → **200 정상** (서버 DNS는 차단 안 됨)
+2. 학교망 PC 브라우저에서 동일 URL → **ERR_NAME_NOT_RESOLVED**
+3. VPN 켠 후 동일 URL → **정상 접속 확인** ✅
+
+### 현재 해결 방법
+
+VPN을 켜고 접속. cloudflared outbound 터널은 정상 동작하므로 DNS만 우회하면 됨.
+
+### 시도했다가 취소한 방법: 내부망 직접 접속
+
+`SESSION_BASE_URL=http://10.72.117.24` 환경변수를 추가해 cloudflared 없이 서버 내부 IP를 직접 세션 URL로 사용하는 방식을 구현했으나, **학교 VLAN/스위치 ACL이 해당 IP/포트도 차단**하는 것으로 확인되어 제거했다.
+
+> §20에서 내부망 직접 접속이 학생 PC → 노드 PC 구간에서 차단됨을 이미 기록한 바 있음.
+
+### 장기 해결 방향
+
+고정 도메인을 사용하는 **Cloudflare Named Tunnel**으로 전환:
+- Quick Tunnel과 달리 직접 등록한 도메인(예: `dshs-session.example.com`)을 사용
+- 학교 DNS 차단 가능성 낮음 (일반 도메인이므로)
+- 재시작 시 URL 변경 문제도 해결
+- 조건: Cloudflare에 도메인 등록 필요 (`.com` 연 ~$10)
