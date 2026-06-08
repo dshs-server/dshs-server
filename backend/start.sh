@@ -16,8 +16,8 @@ fi
 # Install Python dependencies if needed
 pip3 install -q -r "$SCRIPT_DIR/requirements.txt"
 
-# Export API key (change this before production!)
-export API_KEY="${API_KEY:-dev-secret-change-me}"
+# Export API key — Vercel의 API_KEY 환경변수와 반드시 동일해야 함
+export API_KEY="${API_KEY:-pc-rental-secret-2024}"
 
 echo "Starting FastAPI backend on port $BACKEND_PORT ..."
 cd "$SCRIPT_DIR"

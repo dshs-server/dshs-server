@@ -124,7 +124,7 @@ bash ~/start_backend.sh
 | GPU | NVIDIA RTX 3080 |
 | OS | Ubuntu (GDM 비활성화, multi-user.target) |
 | 컨테이너 이미지 | `kasmweb/ubuntu-jammy-desktop:1.16.0` |
-| 접속 URL (교내) | `http://10.72.117.24/` |
+| 내부망 IP 직접 접속 | 학교 VLAN/ACL로 차단됨 — 사용 불가 |
 
 ---
 
