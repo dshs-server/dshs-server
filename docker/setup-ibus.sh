@@ -8,6 +8,5 @@ if ! pgrep -x ibus-daemon > /dev/null; then
 fi
 
 # Hangul 엔진 등록 + Shift+Space 토글
-dconf write /desktop/ibus/general/preload-engines "['xkb:us::eng', 'hangul']"
+dconf write /desktop/ibus/general/preload-engines "['hangul']"
 dconf write /desktop/ibus/general/use-global-engine true
-dconf write /desktop/ibus/general/hotkey/trigger "['<Shift>space', 'Hangul']"
