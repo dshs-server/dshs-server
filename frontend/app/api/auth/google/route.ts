@@ -1,36 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import crypto from "crypto";
+import { makeToken, COOKIE_NAME } from "@/lib/auth";
+
+// ⚠️ 개발용 우회: Google OAuth 절차를 생략하고 바로 로그인 처리한다.
+//   버튼 클릭 → 더미 계정으로 세션 쿠키 발급 → 대시보드 이동.
+//   실제 운영 복구 시 이 파일을 git 이전 버전으로 되돌릴 것.
+const DEV_EMAIL = process.env.DEV_LOGIN_EMAIL || "dev@ts.hs.kr";
 
 export async function GET(request: NextRequest) {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  if (!clientId) {
-    return NextResponse.redirect(
-      new URL("/login?error=config", request.nextUrl.origin)
-    );
-  }
-
-  const redirectUri = `${request.nextUrl.origin}/api/auth/callback`;
-  const state = crypto.randomBytes(16).toString("hex");
-  const domain = process.env.ALLOWED_DOMAIN || "ts.hs.kr";
-
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    response_type: "code",
-    scope: "openid email profile",
-    state,
-    access_type: "online",
-    prompt: "select_account",
-    hd: domain, // 학교 도메인 힌트 (계정 선택 시 해당 도메인 우선)
-  });
-
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-  const response = NextResponse.redirect(authUrl);
-  response.cookies.set("g_oauth_state", state, {
+  const origin = request.nextUrl.origin;
+  const response = NextResponse.redirect(new URL("/dashboard", origin));
+  response.cookies.set(COOKIE_NAME, makeToken(DEV_EMAIL), {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
-    maxAge: 600,
+    maxAge: 60 * 60 * 8,
     path: "/",
   });
   return response;
