@@ -1,29 +1,57 @@
 import crypto from "crypto";
 import { cookies } from "next/headers";
 
-const COOKIE_NAME = "pc_rental_auth";
+export const COOKIE_NAME = "pc_rental_auth";
 
-function makeToken(username: string): string {
+/**
+ * 쿠키 토큰 형식: `<hmac>.<urlencoded-email>`
+ *  - hmac 은 email 에 대한 HMAC-SHA256 (hex, 64자, 점 없음)
+ *  - email 은 점을 포함할 수 있으므로 첫 번째 '.' 를 구분자로 사용
+ */
+function sign(email: string): string {
   return crypto
     .createHmac("sha256", process.env.AUTH_SECRET!)
-    .update(username)
+    .update(email)
     .digest("hex");
 }
 
-export function isValidCredentials(username: string, password: string): boolean {
-  return (
-    username === process.env.ADMIN_USERNAME &&
-    password === process.env.ADMIN_PASSWORD
-  );
+export function makeToken(email: string): string {
+  return `${sign(email)}.${encodeURIComponent(email)}`;
 }
 
-export async function setAuthCookie(username: string): Promise<void> {
+/** 토큰을 검증하고 유효하면 email 을, 아니면 null 을 반환한다. */
+export function verifyToken(token: string | undefined): string | null {
+  if (!token || !process.env.AUTH_SECRET) return null;
+  const sep = token.indexOf(".");
+  if (sep <= 0) return null;
+
+  const sig = token.slice(0, sep);
+  let email: string;
+  try {
+    email = decodeURIComponent(token.slice(sep + 1));
+  } catch {
+    return null;
+  }
+
+  const expected = sign(email);
+  if (sig.length !== expected.length) return null;
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return email;
+}
+
+export async function setAuthCookie(email: string): Promise<void> {
   const cookieStore = await cookies();
-  cookieStore.set(COOKIE_NAME, makeToken(username), {
+  cookieStore.set(COOKIE_NAME, makeToken(email), {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
-    maxAge: 60 * 60 * 24, // 1 day
+    maxAge: 60 * 60 * 8, // 8시간
     path: "/",
   });
 }
@@ -33,7 +61,24 @@ export async function clearAuthCookie(): Promise<void> {
   cookieStore.delete(COOKIE_NAME);
 }
 
-export function verifyToken(token: string): boolean {
-  const expected = makeToken(process.env.ADMIN_USERNAME!);
-  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+/** 현재 로그인한 사용자의 email 을 반환 (서버 컴포넌트/라우트용). */
+export async function getSessionEmail(): Promise<string | null> {
+  const cookieStore = await cookies();
+  return verifyToken(cookieStore.get(COOKIE_NAME)?.value);
+}
+
+/** 허용 도메인(@ts.hs.kr 등) 여부. */
+export function isAllowedDomain(email: string): boolean {
+  const domain = (process.env.ALLOWED_DOMAIN || "ts.hs.kr").toLowerCase();
+  return email.toLowerCase().endsWith(`@${domain}`);
+}
+
+/** 관리자 email 여부. ADMIN_EMAILS 는 쉼표로 구분. */
+export function isAdmin(email: string | null): boolean {
+  if (!email) return false;
+  const admins = (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return admins.includes(email.toLowerCase());
 }
