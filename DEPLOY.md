@@ -1,57 +1,61 @@
 # PC 대여 시스템 배포 가이드
 
-## 현재 상태 (2026-06-07 기준)
+## 현재 상태 (2026-06-27 기준)
 - ✅ 백엔드 (FastAPI) — 서버에서 실행 중
-- ✅ cloudflared 백엔드 터널 — 실행 중
+- ✅ Cloudflare Named Tunnel — `api.dshs-app.net` + `kasm.dshs-app.net` (고정, 재부팅 후에도 유지)
 - ✅ 프론트엔드 (Next.js) — Vercel 배포 완료
+- ✅ 학교망 DNS 차단 문제 해결 완료 (VPN 불필요)
 
 ---
 
 ## 1. 서버 백엔드 시작/재시작
 
-서버가 재부팅되면 백엔드와 cloudflared를 다시 시작해야 합니다.
-**반드시 `~/start_backend.sh`를 사용할 것** — 직접 uvicorn을 실행하면 `API_KEY`가 기본값으로 설정되어 프론트엔드 인증이 실패합니다.
+서버가 재부팅되면 `backend.service`와 `kasm-tunnel.service`가 자동 시작된다. 수동으로 재시작할 경우:
 
 ```bash
-ssh student3@100.115.25.22
-# 비밀번호: BOS123!@#
+ssh admin-swai@100.87.162.103
+# 비밀번호: asdwsx12!
 
+# FastAPI 재시작
 bash ~/start_backend.sh
+
+# Named Tunnel 재시작
+sudo systemctl restart kasm-tunnel
+
+# 상태 확인
+sudo systemctl status backend kasm-tunnel nginx
 ```
 
-출력 예시:
-```
-FastAPI OK
-=========================================
-BACKEND_URL=https://xxxx.trycloudflare.com
-Vercel 환경변수에 위 URL을 설정하세요.
-=========================================
-```
+**BACKEND_URL은 고정** (`https://api.dshs-app.net`) — Vercel 업데이트 불필요.
 
 ---
 
-## 2. Vercel 환경변수 설정
+## 2. Vercel 환경변수 (최초 1회 설정 후 변경 불필요)
 
-Vercel 대시보드 → 프로젝트 → Settings → Environment Variables 에 아래 추가:
-
-| 변수명 | 값 | 비고 |
-|--------|-----|------|
-| `BACKEND_URL` | `https://xxxx.trycloudflare.com` | start_backend.sh 출력값 |
-| `API_KEY` | `pc-rental-secret-2024` | 백엔드 API 키 |
-| `ADMIN_USERNAME` | `admin` | 포털 로그인 아이디 |
-| `ADMIN_PASSWORD` | `admin1234` | 포털 로그인 비밀번호 |
-| `AUTH_SECRET` | `pc-rental-auth-secret-super-random-2024` | 세션 쿠키 서명 키 |
+| 변수명 | 값 |
+|--------|-----|
+| `BACKEND_URL` | `https://api.dshs-app.net` |
+| `API_KEY` | `pc-rental-secret-2024` |
+| `ADMIN_USERNAME` | `admin` |
+| `ADMIN_PASSWORD` | `admin1234` |
+| `AUTH_SECRET` | `pc-rental-auth-secret-super-random-2024` |
 
 ---
 
-## 3. 서버 재시작 후 BACKEND_URL 업데이트
+## 3. Cloudflare Named Tunnel 정보
 
-Quick Tunnel은 재시작 시 URL이 바뀝니다.
+| 항목 | 값 |
+|------|-----|
+| Tunnel ID | `a3e0c5e1-b71c-48f4-991a-5f3ec4810229` |
+| 도메인 | `dshs-app.net` |
+| 백엔드 URL | `https://api.dshs-app.net` → `localhost:8000` |
+| 세션 VNC URL | `https://kasm.dshs-app.net` → `localhost:80` (nginx) |
+| Zone ID | `d3b89064edaac87902c2458740a78a55` |
+| Account ID | `89d76756960a4356d238c59ba78003c7` |
+| 서버 설정 파일 | `~/.cloudflared/config.yml` |
+| systemd 서비스 | `kasm-tunnel.service` |
 
-1. 서버에서 `bash ~/start_backend.sh` 실행
-2. 새 BACKEND_URL 복사
-3. Vercel 대시보드 → Environment Variables → `BACKEND_URL` 수정
-4. "Redeploy" 버튼 클릭
+터널 재생성이 필요할 경우 → CLAUDE.md "새 서버 초기 설정 가이드" 참고.
 
 ---
 
@@ -80,29 +84,26 @@ npm run dev
 
 ---
 
-## 6. 학교망 접속 주의사항
-
-학교 네트워크 DNS가 `*.trycloudflare.com`을 차단합니다.
-
-- **백엔드 API**: Vercel 서버가 서버측 호출 → 영향 없음 ✅
-- **세션 VNC URL**: 사용자 브라우저 직접 접근 → DNS 차단 ❌
-
-**해결 방법**: VPN을 켜고 접속.
-내부망 직접 접속(`http://10.72.117.24/`)은 학교 VLAN/ACL로 차단되어 사용 불가.
-
----
-
 ## 시스템 구조
 
 ```
 [학생 브라우저]
     → Vercel (Next.js 프론트엔드)
         → Next.js API 라우트 (프록시)
-            → cloudflared Quick Tunnel (백엔드용)
+            → Cloudflare Named Tunnel (api.dshs-app.net)
                 → FastAPI 백엔드 (서버 포트 8000)
                     → docker run (Kasm 컨테이너 포트 8080→6901)
-                    → cloudflared Quick Tunnel (세션용)
-                        → nginx 포트 80 (Authorization 자동 주입)
-                            → Kasm KasmVNC 스트리밍
-[URL 반환] → 학생에게 표시 (VPN 필요)
+
+[학생 브라우저]
+    → Cloudflare Named Tunnel (kasm.dshs-app.net)
+        → nginx 포트 80 (Authorization 헤더 자동 주입)
+            → Kasm KasmVNC 스트리밍
 ```
+
+### 서버에서 실행 중인 서비스 (systemd)
+| 서비스 | 역할 |
+|--------|------|
+| `backend.service` | FastAPI uvicorn (포트 8000) |
+| `kasm-tunnel.service` | Cloudflare Named Tunnel (api + kasm) |
+| `nginx` | Kasm 역방향 프록시 (포트 80 → 8080) |
+| `docker` | Kasm 컨테이너 실행 환경 |

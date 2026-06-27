@@ -1,21 +1,17 @@
 import asyncio
 import os
-import re
 import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 API_KEY = os.environ.get("API_KEY", "dev-secret-change-me")
 
-SESSION_CF_LOG = "/tmp/session_cf.log"
-SESSION_CF_PID = "/tmp/session_cf.pid"
 ACTIVE_CONTAINER = "active_session"
+SESSION_URL = "https://kasm.dshs-app.net"
 
 # In-memory session store (single session MVP)
 session_store: dict = {}
@@ -84,31 +80,6 @@ def _get_container_state(name: str) -> tuple[bool, bool]:
         return False, False
 
 
-def _is_cf_alive() -> bool:
-    """cloudflared 프로세스가 살아있는지 확인한다."""
-    pid_file = Path(SESSION_CF_PID)
-    if not pid_file.exists():
-        return False
-    try:
-        pid = int(pid_file.read_text().strip())
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError, ProcessLookupError):
-        return False
-
-
-def _start_cf_tunnel():
-    """cloudflared Quick Tunnel을 시작하고 PID를 기록한다."""
-    Path(SESSION_CF_LOG).unlink(missing_ok=True)
-    with open(SESSION_CF_LOG, "w") as log_f:
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", "http://localhost:80"],
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-        )
-    Path(SESSION_CF_PID).write_text(str(proc.pid))
-
-
 def _restore_session_from_container():
     """서버 재시작 후 실행 중인 컨테이너가 있으면 session_store를 복원한다."""
     running, restarting = _get_container_state(ACTIVE_CONTAINER)
@@ -116,19 +87,17 @@ def _restore_session_from_container():
         return
 
     session_id = uuid.uuid4().hex[:8]
-    url = _get_cf_url(SESSION_CF_LOG) if running else None
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
-        "log_path": SESSION_CF_LOG,
-        "tunnel_url": url,
+        "tunnel_url": SESSION_URL,
         "restarting": restarting,
         "created_at": time.time(),
     }
 
 
 async def _monitor_and_restart():
-    """컨테이너 재시작 및 cloudflared 장애를 감지하여 자동 복구한다."""
+    """컨테이너 재시작을 감지하여 session_store 상태를 동기화한다."""
     while True:
         await asyncio.sleep(10)
         if not session_store:
@@ -139,23 +108,10 @@ async def _monitor_and_restart():
         running, docker_restarting = _get_container_state(ACTIVE_CONTAINER)
 
         if docker_restarting:
-            # 컨테이너가 재시작 중 → 클라이언트에 starting 상태 표시
             s["restarting"] = True
-
-        elif running:
-            if s.get("restarting"):
-                # 재시작 완료 → URL 복원 시도
-                url = _get_cf_url(s["log_path"])
-                if url:
-                    s["tunnel_url"] = url
-                    s["restarting"] = False
-                # URL이 아직 없으면 계속 대기
-
-            # cloudflared가 죽은 경우 재시작 (재시작 대기 중이 아닐 때만)
-            if not s.get("restarting") and not _is_cf_alive():
-                _start_cf_tunnel()
-                s["tunnel_url"] = None
-                s["restarting"] = True  # 새 URL 발급 대기
+        elif running and s.get("restarting"):
+            s["restarting"] = False
+            s["tunnel_url"] = SESSION_URL
 
 
 @asynccontextmanager
@@ -186,32 +142,9 @@ async def require_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _kill_session_cf():
-    pid_file = Path(SESSION_CF_PID)
-    if pid_file.exists():
-        try:
-            os.kill(int(pid_file.read_text().strip()), 9)
-        except (ProcessLookupError, ValueError, OSError):
-            pass
-        pid_file.unlink(missing_ok=True)
-    # fallback pkill
-    subprocess.run(["pkill", "-f", SESSION_CF_LOG], capture_output=True)
-
-
 def _stop_all_containers():
-    # Stop the legacy test container and any active session container
     for name in ["test_kasm", ACTIVE_CONTAINER]:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-
-
-def _get_cf_url(log_path: str) -> Optional[str]:
-    p = Path(log_path)
-    if not p.exists():
-        return None
-    match = re.search(
-        r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com", p.read_text()
-    )
-    return match.group(0) if match else None
 
 
 @app.get("/health")
@@ -234,11 +167,6 @@ async def get_active_session():
 
     if s["tunnel_url"]:
         return {"status": "ready", "session_id": session_id, "url": s["tunnel_url"]}
-
-    url = _get_cf_url(s["log_path"])
-    if url:
-        s["tunnel_url"] = url
-        return {"status": "ready", "session_id": session_id, "url": url}
 
     running, restarting = _get_container_state(ACTIVE_CONTAINER)
     if not running and not restarting:
@@ -265,21 +193,17 @@ async def create_session(resume: bool = Query(False)):
                     detail=f"docker start error: {result.stderr.strip()}",
                 )
         time.sleep(2)
-        _kill_session_cf()
-        _start_cf_tunnel()
         session_store.clear()
         session_store[session_id] = {
             "session_id": session_id,
             "container": ACTIVE_CONTAINER,
-            "log_path": SESSION_CF_LOG,
-            "tunnel_url": None,
+            "tunnel_url": SESSION_URL,
             "restarting": False,
             "created_at": time.time(),
         }
         return {"session_id": session_id, "status": "starting"}
 
     # Tear down any existing session and create new container
-    _kill_session_cf()
     _stop_all_containers()
     session_store.clear()
 
@@ -304,17 +228,10 @@ async def create_session(resume: bool = Query(False)):
             status_code=500, detail=f"docker error: {result.stderr.strip()}"
         )
 
-    # Give container a moment to bind port before nginx retries
-    time.sleep(2)
-
-    # Start cloudflared → nginx:80 → kasm
-    _start_cf_tunnel()
-
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
-        "log_path": SESSION_CF_LOG,
-        "tunnel_url": None,
+        "tunnel_url": SESSION_URL,
         "restarting": False,
         "created_at": time.time(),
     }
@@ -336,19 +253,15 @@ async def get_session(session_id: str):
     if s["tunnel_url"]:
         return {"status": "ready", "url": s["tunnel_url"]}
 
-    url = _get_cf_url(s["log_path"])
-    if url:
-        s["tunnel_url"] = url
-        return {"status": "ready", "url": url}
-
-    # Check container is still running
+    # Named Tunnel은 항상 고정 URL — 컨테이너 상태만 확인
     running, restarting = _get_container_state(ACTIVE_CONTAINER)
     if restarting:
         return {"status": "starting"}
     if not running:
         return {"status": "error", "message": "컨테이너 시작 실패"}
 
-    return {"status": "starting"}
+    s["tunnel_url"] = SESSION_URL
+    return {"status": "ready", "url": SESSION_URL}
 
 
 @app.delete("/session/{session_id}", dependencies=[Depends(require_key)])
@@ -356,7 +269,6 @@ async def delete_session(session_id: str):
     if session_id not in session_store:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    _kill_session_cf()
     # 컨테이너를 삭제하지 않고 중지만 — 데이터 보존 및 이어서 사용 가능
     subprocess.run(["docker", "stop", ACTIVE_CONTAINER], capture_output=True)
     session_store.clear()
