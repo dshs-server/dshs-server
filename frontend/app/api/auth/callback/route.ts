@@ -1,21 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { makeToken, isAllowedDomain, COOKIE_NAME } from "@/lib/auth";
 
-interface GoogleIdToken {
+interface GoogleUserInfo {
   email?: string;
   email_verified?: boolean | string;
   hd?: string;
   name?: string;
-}
-
-function decodeIdToken(idToken: string): GoogleIdToken | null {
-  try {
-    const payload = idToken.split(".")[1];
-    const json = Buffer.from(payload, "base64url").toString("utf8");
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
 }
 
 function loginRedirect(origin: string, error: string) {
@@ -42,7 +32,7 @@ export async function GET(request: NextRequest) {
   }
 
   // authorization code → token 교환
-  let idToken: string | undefined;
+  let accessToken: string | undefined;
   try {
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
@@ -59,14 +49,26 @@ export async function GET(request: NextRequest) {
       return loginRedirect(origin, "oauth");
     }
     const data = await tokenRes.json();
-    idToken = data.id_token;
+    accessToken = data.access_token;
   } catch {
     return loginRedirect(origin, "oauth");
   }
 
-  if (!idToken) return loginRedirect(origin, "oauth");
+  if (!accessToken) return loginRedirect(origin, "oauth");
 
-  const claims = decodeIdToken(idToken);
+  // Google이 발급한 access token으로 사용자 정보를 서버에서 다시 확인한다.
+  let claims: GoogleUserInfo | null = null;
+  try {
+    const userInfoRes = await fetch(
+      "https://openidconnect.googleapis.com/v1/userinfo",
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (!userInfoRes.ok) return loginRedirect(origin, "oauth");
+    claims = await userInfoRes.json();
+  } catch {
+    return loginRedirect(origin, "oauth");
+  }
+
   const email = claims?.email?.toLowerCase();
   const verified =
     claims?.email_verified === true || claims?.email_verified === "true";

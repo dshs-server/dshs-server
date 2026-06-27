@@ -6,6 +6,7 @@ const API_KEY = process.env.API_KEY!;
 
 async function userHeaders() {
   const email = await getSessionEmail();
+  if (!email) return null;
   return {
     "x-api-key": API_KEY,
     "x-user-email": email || "",
@@ -18,9 +19,13 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const headers = await userHeaders();
+  if (!headers) {
+    return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
+  }
   try {
     const res = await fetch(`${BACKEND_URL}/session/${id}`, {
-      headers: await userHeaders(),
+      headers,
       cache: "no-store",
     });
     if (!res.ok) {
@@ -41,10 +46,14 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  const headers = await userHeaders();
+  if (!headers) {
+    return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
+  }
   try {
     const res = await fetch(`${BACKEND_URL}/session/${id}`, {
       method: "DELETE",
-      headers: await userHeaders(),
+      headers,
     });
     if (!res.ok) {
       return NextResponse.json({ error: "세션 종료 실패" }, { status: res.status });

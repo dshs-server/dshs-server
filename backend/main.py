@@ -1,9 +1,11 @@
 import asyncio
+import json
 import os
 import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
@@ -16,6 +18,12 @@ SESSION_MAX_MINUTES = int(os.environ.get("SESSION_MAX_MINUTES", "120"))
 
 ACTIVE_CONTAINER = "active_session"
 SESSION_URL = os.environ.get("SESSION_URL", "https://kasm.dshs-app.net")
+SESSION_STATE_FILE = Path(
+    os.environ.get(
+        "SESSION_STATE_FILE",
+        str(Path.home() / ".dshs-server-session.json"),
+    )
+)
 
 # In-memory session store (single session MVP)
 session_store: dict = {}
@@ -25,6 +33,33 @@ queue: list[str] = []
 
 # 공지사항 (관리자가 설정, 인메모리)
 notice_text: str = ""
+
+
+def _load_session_state() -> dict:
+    """재시작 및 suspend 후에도 유지할 최소 세션 메타데이터를 읽는다."""
+    try:
+        data = json.loads(SESSION_STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_session_state(owner: Optional[str], created_at: float) -> None:
+    """소유자와 시작 시각을 원자적으로 저장한다."""
+    SESSION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = SESSION_STATE_FILE.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(
+            {"owner": owner, "created_at": created_at},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    temp_path.replace(SESSION_STATE_FILE)
+
+
+def _clear_session_state() -> None:
+    SESSION_STATE_FILE.unlink(missing_ok=True)
 
 
 def _mask_email(email: str) -> str:
@@ -122,13 +157,15 @@ def _restore_session_from_container():
     if not running and not restarting:
         return
 
+    saved = _load_session_state()
     session_id = uuid.uuid4().hex[:8]
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
         "tunnel_url": SESSION_URL if running else None,
         "restarting": restarting,
-        "created_at": time.time(),
+        "created_at": saved.get("created_at", time.time()),
+        "owner": saved.get("owner"),
     }
 
 
@@ -187,6 +224,11 @@ async def require_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+async def require_user(x_user_email: str = Header("")):
+    if not (x_user_email or "").strip():
+        raise HTTPException(status_code=401, detail="Login required")
+
+
 def _stop_all_containers():
     # Stop the legacy test container and any active session container
     for name in ["test_kasm", ACTIVE_CONTAINER]:
@@ -198,12 +240,16 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/session", dependencies=[Depends(require_key)])
+@app.get(
+    "/session",
+    dependencies=[Depends(require_key), Depends(require_user)],
+)
 async def get_active_session(
     x_user_email: str = Header(""),
     x_user_admin: str = Header("0"),
 ):
     me = (x_user_email or "").lower()
+    is_admin = x_user_admin == "1"
 
     if not session_store:
         # 활성 세션 없음 — 대기열 처리
@@ -215,12 +261,19 @@ async def get_active_session(
                 return {"status": "queued", "queue_position": queue.index(me) + 1,
                         "queue_length": len(queue)}
         if _is_container_exited(ACTIVE_CONTAINER):
-            return {"status": "suspended"}
+            saved_owner = (_load_session_state().get("owner") or "").lower()
+            if is_admin or (saved_owner and saved_owner == me):
+                return {"status": "suspended"}
+            # 다른 사용자의 저장된 환경은 노출하지 않고 새 대여만 허용한다.
+            return {"status": "none"}
         return {"status": "none"}
 
     session_id, s = next(iter(session_store.items()))
     owner = (s.get("owner") or "").lower()
-    is_admin = x_user_admin == "1"
+
+    # 소유자 메타데이터가 없는 복원 세션은 관리자만 접근할 수 있다.
+    if not owner and not is_admin:
+        return {"status": "busy", "owner": "관리자 확인 필요"}
 
     # 다른 사용자가 점유 중 → busy / queued
     if me and owner and me != owner and not is_admin:
@@ -246,7 +299,10 @@ async def get_active_session(
     return {"status": "starting", "session_id": session_id}
 
 
-@app.post("/session", dependencies=[Depends(require_key)])
+@app.post(
+    "/session",
+    dependencies=[Depends(require_key), Depends(require_user)],
+)
 async def create_session(
     resume: bool = Query(False),
     x_user_email: str = Header(""),
@@ -272,6 +328,13 @@ async def create_session(
         queue.remove(me)
 
     if resume:
+        saved_owner = (_load_session_state().get("owner") or "").lower()
+        if not is_admin and (not saved_owner or saved_owner != me):
+            raise HTTPException(
+                status_code=403,
+                detail="본인의 저장된 세션만 이어서 사용할 수 있습니다.",
+            )
+
         # 저장된 컨테이너 재시작
         running, _ = _get_container_state(ACTIVE_CONTAINER)
         if not running:
@@ -286,19 +349,22 @@ async def create_session(
                 )
         time.sleep(2)
         session_store.clear()
+        created_at = time.time()
         session_store[session_id] = {
             "session_id": session_id,
             "container": ACTIVE_CONTAINER,
             "tunnel_url": SESSION_URL,
             "restarting": False,
-            "created_at": time.time(),
+            "created_at": created_at,
             "owner": me or None,
         }
+        _save_session_state(me or None, created_at)
         return {"session_id": session_id, "status": "starting"}
 
     # Tear down any existing session and create new container
     _stop_all_containers()
     session_store.clear()
+    _clear_session_state()
 
     # Start Kasm container on port 8080
     # --restart unless-stopped: 컨테이너 내부에서 종료/재부팅 시 자동 재시작
@@ -324,24 +390,37 @@ async def create_session(
     # Give container a moment to bind port before nginx retries
     time.sleep(2)
 
+    created_at = time.time()
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
         "tunnel_url": SESSION_URL,
         "restarting": False,
-        "created_at": time.time(),
+        "created_at": created_at,
         "owner": me or None,
     }
+    _save_session_state(me or None, created_at)
 
     return {"session_id": session_id, "status": "starting"}
 
 
-@app.get("/session/{session_id}", dependencies=[Depends(require_key)])
-async def get_session(session_id: str):
+@app.get(
+    "/session/{session_id}",
+    dependencies=[Depends(require_key), Depends(require_user)],
+)
+async def get_session(
+    session_id: str,
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
     if session_id not in session_store:
         raise HTTPException(status_code=404, detail="Session not found")
 
     s = session_store[session_id]
+    me = (x_user_email or "").lower()
+    owner = (s.get("owner") or "").lower()
+    if x_user_admin != "1" and (not owner or owner != me):
+        raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
 
     # 재시작 대기 중이면 starting 반환
     if s.get("restarting"):
@@ -361,7 +440,10 @@ async def get_session(session_id: str):
     return {"status": "ready", "url": SESSION_URL}
 
 
-@app.delete("/session/{session_id}", dependencies=[Depends(require_key)])
+@app.delete(
+    "/session/{session_id}",
+    dependencies=[Depends(require_key), Depends(require_user)],
+)
 async def delete_session(
     session_id: str,
     x_user_email: str = Header(""),
@@ -373,7 +455,7 @@ async def delete_session(
     # 소유자 또는 관리자만 종료 가능
     me = (x_user_email or "").lower()
     owner = (session_store[session_id].get("owner") or "").lower()
-    if owner and me and owner != me and x_user_admin != "1":
+    if x_user_admin != "1" and (not owner or owner != me):
         raise HTTPException(status_code=403, detail="본인 세션만 종료할 수 있습니다.")
 
     # 컨테이너를 삭제하지 않고 중지만 — 데이터 보존 및 이어서 사용 가능

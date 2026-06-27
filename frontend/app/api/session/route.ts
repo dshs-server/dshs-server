@@ -6,6 +6,7 @@ const API_KEY = process.env.API_KEY!;
 
 async function userHeaders() {
   const email = await getSessionEmail();
+  if (!email) return null;
   return {
     "x-api-key": API_KEY,
     "x-user-email": email || "",
@@ -14,9 +15,13 @@ async function userHeaders() {
 }
 
 export async function GET() {
+  const headers = await userHeaders();
+  if (!headers) {
+    return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
+  }
   try {
     const res = await fetch(`${BACKEND_URL}/session`, {
-      headers: await userHeaders(),
+      headers,
       cache: "no-store",
     });
     if (!res.ok) return NextResponse.json({ status: "none" });
@@ -28,6 +33,10 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const headers = await userHeaders();
+  if (!headers) {
+    return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
+  }
   const { searchParams } = new URL(request.url);
   const resume = searchParams.get("resume");
   const backendPath =
@@ -38,7 +47,7 @@ export async function POST(request: Request) {
   try {
     const res = await fetch(backendPath, {
       method: "POST",
-      headers: await userHeaders(),
+      headers,
     });
 
     const data = await res.json().catch(() => ({}));
