@@ -220,14 +220,32 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-### 4. 백엔드 파일 배포
+### 4. GDM Wayland 비활성화 (NVIDIA GPU 서버 필수)
+
+NVIDIA GPU + GDM(GNOME) 환경에서 X11 세션과 GDM Wayland greeter가 DRM master를 두고 충돌하면
+물리 화면·키보드·마우스가 먹통이 된다. 신규 서버 세팅 시 반드시 적용.
+
+```bash
+sudo sed -i 's/#WaylandEnable=false/WaylandEnable=false/' /etc/gdm3/custom.conf
+sudo systemctl restart gdm3
+```
+
+확인:
+```bash
+# dmesg에 아래 에러가 없으면 정상
+# "Failed to grab modeset ownership"
+# "Failed to apply atomic modeset. Error code: -22"
+grep WaylandEnable /etc/gdm3/custom.conf   # WaylandEnable=false 출력돼야 함
+```
+
+### 5. 백엔드 파일 배포
 
 ```bash
 # 로컬 Mac에서 실행
 scp backend/main.py backend/requirements.txt backend/start.sh USER@SERVER_IP:~/backend/
 ```
 
-### 5. systemd 서비스 등록 (자동 시작)
+### 6. systemd 서비스 등록 (자동 시작)
 
 ```bash
 sudo tee /etc/systemd/system/backend.service << 'EOF'
@@ -260,7 +278,7 @@ sudo systemctl enable --now backend
 grep -o "https://.*\.trycloudflare\.com" /tmp/backend_cf.log
 ```
 
-### 6. start_backend.sh 홈에 등록 (수동 재시작용)
+### 7. start_backend.sh 홈에 등록 (수동 재시작용)
 
 ```bash
 cat > ~/start_backend.sh << 'EOF'
