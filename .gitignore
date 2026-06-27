@@ -16,3 +16,8 @@ backend/.env
 # Python
 __pycache__/
 *.pyc
+
+# Internal docs (contain credentials)
+CLAUDE.md
+DEPLOY.md
+computing_rental_system_unified.md
