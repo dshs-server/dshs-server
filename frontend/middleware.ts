@@ -17,32 +17,55 @@ async function hmacHex(secret: string, data: string): Promise<string> {
     .join("");
 }
 
+/** 토큰 검증 → 유효하면 email, 아니면 null */
+async function verify(
+  token: string | undefined,
+  secret: string
+): Promise<string | null> {
+  if (!token) return null;
+  const sep = token.indexOf(".");
+  if (sep <= 0) return null;
+  const sig = token.slice(0, sep);
+  let email: string;
+  try {
+    email = decodeURIComponent(token.slice(sep + 1));
+  } catch {
+    return null;
+  }
+  const expected = await hmacHex(secret, email);
+  return sig === expected ? email : null;
+}
+
+function isAdmin(email: string): boolean {
+  const admins = (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return admins.includes(email.toLowerCase());
+}
+
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
-
-  if (!pathname.startsWith("/dashboard")) {
-    return NextResponse.next();
+  const secret = process.env.AUTH_SECRET;
+  if (!secret) {
+    return NextResponse.redirect(new URL("/login", request.url));
   }
 
   const token = request.cookies.get(COOKIE_NAME)?.value;
-  if (!token) {
+  const email = await verify(token, secret);
+
+  if (!email) {
     return NextResponse.redirect(new URL("/login", request.url));
   }
 
-  const secret = process.env.AUTH_SECRET;
-  const username = process.env.ADMIN_USERNAME;
-  if (!secret || !username) {
-    return NextResponse.redirect(new URL("/login", request.url));
-  }
-
-  const expected = await hmacHex(secret, username);
-  if (token !== expected) {
-    return NextResponse.redirect(new URL("/login", request.url));
+  // 관리자 전용 경로
+  if (pathname.startsWith("/admin") && !isAdmin(email)) {
+    return NextResponse.redirect(new URL("/dashboard", request.url));
   }
 
   return NextResponse.next();
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*"],
+  matcher: ["/dashboard/:path*", "/admin/:path*"],
 };

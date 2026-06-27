@@ -1,19 +1,25 @@
 import { NextResponse } from "next/server";
+import { getSessionEmail, isAdmin } from "@/lib/auth";
 
 const BACKEND_URL = process.env.BACKEND_URL!;
 const API_KEY = process.env.API_KEY!;
 
+async function userHeaders() {
+  const email = await getSessionEmail();
+  return {
+    "x-api-key": API_KEY,
+    "x-user-email": email || "",
+    "x-user-admin": isAdmin(email) ? "1" : "0",
+  };
+}
+
 export async function GET() {
   try {
     const res = await fetch(`${BACKEND_URL}/session`, {
-      headers: { "x-api-key": API_KEY },
+      headers: await userHeaders(),
       cache: "no-store",
     });
-
-    if (!res.ok) {
-      return NextResponse.json({ status: "none" });
-    }
-
+    if (!res.ok) return NextResponse.json({ status: "none" });
     return NextResponse.json(await res.json());
   } catch (e) {
     console.error("session get error:", e);
@@ -32,18 +38,25 @@ export async function POST(request: Request) {
   try {
     const res = await fetch(backendPath, {
       method: "POST",
-      headers: { "x-api-key": API_KEY },
+      headers: await userHeaders(),
     });
 
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const body = await res.text();
+      // 409 = 다른 사용자가 점유 중 (detail 안에 owner/queue_position)
+      if (res.status === 409) {
+        const d = data.detail || {};
+        return NextResponse.json(
+          { error: "사용 중", owner: d.owner, queue_position: d.queue_position },
+          { status: 409 }
+        );
+      }
+      const detail = typeof data.detail === "string" ? data.detail : null;
       return NextResponse.json(
-        { error: `백엔드 오류: ${body}` },
+        { error: detail || data.error || "세션 생성 실패" },
         { status: res.status }
       );
     }
-
-    const data = await res.json();
     return NextResponse.json(data);
   } catch (e) {
     console.error("session create error:", e);

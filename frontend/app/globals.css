@@ -1,0 +1,341 @@
+/* =========================================================
+   PC 대여 포털 — 글래스모피즘 디자인 시스템
+   ========================================================= */
+
+:root {
+  /* 브랜드 / 포인트 색상 */
+  --accent: #7c8cff;
+  --accent-strong: #6366f1;
+  --accent-glow: rgba(124, 140, 255, 0.55);
+  --success: #34d399;
+  --success-strong: #10b981;
+  --danger: #fb7185;
+  --danger-strong: #f43f5e;
+  --warning: #fbbf24;
+
+  /* 글래스 표면 */
+  --glass-bg: rgba(255, 255, 255, 0.07);
+  --glass-bg-strong: rgba(255, 255, 255, 0.12);
+  --glass-border: rgba(255, 255, 255, 0.16);
+  --glass-border-strong: rgba(255, 255, 255, 0.28);
+  --glass-shadow: 0 8px 40px rgba(8, 11, 40, 0.45);
+
+  /* 텍스트 */
+  --text: #eef1ff;
+  --text-dim: rgba(238, 241, 255, 0.66);
+  --text-faint: rgba(238, 241, 255, 0.42);
+
+  --radius: 20px;
+  --radius-sm: 12px;
+  --blur: 22px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}
+
+body {
+  font-family: "Pretendard Variable", Pretendard, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic",
+    sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(1200px 800px at 12% -10%, #4338ca 0%, transparent 55%),
+    radial-gradient(1000px 700px at 110% 10%, #7c3aed 0%, transparent 50%),
+    radial-gradient(900px 900px at 50% 120%, #2563eb 0%, transparent 55%),
+    linear-gradient(160deg, #0b1031 0%, #131a4a 45%, #0a0e26 100%);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 은은하게 떠다니는 배경 광원 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(380px 380px at 80% 30%, rgba(124, 140, 255, 0.16), transparent 70%),
+    radial-gradient(420px 420px at 20% 70%, rgba(167, 139, 250, 0.14), transparent 70%);
+  animation: drift 18s ease-in-out infinite alternate;
+  z-index: 0;
+}
+
+@keyframes drift {
+  from { transform: translate3d(-2%, -1%, 0) scale(1); }
+  to   { transform: translate3d(2%, 2%, 0) scale(1.08); }
+}
+
+/* =========================================================
+   글래스 카드
+   ========================================================= */
+.glass {
+  position: relative;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(140%);
+  backdrop-filter: blur(var(--blur)) saturate(140%);
+  box-shadow: var(--glass-shadow);
+}
+
+/* 카드 상단 하이라이트 라인 */
+.glass::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.35),
+    rgba(255, 255, 255, 0) 40%
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.glass-strong {
+  background: var(--glass-bg-strong);
+  border-color: var(--glass-border-strong);
+}
+
+/* =========================================================
+   버튼
+   ========================================================= */
+.btn {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-weight: 600;
+  font-size: 15px;
+  padding: 13px 20px;
+  cursor: pointer;
+  color: var(--text);
+  transition: transform 0.12s ease, box-shadow 0.2s ease, background 0.2s ease,
+    opacity 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  user-select: none;
+}
+.btn:active { transform: translateY(1px) scale(0.99); }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  box-shadow: 0 8px 24px -6px var(--accent-glow);
+}
+.btn-primary:hover:not(:disabled) {
+  box-shadow: 0 12px 30px -6px var(--accent-glow);
+  transform: translateY(-1px);
+}
+
+.btn-success {
+  background: linear-gradient(135deg, var(--success) 0%, var(--success-strong) 100%);
+  box-shadow: 0 8px 24px -6px rgba(16, 185, 129, 0.5);
+}
+.btn-success:hover:not(:disabled) { transform: translateY(-1px); }
+
+.btn-ghost {
+  background: var(--glass-bg);
+  border-color: var(--glass-border);
+  color: var(--text);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+.btn-ghost:hover:not(:disabled) { background: var(--glass-bg-strong); }
+
+.btn-danger {
+  background: transparent;
+  border-color: rgba(251, 113, 133, 0.5);
+  color: var(--danger);
+}
+.btn-danger:hover:not(:disabled) {
+  background: rgba(251, 113, 133, 0.12);
+  border-color: var(--danger);
+}
+
+.btn-block { width: 100%; }
+
+/* Google 로그인 버튼 */
+.btn-google {
+  background: #ffffff;
+  color: #1f2937;
+  font-weight: 600;
+}
+.btn-google:hover:not(:disabled) {
+  background: #f3f4f6;
+  transform: translateY(-1px);
+  box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.5);
+}
+
+/* =========================================================
+   입력
+   ========================================================= */
+.input {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--glass-border);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  outline: none;
+  transition: border 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+.input::placeholder { color: var(--text-faint); }
+.input:focus {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 0 0 3px rgba(124, 140, 255, 0.22);
+}
+
+/* =========================================================
+   배지 / 상태 점
+   ========================================================= */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-pulse { animation: pulse 1.6s ease-in-out infinite; }
+.dot-success { background: var(--success); box-shadow: 0 0 10px var(--success); }
+.dot-warning { background: var(--warning); box-shadow: 0 0 10px var(--warning); }
+.dot-danger  { background: var(--danger);  box-shadow: 0 0 10px var(--danger); }
+.dot-idle    { background: var(--text-faint); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+/* =========================================================
+   스피너 / 진행바
+   ========================================================= */
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2.5px solid rgba(255, 255, 255, 0.2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+  box-shadow: 0 0 12px var(--accent-glow);
+  transition: width 0.8s ease;
+}
+
+/* =========================================================
+   토스트
+   ========================================================= */
+.toast-wrap {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: min(360px, calc(100vw - 40px));
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 13px 15px;
+  border-radius: var(--radius-sm);
+  background: rgba(20, 24, 56, 0.72);
+  border: 1px solid var(--glass-border);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.4);
+  animation: toastIn 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+  font-size: 14px;
+}
+.toast.leaving { animation: toastOut 0.28s ease forwards; }
+.toast-bar {
+  width: 3px;
+  align-self: stretch;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.toast-success .toast-bar { background: var(--success); }
+.toast-error   .toast-bar { background: var(--danger); }
+.toast-info    .toast-bar { background: var(--accent); }
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(40px) scale(0.96); }
+  to   { opacity: 1; transform: translateX(0) scale(1); }
+}
+@keyframes toastOut {
+  to { opacity: 0; transform: translateX(40px) scale(0.96); }
+}
+
+/* =========================================================
+   공통 레이아웃 유틸
+   ========================================================= */
+.page {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+}
+.center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+.fade-in { animation: fadeIn 0.5s ease both; }
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+a { color: var(--accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

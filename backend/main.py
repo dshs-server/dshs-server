@@ -4,17 +4,53 @@ import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 API_KEY = os.environ.get("API_KEY", "dev-secret-change-me")
 
+# 세션 최대 사용 시간(분). 초과 시 자동 suspend. 0 이하면 제한 없음.
+SESSION_MAX_MINUTES = int(os.environ.get("SESSION_MAX_MINUTES", "120"))
+
 ACTIVE_CONTAINER = "active_session"
-SESSION_URL = "https://kasm.dshs-app.net"
+SESSION_URL = os.environ.get("SESSION_URL", "https://kasm.dshs-app.net")
 
 # In-memory session store (single session MVP)
 session_store: dict = {}
+
+# 대기열 (FIFO, 이메일 문자열). 단일 머신이라 한 명만 점유 가능.
+queue: list[str] = []
+
+# 공지사항 (관리자가 설정, 인메모리)
+notice_text: str = ""
+
+
+def _mask_email(email: str) -> str:
+    """이메일을 부분 마스킹한다. abc@ts.hs.kr → ab***@ts.hs.kr"""
+    if not email or "@" not in email:
+        return email or "익명"
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked = local[0] + "***"
+    else:
+        masked = local[:2] + "***"
+    return f"{masked}@{domain}"
+
+
+def _session_expires_at(s: dict) -> Optional[float]:
+    if SESSION_MAX_MINUTES <= 0:
+        return None
+    return s.get("created_at", time.time()) + SESSION_MAX_MINUTES * 60
+
+
+def _active_owner() -> Optional[str]:
+    """현재 활성 세션의 소유자 이메일. 없으면 None."""
+    if not session_store:
+        return None
+    _, s = next(iter(session_store.items()))
+    return s.get("owner")
 
 
 KASM_IMAGE = "kasmweb/ubuntu-jammy-desktop"
@@ -90,7 +126,7 @@ def _restore_session_from_container():
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
-        "tunnel_url": SESSION_URL,
+        "tunnel_url": SESSION_URL if running else None,
         "restarting": restarting,
         "created_at": time.time(),
     }
@@ -103,15 +139,24 @@ async def _monitor_and_restart():
         if not session_store:
             continue
 
-        _, s = next(iter(session_store.items()))
+        sid, s = next(iter(session_store.items()))
+
+        # 시간 초과 자동 suspend
+        expires_at = _session_expires_at(s)
+        if expires_at and time.time() >= expires_at:
+            subprocess.run(["docker", "stop", ACTIVE_CONTAINER], capture_output=True)
+            session_store.clear()
+            continue
 
         running, docker_restarting = _get_container_state(ACTIVE_CONTAINER)
 
         if docker_restarting:
+            # 컨테이너가 재시작 중 → 클라이언트에 starting 상태 표시
             s["restarting"] = True
+
         elif running and s.get("restarting"):
-            s["restarting"] = False
             s["tunnel_url"] = SESSION_URL
+            s["restarting"] = False
 
 
 @asynccontextmanager
@@ -143,6 +188,7 @@ async def require_key(x_api_key: str = Header(...)):
 
 
 def _stop_all_containers():
+    # Stop the legacy test container and any active session container
     for name in ["test_kasm", ACTIVE_CONTAINER]:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
@@ -153,20 +199,45 @@ async def health():
 
 
 @app.get("/session", dependencies=[Depends(require_key)])
-async def get_active_session():
+async def get_active_session(
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    me = (x_user_email or "").lower()
+
     if not session_store:
+        # 활성 세션 없음 — 대기열 처리
+        if me and queue:
+            if queue[0] == me:
+                queue.pop(0)  # 내 차례 → 시작 가능
+                return {"status": "your_turn"}
+            if me in queue:
+                return {"status": "queued", "queue_position": queue.index(me) + 1,
+                        "queue_length": len(queue)}
         if _is_container_exited(ACTIVE_CONTAINER):
             return {"status": "suspended"}
         return {"status": "none"}
 
     session_id, s = next(iter(session_store.items()))
+    owner = (s.get("owner") or "").lower()
+    is_admin = x_user_admin == "1"
+
+    # 다른 사용자가 점유 중 → busy / queued
+    if me and owner and me != owner and not is_admin:
+        if me in queue:
+            return {"status": "queued", "owner": _mask_email(owner),
+                    "queue_position": queue.index(me) + 1, "queue_length": len(queue)}
+        return {"status": "busy", "owner": _mask_email(owner)}
+
+    expires_at = _session_expires_at(s)
 
     # 컨테이너 재시작 중이면 starting 반환
     if s.get("restarting"):
         return {"status": "starting", "session_id": session_id}
 
     if s["tunnel_url"]:
-        return {"status": "ready", "session_id": session_id, "url": s["tunnel_url"]}
+        return {"status": "ready", "session_id": session_id,
+                "url": s["tunnel_url"], "expires_at": expires_at}
 
     running, restarting = _get_container_state(ACTIVE_CONTAINER)
     if not running and not restarting:
@@ -176,8 +247,29 @@ async def get_active_session():
 
 
 @app.post("/session", dependencies=[Depends(require_key)])
-async def create_session(resume: bool = Query(False)):
+async def create_session(
+    resume: bool = Query(False),
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
     session_id = uuid.uuid4().hex[:8]
+    me = (x_user_email or "").lower()
+    is_admin = x_user_admin == "1"
+
+    # 다른 사용자가 점유 중이면 409 + 대기열 등록
+    owner = (_active_owner() or "").lower()
+    if owner and me and owner != me and not is_admin:
+        if me not in queue:
+            queue.append(me)
+        raise HTTPException(
+            status_code=409,
+            detail={"owner": _mask_email(owner),
+                    "queue_position": queue.index(me) + 1},
+        )
+
+    # 내 차례가 되어 시작 → 대기열에서 제거
+    if me and me in queue:
+        queue.remove(me)
 
     if resume:
         # 저장된 컨테이너 재시작
@@ -200,6 +292,7 @@ async def create_session(resume: bool = Query(False)):
             "tunnel_url": SESSION_URL,
             "restarting": False,
             "created_at": time.time(),
+            "owner": me or None,
         }
         return {"session_id": session_id, "status": "starting"}
 
@@ -228,12 +321,16 @@ async def create_session(resume: bool = Query(False)):
             status_code=500, detail=f"docker error: {result.stderr.strip()}"
         )
 
+    # Give container a moment to bind port before nginx retries
+    time.sleep(2)
+
     session_store[session_id] = {
         "session_id": session_id,
         "container": ACTIVE_CONTAINER,
         "tunnel_url": SESSION_URL,
         "restarting": False,
         "created_at": time.time(),
+        "owner": me or None,
     }
 
     return {"session_id": session_id, "status": "starting"}
@@ -253,7 +350,7 @@ async def get_session(session_id: str):
     if s["tunnel_url"]:
         return {"status": "ready", "url": s["tunnel_url"]}
 
-    # Named Tunnel은 항상 고정 URL — 컨테이너 상태만 확인
+    # Named Tunnel은 고정 URL이므로 컨테이너 상태만 확인한다.
     running, restarting = _get_container_state(ACTIVE_CONTAINER)
     if restarting:
         return {"status": "starting"}
@@ -265,9 +362,19 @@ async def get_session(session_id: str):
 
 
 @app.delete("/session/{session_id}", dependencies=[Depends(require_key)])
-async def delete_session(session_id: str):
+async def delete_session(
+    session_id: str,
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
     if session_id not in session_store:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # 소유자 또는 관리자만 종료 가능
+    me = (x_user_email or "").lower()
+    owner = (session_store[session_id].get("owner") or "").lower()
+    if owner and me and owner != me and x_user_admin != "1":
+        raise HTTPException(status_code=403, detail="본인 세션만 종료할 수 있습니다.")
 
     # 컨테이너를 삭제하지 않고 중지만 — 데이터 보존 및 이어서 사용 가능
     subprocess.run(["docker", "stop", ACTIVE_CONTAINER], capture_output=True)
@@ -281,3 +388,49 @@ async def admin_cleanup():
     """중단된 Kasm 컨테이너를 즉시 정리한다."""
     removed = _cleanup_stopped_containers()
     return {"removed": removed, "count": len(removed)}
+
+
+@app.post("/admin/terminate", dependencies=[Depends(require_key)])
+async def admin_terminate():
+    """관리자가 현재 활성 세션을 강제로 종료(suspend)한다."""
+    subprocess.run(["docker", "stop", ACTIVE_CONTAINER], capture_output=True)
+    session_store.clear()
+    return {"status": "terminated"}
+
+
+@app.get("/admin/status", dependencies=[Depends(require_key)])
+async def admin_status():
+    """관리자용: 현재 세션 소유자·만료시각·대기열 조회."""
+    active = None
+    if session_store:
+        sid, s = next(iter(session_store.items()))
+        if s.get("restarting"):
+            st = "starting"
+        elif s.get("tunnel_url"):
+            st = "ready"
+        else:
+            st = "starting"
+        active = {
+            "owner": _mask_email(s.get("owner") or "익명"),
+            "since": s.get("created_at"),
+            "expires_at": _session_expires_at(s),
+            "url": s.get("tunnel_url"),
+            "status": st,
+        }
+    return {
+        "active": active,
+        "queue": [_mask_email(e) for e in queue],
+        "max_minutes": SESSION_MAX_MINUTES,
+    }
+
+
+@app.get("/notice", dependencies=[Depends(require_key)])
+async def get_notice():
+    return {"notice": notice_text or None}
+
+
+@app.post("/notice", dependencies=[Depends(require_key)])
+async def set_notice(payload: dict):
+    global notice_text
+    notice_text = (payload.get("notice") or "").strip()
+    return {"notice": notice_text or None}
