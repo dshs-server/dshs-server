@@ -67,7 +67,7 @@ vercel deploy --prod
 ```
 
 또는 Vercel 웹사이트:
-1. [vercel.com](https://vercel.com) → New Project → `minigu5/dshs-server` 연결
+1. [vercel.com](https://vercel.com) → New Project → `dshs-server/dshs-server` 연결
 2. Root Directory: `frontend` 설정 (필수)
 3. 환경변수 5개 입력 후 Deploy
 

@@ -1580,7 +1580,7 @@ bash ~/start_backend.sh
 
 ### 구현 내용
 
-**GitHub:** `https://github.com/minigu5/dshs-server`
+**GitHub:** `https://github.com/dshs-server/dshs-server`
 
 **로컬 경로:** `/Users/shinmingyu/Project/server_connection/frontend/`
 
@@ -1634,7 +1634,7 @@ frontend/
 
 ### Vercel 배포 방법
 
-1. [vercel.com](https://vercel.com) → **New Project** → `minigu5/dshs-server` 연결
+1. [vercel.com](https://vercel.com) → **New Project** → `dshs-server/dshs-server` 연결
 2. 위 환경변수 5개 입력
 3. **Deploy** 클릭
 

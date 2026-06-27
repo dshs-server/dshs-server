@@ -5,7 +5,7 @@
 학교 전산실 워크스테이션을 학생에게 브라우저로 대여해주는 시스템.
 Docker + KasmVNC로 Ubuntu MATE 데스크톱을 스트리밍하고, Cloudflare Quick Tunnel로 외부에서 접속 가능하게 한다.
 
-**GitHub**: https://github.com/minigu5/dshs-server
+**GitHub**: https://github.com/dshs-server/dshs-server
 
 ---
 
