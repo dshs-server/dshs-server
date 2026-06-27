@@ -88,7 +88,7 @@ def _active_owner() -> Optional[str]:
     return s.get("owner")
 
 
-KASM_IMAGE = "kasmweb/ubuntu-jammy-desktop"
+KASM_IMAGE = "dshs-kasm-win10"
 
 
 def _cleanup_stopped_containers() -> list[str]:
@@ -96,7 +96,7 @@ def _cleanup_stopped_containers() -> list[str]:
     ACTIVE_CONTAINER는 저장된 세션일 수 있으므로 제외한다."""
     result = subprocess.run(
         ["docker", "ps", "-a",
-         "--filter", f"ancestor={KASM_IMAGE}:1.16.0",
+         "--filter", f"ancestor={KASM_IMAGE}:latest",
          "--filter", "status=exited",
          "--format", "{{.Names}}"],
         capture_output=True, text=True,
@@ -104,7 +104,7 @@ def _cleanup_stopped_containers() -> list[str]:
     # exited가 아닌 dead/created 상태도 포함
     result2 = subprocess.run(
         ["docker", "ps", "-a",
-         "--filter", f"ancestor={KASM_IMAGE}:1.16.0",
+         "--filter", f"ancestor={KASM_IMAGE}:latest",
          "--filter", "status=dead",
          "--filter", "status=created",
          "--format", "{{.Names}}"],
@@ -377,7 +377,7 @@ async def create_session(
             "--shm-size=2gb",
             "-p", "8080:6901",
             "-e", "VNC_PW=test1234",
-            "kasmweb/ubuntu-jammy-desktop:1.16.0",
+            f"{KASM_IMAGE}:latest",
         ],
         capture_output=True,
         text=True,
