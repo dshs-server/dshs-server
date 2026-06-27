@@ -1,7 +1,11 @@
 "use client";
 
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
+import { signInWithPopup, GoogleAuthProvider } from "firebase/auth";
+import { auth } from "@/lib/firebase";
 
 const ERROR_MESSAGES: Record<string, string> = {
   domain: "학교 계정(@ts.hs.kr)으로만 로그인할 수 있습니다.",
@@ -13,8 +17,40 @@ const ERROR_MESSAGES: Record<string, string> = {
 
 function LoginCard() {
   const params = useSearchParams();
+  const router = useRouter();
   const errorKey = params.get("error");
-  const error = errorKey ? ERROR_MESSAGES[errorKey] || "로그인에 실패했습니다." : null;
+  const [clientError, setClientError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const error = clientError ?? (errorKey ? ERROR_MESSAGES[errorKey] || "로그인에 실패했습니다." : null);
+
+  async function handleGoogleLogin() {
+    setClientError(null);
+    setLoading(true);
+    try {
+      const provider = new GoogleAuthProvider();
+      const result = await signInWithPopup(auth, provider);
+      const idToken = await result.user.getIdToken();
+
+      const res = await fetch("/api/auth/firebase", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ idToken }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        setClientError(ERROR_MESSAGES[data.error] || "로그인에 실패했습니다.");
+        return;
+      }
+
+      router.push("/dashboard");
+    } catch {
+      setClientError("Google 인증에 실패했습니다. 다시 시도해 주세요.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
     <div className="glass glass-strong fade-in" style={card}>
@@ -36,10 +72,15 @@ function LoginCard() {
         </div>
       )}
 
-      <a href="/api/auth/google" className="btn btn-google btn-block" style={{ marginTop: "8px" }}>
+      <button
+        onClick={handleGoogleLogin}
+        disabled={loading}
+        className="btn btn-google btn-block"
+        style={{ marginTop: "8px", opacity: loading ? 0.7 : 1, cursor: loading ? "not-allowed" : "pointer" }}
+      >
         <GoogleIcon />
-        Google 계정으로 로그인
-      </a>
+        {loading ? "로그인 중..." : "Google 계정으로 로그인"}
+      </button>
 
       <div style={hintBox}>
         <span style={{ color: "var(--text-faint)" }}>학생 계정</span>

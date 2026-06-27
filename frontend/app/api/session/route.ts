@@ -39,15 +39,28 @@ export async function POST(request: Request) {
   }
   const { searchParams } = new URL(request.url);
   const resume = searchParams.get("resume");
-  const backendPath =
-    resume === "true"
-      ? `${BACKEND_URL}/session?resume=true`
-      : `${BACKEND_URL}/session`;
+  const sessionId = searchParams.get("session_id");
+
+  let backendPath = resume === "true" ? `${BACKEND_URL}/session?resume=true` : `${BACKEND_URL}/session`;
+  if (resume === "true" && sessionId) backendPath += `&session_id=${encodeURIComponent(sessionId)}`;
+
+  let bodyStr: string | undefined;
+  let contentType: string | undefined;
+  if (resume !== "true") {
+    try {
+      const json = await request.json();
+      bodyStr = JSON.stringify(json);
+      contentType = "application/json";
+    } catch {
+      // no body
+    }
+  }
 
   try {
     const res = await fetch(backendPath, {
       method: "POST",
-      headers,
+      headers: { ...headers, ...(contentType ? { "Content-Type": contentType } : {}) },
+      ...(bodyStr ? { body: bodyStr } : {}),
     });
 
     const data = await res.json().catch(() => ({}));

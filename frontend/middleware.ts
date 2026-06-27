@@ -36,12 +36,16 @@ async function verify(
   return sig === expected ? email : null;
 }
 
+const HARDCODED_ADMINS = ["ts250024@ts.hs.kr", "ts250015@ts.hs.kr"];
+
 function isAdmin(email: string): boolean {
+  const lower = email.toLowerCase();
+  if (HARDCODED_ADMINS.includes(lower)) return true;
   const admins = (process.env.ADMIN_EMAILS || "")
     .split(",")
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
-  return admins.includes(email.toLowerCase());
+  return admins.includes(lower);
 }
 
 export async function middleware(request: NextRequest) {

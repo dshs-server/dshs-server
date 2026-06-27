@@ -4,25 +4,52 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { ToastProvider, useToast } from "@/components/toast";
 
-type Status =
-  | "checking"
-  | "idle"
-  | "suspended"
-  | "starting"
-  | "ready"
-  | "busy"
-  | "queued"
-  | "error";
+type Status = "checking" | "idle" | "starting" | "ready" | "busy" | "queued" | "error";
+
+interface SuspendedSession {
+  id: string;
+  project_name?: string;
+  saved_at?: number;
+  team_members?: string[];
+  resources?: {
+    cpu_cores?: number;
+    ram_gb?: number;
+    storage_gb?: number;
+    gpu?: string;
+  };
+}
+
+interface NewSessionForm {
+  project_name: string;
+  team_members: string[];
+  cpu_cores: number;
+  ram_gb: number;
+  storage_gb: number;
+  duration_days: number;
+  node_id?: string;
+}
+
+interface NodeInfo {
+  id: string;
+  name?: string;
+  cpu: string;
+  gpu: string;
+  cpu_cores?: number;
+  ram_gb: number;
+  storage_gb: number;
+  available: boolean;
+  session_state?: "none" | "suspended" | "active";
+}
 
 interface SessionData {
   status: string;
   session_id?: string;
   url?: string;
   message?: string;
-  expires_at?: number; // epoch seconds
-  owner?: string; // 마스킹된 점유자 (다른 사용자)
+  expires_at?: number;
+  owner?: string;
   queue_position?: number;
-  queue_length?: number;
+  suspended_sessions?: SuspendedSession[];
 }
 
 interface Me {
@@ -45,6 +72,11 @@ function Dashboard() {
   const [queuePos, setQueuePos] = useState<number | null>(null);
   const [me, setMe] = useState<Me | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [suspendedSessions, setSuspendedSessions] = useState<SuspendedSession[]>([]);
+  const [showTerminateConfirm, setShowTerminateConfirm] = useState(false);
+  const [showNewSessionModal, setShowNewSessionModal] = useState(false);
+  const [replaceSessionId, setReplaceSessionId] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -61,14 +93,15 @@ function Dashboard() {
     if (typeof data.expires_at === "number") setExpiresAt(data.expires_at);
     if (data.owner) setOwner(data.owner);
     if (typeof data.queue_position === "number") setQueuePos(data.queue_position);
+    if (Array.isArray(data.suspended_sessions)) setSuspendedSessions(data.suspended_sessions);
   }, []);
 
   const startPolling = useCallback(
-    (session_id: string) => {
+    (sid: string) => {
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = setInterval(async () => {
         try {
-          const r = await fetch(`/api/session/${session_id}`);
+          const r = await fetch(`/api/session/${sid}`);
           const data: SessionData = await r.json();
           applyData(data);
           if (data.status === "ready") {
@@ -90,7 +123,9 @@ function Dashboard() {
     [applyData, clearIntervals, toast]
   );
 
-  async function handleRent() {
+  async function handleStartNew(form: NewSessionForm, replaceId?: string) {
+    setShowNewSessionModal(false);
+    setReplaceSessionId(null);
     setStatus("starting");
     setErrorMsg(null);
     setUrl(null);
@@ -100,11 +135,28 @@ function Dashboard() {
     timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
 
     try {
-      const res = await fetch("/api/session", { method: "POST" });
+      const body = {
+        project_name: form.project_name,
+        team_members: form.team_members,
+        node_id: form.node_id,
+        resources: {
+          cpu_cores: form.cpu_cores,
+          ram_gb: form.ram_gb,
+          storage_gb: form.storage_gb,
+        },
+        duration_days: form.duration_days,
+        ...(replaceId ? { replace_session_id: replaceId } : {}),
+      };
+
+      const res = await fetch("/api/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
       const data = await res.json();
+
       if (!res.ok) {
         if (res.status === 409) {
-          // 다른 사용자가 사용 중 → 대기열 등록됨
           setOwner(data.owner || null);
           setQueuePos(data.queue_position ?? null);
           setStatus("queued");
@@ -119,6 +171,10 @@ function Dashboard() {
         }
         throw new Error(data.error || "세션 생성 실패");
       }
+
+      if (replaceId) {
+        setSuspendedSessions((prev) => prev.filter((s) => s.id !== replaceId));
+      }
       applyData(data);
       setSessionId(data.session_id);
       startPolling(data.session_id);
@@ -130,7 +186,7 @@ function Dashboard() {
     }
   }
 
-  async function handleResume() {
+  async function handleResume(suspendedId: string) {
     setStatus("starting");
     setErrorMsg(null);
     setUrl(null);
@@ -140,9 +196,11 @@ function Dashboard() {
     timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
 
     try {
-      const res = await fetch("/api/session?resume=true", { method: "POST" });
+      const extra = suspendedId !== "default" ? `&session_id=${encodeURIComponent(suspendedId)}` : "";
+      const res = await fetch(`/api/session?resume=true${extra}`, { method: "POST" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "세션 재시작 실패");
+      setSuspendedSessions((prev) => prev.filter((s) => s.id !== suspendedId));
       applyData(data);
       setSessionId(data.session_id);
       startPolling(data.session_id);
@@ -163,7 +221,10 @@ function Dashboard() {
       } catch {
         // ignore
       }
-      setStatus("suspended");
+      setSuspendedSessions((prev) =>
+        prev.some((s) => s.id === sid) ? prev : [...prev, { id: sid }]
+      );
+      setStatus("idle");
       setSessionId(null);
       setUrl(null);
       setExpiresAt(null);
@@ -177,12 +238,41 @@ function Dashboard() {
     [sessionId, clearIntervals, toast]
   );
 
+  async function handlePermanentDelete(id: string) {
+    setPendingDeleteId(null);
+    try {
+      await fetch(`/api/session/${id}?permanent=true`, { method: "DELETE" });
+    } catch {
+      // ignore
+    }
+    setSuspendedSessions((prev) => prev.filter((s) => s.id !== id));
+    toast("세션을 완전히 삭제했습니다.", "success");
+  }
+
+  async function handleCheckAvailability() {
+    try {
+      const r = await fetch("/api/session");
+      const data: SessionData = await r.json();
+      applyData(data);
+      if (data.status === "none") {
+        setStatus("idle");
+        toast("PC를 사용할 수 있습니다!", "success");
+      } else if (data.status === "your_turn") {
+        setStatus("idle");
+        setShowNewSessionModal(true);
+      } else {
+        toast("아직 사용 중입니다.", "info");
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   async function handleLogout() {
     await fetch("/api/logout", { method: "POST" });
     router.push("/login");
   }
 
-  // 남은 시간 카운트다운 (expires_at 기반)
   useEffect(() => {
     if (status !== "ready" || !expiresAt) {
       setRemaining(null);
@@ -203,7 +293,6 @@ function Dashboard() {
     return () => clearInterval(iv);
   }, [status, expiresAt, handleTerminate, toast]);
 
-  // busy/queued 상태일 때 자리·순번을 주기적으로 확인
   useEffect(() => {
     if (status !== "busy" && status !== "queued") return;
     const iv = setInterval(async () => {
@@ -213,8 +302,9 @@ function Dashboard() {
         applyData(data);
         if (data.status === "your_turn") {
           clearInterval(iv);
-          toast("이제 사용할 수 있습니다! 데스크톱을 준비합니다.", "success");
-          handleRent();
+          toast("이제 사용할 수 있습니다!", "success");
+          setStatus("idle");
+          setShowNewSessionModal(true);
         } else if (data.status === "queued") {
           setStatus("queued");
           setQueuePos(data.queue_position ?? null);
@@ -222,7 +312,14 @@ function Dashboard() {
           setOwner(data.owner || null);
         } else if (data.status === "none" || data.status === "suspended") {
           clearInterval(iv);
-          setStatus(data.status === "suspended" ? "suspended" : "idle");
+          if (data.status === "suspended") {
+            setSuspendedSessions((prev) =>
+              prev.some((s) => s.id === (data.session_id || "default"))
+                ? prev
+                : [...prev, { id: data.session_id || "default" }]
+            );
+          }
+          setStatus("idle");
         }
       } catch {
         // keep polling
@@ -232,7 +329,6 @@ function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
-  // 초기 로드: 사용자 정보 + 공지 + 세션 복원
   useEffect(() => {
     fetch("/api/me")
       .then((r) => (r.ok ? r.json() : null))
@@ -249,6 +345,14 @@ function Dashboard() {
         const res = await fetch("/api/session");
         const data: SessionData = await res.json();
         applyData(data);
+
+        if (data.status === "suspended") {
+          if (!Array.isArray(data.suspended_sessions) || data.suspended_sessions.length === 0) {
+            setSuspendedSessions([{ id: data.session_id || "default" }]);
+          }
+          setStatus("idle");
+          return;
+        }
         if (data.status === "ready" && data.url) {
           setSessionId(data.session_id || null);
           setUrl(data.url);
@@ -259,10 +363,6 @@ function Dashboard() {
           setSessionId(data.session_id);
           setStatus("starting");
           startPolling(data.session_id);
-          return;
-        }
-        if (data.status === "suspended") {
-          setStatus("suspended");
           return;
         }
         if (data.status === "busy") {
@@ -277,7 +377,8 @@ function Dashboard() {
           return;
         }
         if (data.status === "your_turn") {
-          handleRent();
+          setStatus("idle");
+          setShowNewSessionModal(true);
           return;
         }
       } catch {
@@ -295,7 +396,7 @@ function Dashboard() {
 
   return (
     <div className="page">
-      <Header me={me} onLogout={handleLogout} status={status} />
+      <Header me={me} onLogout={handleLogout} />
 
       <main style={mainWrap}>
         {notice && <NoticeBanner text={notice} />}
@@ -311,23 +412,20 @@ function Dashboard() {
             브라우저에서 Ubuntu MATE 데스크톱을 그대로 사용할 수 있습니다.
           </p>
 
-          <SpecRow />
-
-          <div style={{ marginTop: "24px" }}>
+          <div style={{ marginTop: "8px" }}>
             {status === "checking" && <CheckingState />}
 
             {status === "idle" && (
-              <button className="btn btn-primary btn-block" onClick={handleRent}>
+              <button
+                className="btn btn-primary btn-block"
+                onClick={() => { setReplaceSessionId(null); setShowNewSessionModal(true); }}
+              >
                 PC 대여하기
               </button>
             )}
 
-            {status === "suspended" && (
-              <SuspendedState onResume={handleResume} onFresh={handleRent} />
-            )}
-
             {status === "busy" && (
-              <BusyState owner={owner} onRetry={handleRent} />
+              <BusyState owner={owner} onRetry={handleCheckAvailability} />
             )}
 
             {status === "queued" && (
@@ -342,7 +440,7 @@ function Dashboard() {
               <ReadyState
                 url={url}
                 remaining={remaining}
-                onTerminate={() => handleTerminate(false)}
+                onTerminate={() => setShowTerminateConfirm(true)}
               />
             )}
 
@@ -352,25 +450,60 @@ function Dashboard() {
           </div>
         </div>
 
+        {suspendedSessions.length > 0 && (
+          <div className="fade-in">
+            <h3 style={sectionTitle}>저장된 세션</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+              {suspendedSessions.map((s) => (
+                <SuspendedSessionCard
+                  key={s.id}
+                  session={s}
+                  onResume={handleResume}
+                  onDelete={(id) => setPendingDeleteId(id)}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
         <p style={footHint}>
           ※ 학교망에서 접속이 안 되면 VPN을 켜고 다시 시도하세요.
         </p>
       </main>
+
+      {showTerminateConfirm && (
+        <ConfirmModal
+          title="세션 종료"
+          message="세션을 종료하시겠습니까? 현재 환경은 저장된 세션으로 보존되며 나중에 이어서 사용할 수 있습니다."
+          onConfirm={() => { setShowTerminateConfirm(false); handleTerminate(false); }}
+          onCancel={() => setShowTerminateConfirm(false)}
+        />
+      )}
+
+      {showNewSessionModal && (
+        <NewSessionModal
+          onConfirm={(form) => handleStartNew(form, replaceSessionId || undefined)}
+          onCancel={() => { setShowNewSessionModal(false); setReplaceSessionId(null); }}
+        />
+      )}
+
+      {pendingDeleteId && (
+        <ConfirmModal
+          title="파일 완전히 제거"
+          message="저장된 세션의 모든 파일과 설치된 패키지가 영구 삭제됩니다. 이 작업은 되돌릴 수 없습니다."
+          confirmLabel="영구 삭제"
+          danger
+          onConfirm={() => handlePermanentDelete(pendingDeleteId)}
+          onCancel={() => setPendingDeleteId(null)}
+        />
+      )}
     </div>
   );
 }
 
-/* ----------------------------- 하위 컴포넌트 ----------------------------- */
+/* ─────────────────────── 하위 컴포넌트 ─────────────────────── */
 
-function Header({
-  me,
-  onLogout,
-  status,
-}: {
-  me: Me | null;
-  onLogout: () => void;
-  status: Status;
-}) {
+function Header({ me, onLogout }: { me: Me | null; onLogout: () => void }) {
   return (
     <header style={header}>
       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -411,13 +544,12 @@ function NoticeBanner({ text }: { text: string }) {
 function StatusBadge({ status }: { status: Status }) {
   const map: Record<Status, { dot: string; label: string; pulse?: boolean }> = {
     checking: { dot: "dot-idle", label: "확인 중" },
-    idle: { dot: "dot-success", label: "사용 가능" },
-    suspended: { dot: "dot-warning", label: "저장됨" },
+    idle:     { dot: "dot-success", label: "사용 가능" },
     starting: { dot: "dot-warning", label: "준비 중", pulse: true },
-    ready: { dot: "dot-success", label: "사용 중", pulse: true },
-    busy: { dot: "dot-danger", label: "다른 사용자 사용 중" },
-    queued: { dot: "dot-warning", label: "대기 중", pulse: true },
-    error: { dot: "dot-danger", label: "오류" },
+    ready:    { dot: "dot-success", label: "사용 중", pulse: true },
+    busy:     { dot: "dot-danger", label: "다른 사용자 사용 중" },
+    queued:   { dot: "dot-warning", label: "대기 중", pulse: true },
+    error:    { dot: "dot-danger", label: "오류" },
   };
   const s = map[status];
   return (
@@ -428,23 +560,413 @@ function StatusBadge({ status }: { status: Status }) {
   );
 }
 
-function SpecRow() {
-  const specs = [
-    { label: "GPU", value: "NVIDIA GTX 1660", icon: "🎮" },
-    { label: "OS", value: "Ubuntu MATE", icon: "🐧" },
-    { label: "접속", value: "웹 브라우저", icon: "🌐" },
-  ];
+
+function SuspendedSessionCard({
+  session,
+  onResume,
+  onDelete,
+}: {
+  session: SuspendedSession;
+  onResume: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
   return (
-    <div style={specGrid}>
-      {specs.map((s) => (
-        <div key={s.label} className="glass" style={specCell}>
-          <div style={{ fontSize: "18px", marginBottom: "4px" }}>{s.icon}</div>
-          <div style={{ color: "var(--text-faint)", fontSize: "12px" }}>
-            {s.label}
+    <div className="glass glass-strong" style={{ padding: "22px" }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          justifyContent: "space-between",
+          marginBottom: "14px",
+          gap: "12px",
+        }}
+      >
+        <div>
+          <div style={{ fontWeight: 700, fontSize: "15px" }}>
+            {session.project_name || "저장된 세션"}
           </div>
-          <div style={{ fontWeight: 700, fontSize: "13.5px" }}>{s.value}</div>
+          {session.saved_at && (
+            <div style={{ color: "var(--text-faint)", fontSize: "12px", marginTop: "3px" }}>
+              {new Date(session.saved_at * 1000).toLocaleString("ko-KR")} 저장
+            </div>
+          )}
         </div>
-      ))}
+        <span className="badge" style={{ flexShrink: 0 }}>
+          <span className="dot dot-warning" />
+          저장됨
+        </span>
+      </div>
+
+      {session.resources && (
+        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "14px" }}>
+          {session.resources.cpu_cores && (
+            <span style={specTagStyle}>CPU {session.resources.cpu_cores}코어</span>
+          )}
+          {session.resources.ram_gb && (
+            <span style={specTagStyle}>RAM {session.resources.ram_gb}GB</span>
+          )}
+          {session.resources.storage_gb && (
+            <span style={specTagStyle}>저장 {session.resources.storage_gb}GB</span>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: "10px" }}>
+        <button
+          className="btn btn-primary"
+          style={{ flex: 1, padding: "11px 14px", fontSize: "14px" }}
+          onClick={() => onResume(session.id)}
+        >
+          이어서 사용하기
+        </button>
+        <button
+          className="btn btn-danger"
+          style={{ flex: 1, padding: "11px 14px", fontSize: "14px" }}
+          onClick={() => onDelete(session.id)}
+        >
+          파일 완전히 제거
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmModal({
+  title,
+  message,
+  confirmLabel = "확인",
+  danger = false,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div style={modalOverlay}>
+      <div className="glass glass-strong fade-in" style={{ ...modalCard, maxWidth: "400px" }}>
+        <h3 style={{ margin: "0 0 12px", fontSize: "17px", fontWeight: 800 }}>{title}</h3>
+        <p style={{ margin: "0 0 24px", color: "var(--text-dim)", fontSize: "14px", lineHeight: 1.6 }}>
+          {message}
+        </p>
+        <div style={{ display: "flex", gap: "12px" }}>
+          <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onCancel}>취소</button>
+          <button
+            className={`btn ${danger ? "btn-danger" : "btn-primary"}`}
+            style={{ flex: 1 }}
+            onClick={onConfirm}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function getNodeState(node: NodeInfo): "available" | "suspended" | "active" {
+  if (node.session_state === "suspended") return "suspended";
+  if (node.session_state === "active") return "active";
+  if (node.session_state === "none") return "available";
+  return node.available ? "available" : "active";
+}
+
+function SliderField({
+  value, min, max, step, display, onChange,
+}: {
+  value: number; min: number; max: number; step: number;
+  display: string; onChange: (v: number) => void;
+}) {
+  return (
+    <div style={{ marginBottom: "16px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px", alignItems: "center" }}>
+        <span style={{ fontSize: "12px", color: "var(--text-faint)" }}>{min}</span>
+        <span style={{ fontWeight: 700, fontSize: "13px", color: "var(--accent)" }}>{display}</span>
+        <span style={{ fontSize: "12px", color: "var(--text-faint)" }}>{max}</span>
+      </div>
+      <input
+        type="range"
+        min={min} max={max} step={step} value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        style={{ width: "100%", accentColor: "var(--accent)", cursor: "pointer" }}
+      />
+    </div>
+  );
+}
+
+const minSliderCSS = `
+  .min-slider input[type=range] {
+    position: absolute; width: 100%; height: 100%; top: 0; left: 0;
+    background: transparent; margin: 0; padding: 0;
+    -webkit-appearance: none; appearance: none; cursor: pointer;
+  }
+  .min-slider input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 18px; height: 18px;
+    border-radius: 50%; background: var(--accent, #7c8cff);
+    border: 2px solid rgba(255,255,255,0.9);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+  }
+  .min-slider input[type=range]::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent, #7c8cff);
+    border: 2px solid rgba(255,255,255,0.9);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+  }
+  .min-slider input[type=range]::-webkit-slider-runnable-track { background: transparent; }
+  .min-slider input[type=range]::-moz-range-track { background: transparent; }
+`;
+
+function MinSliderField({
+  label, value, absMin, absMax, step, displayFn, onChange,
+}: {
+  label: string;
+  value: number;
+  absMin: number; absMax: number; step: number;
+  displayFn: (v: number) => string;
+  onChange: (v: number) => void;
+}) {
+  const pct = ((value - absMin) / (absMax - absMin || 1)) * 100;
+
+  return (
+    <div style={{ marginBottom: "16px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+        <span style={{ fontSize: "13px", color: "var(--text-dim)", fontWeight: 600 }}>{label}</span>
+        <span style={{ fontSize: "13px", fontWeight: 700, color: "var(--accent)" }}>
+          {displayFn(value)} 이상
+        </span>
+      </div>
+      <div className="min-slider" style={{ position: "relative", height: "24px" }}>
+        <div style={{
+          position: "absolute", top: "50%", left: 0, right: 0,
+          height: "4px", transform: "translateY(-50%)", borderRadius: "2px", pointerEvents: "none",
+          background: `linear-gradient(to right, rgba(255,255,255,0.12) ${pct}%, var(--accent) ${pct}% 100%)`,
+        }} />
+        <input type="range" min={absMin} max={absMax} step={step} value={value}
+          onChange={(e) => onChange(Number(e.target.value))}
+        />
+      </div>
+    </div>
+  );
+}
+
+function NewSessionModal({
+  onConfirm,
+  onCancel,
+}: {
+  onConfirm: (form: NewSessionForm) => void;
+  onCancel: () => void;
+}) {
+  const [form, setForm] = useState<NewSessionForm>({
+    project_name: "",
+    team_members: [],
+    cpu_cores: 2,
+    ram_gb: 8,
+    storage_gb: 50,
+    duration_days: 7,
+  });
+  const [memberInput, setMemberInput] = useState("");
+  const [memberError, setMemberError] = useState<string | null>(null);
+  const [allNodes, setAllNodes] = useState<NodeInfo[]>([]);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [nodesLoading, setNodesLoading] = useState(true);
+
+  useEffect(() => {
+    fetch("/api/nodes")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d) return;
+        const nodes: NodeInfo[] = d.nodes || [];
+        setAllNodes(nodes);
+        const selectable = nodes.filter((n) => getNodeState(n) !== "active");
+        if (selectable.length === 1) setSelectedNodeId(selectable[0].id);
+      })
+      .catch(() => {})
+      .finally(() => setNodesLoading(false));
+  }, []);
+
+  function addMember() {
+    const email = memberInput.trim().toLowerCase();
+    if (!email) return;
+    if (!email.endsWith("@ts.hs.kr")) {
+      setMemberError("@ts.hs.kr 이메일만 추가할 수 있습니다.");
+      return;
+    }
+    if (form.team_members.includes(email)) {
+      setMemberError("이미 추가된 팀원입니다.");
+      return;
+    }
+    setForm((f) => ({ ...f, team_members: [...f.team_members, email] }));
+    setMemberInput("");
+    setMemberError(null);
+  }
+
+  const selectedNode = allNodes.find((n) => n.id === selectedNodeId);
+  const selectedMeetsSpecs = selectedNode
+    ? (selectedNode.cpu_cores == null || selectedNode.cpu_cores >= form.cpu_cores) &&
+      selectedNode.ram_gb >= form.ram_gb &&
+      selectedNode.storage_gb >= form.storage_gb
+    : false;
+  const canStart = !!form.project_name.trim() && !!selectedNodeId && selectedMeetsSpecs;
+
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div
+        className="glass glass-strong fade-in"
+        style={modalCard}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <style>{minSliderCSS}</style>
+        <h3 style={{ margin: "0 0 20px", fontSize: "18px", fontWeight: 800 }}>새 세션 시작</h3>
+
+        <label style={formLabel}>프로젝트 이름 *</label>
+        <input
+          className="input"
+          value={form.project_name}
+          onChange={(e) => setForm((f) => ({ ...f, project_name: e.target.value }))}
+          placeholder="예: ML 실습 프로젝트"
+          style={{ marginBottom: "18px" }}
+          autoFocus
+        />
+
+        <label style={formLabel}>팀원 추가 (@ts.hs.kr)</label>
+        <div style={{ display: "flex", gap: "8px", marginBottom: "6px" }}>
+          <input
+            className="input"
+            value={memberInput}
+            onChange={(e) => { setMemberInput(e.target.value); setMemberError(null); }}
+            onKeyDown={(e) => e.key === "Enter" && addMember()}
+            placeholder="ts000000@ts.hs.kr"
+            style={{ flex: 1 }}
+          />
+          <button className="btn btn-ghost" onClick={addMember}
+            style={{ padding: "10px 16px", flexShrink: 0 }}>추가</button>
+        </div>
+        {memberError && (
+          <p style={{ color: "var(--danger)", fontSize: "12px", margin: "0 0 8px" }}>{memberError}</p>
+        )}
+        <div style={{ minHeight: "8px", marginBottom: form.team_members.length ? "14px" : "6px" }}>
+          {form.team_members.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+              {form.team_members.map((m) => (
+                <span key={m} className="badge" style={{ fontSize: "12px" }}>
+                  {m}
+                  <button
+                    onClick={() => setForm((f) => ({ ...f, team_members: f.team_members.filter((x) => x !== m) }))}
+                    style={{ background: "none", border: "none", color: "var(--text-dim)", cursor: "pointer", padding: "0 0 0 4px", fontSize: "11px" }}
+                  >✕</button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ borderTop: "1px solid var(--glass-border)", margin: "6px 0 18px" }} />
+        <p style={{ margin: "0 0 14px", fontSize: "13px", color: "var(--text-dim)", fontWeight: 600 }}>
+          최소 사양
+        </p>
+
+        <MinSliderField
+          label="CPU" value={form.cpu_cores}
+          absMin={1} absMax={32} step={1}
+          displayFn={(v) => `${v}코어`}
+          onChange={(v) => setForm((f) => ({ ...f, cpu_cores: v }))}
+        />
+        <MinSliderField
+          label="RAM" value={form.ram_gb}
+          absMin={4} absMax={64} step={4}
+          displayFn={(v) => `${v}GB`}
+          onChange={(v) => setForm((f) => ({ ...f, ram_gb: v }))}
+        />
+        <MinSliderField
+          label="저장공간" value={form.storage_gb}
+          absMin={50} absMax={500} step={50}
+          displayFn={(v) => `${v}GB`}
+          onChange={(v) => setForm((f) => ({ ...f, storage_gb: v }))}
+        />
+
+        <label style={formLabel}>유지 기간</label>
+        <SliderField value={form.duration_days} min={1} max={30} step={1}
+          display={`${form.duration_days}일`}
+          onChange={(v) => setForm((f) => ({ ...f, duration_days: v }))} />
+
+        <div style={{ borderTop: "1px solid var(--glass-border)", margin: "6px 0 18px" }} />
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px" }}>
+          <p style={{ margin: 0, fontSize: "13px", color: "var(--text-dim)", fontWeight: 600 }}>PC 목록</p>
+          {nodesLoading && (
+            <span className="spinner" style={{ width: "13px", height: "13px", borderWidth: "2px" }} />
+          )}
+        </div>
+
+        {!nodesLoading && allNodes.length === 0 ? (
+          <div style={{ ...infoBox("danger"), marginBottom: "18px" }}>
+            연결된 PC가 없습니다. 잠시 후 다시 시도해 주세요.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "18px", minHeight: nodesLoading ? "80px" : undefined }}>
+            {allNodes.map((node) => {
+              const nodeState = getNodeState(node);
+              const meetsSpecs =
+                (node.cpu_cores == null || node.cpu_cores >= form.cpu_cores) &&
+                node.ram_gb >= form.ram_gb &&
+                node.storage_gb >= form.storage_gb;
+              const isSelectable = nodeState !== "active" && meetsSpecs;
+              const selected = selectedNodeId === node.id;
+              return (
+                <button key={node.id}
+                  onClick={() => isSelectable && setSelectedNodeId(node.id)}
+                  style={{
+                    textAlign: "left", padding: "14px", borderRadius: "12px",
+                    background: selected ? "rgba(124,140,255,0.18)" : "rgba(255,255,255,0.05)",
+                    border: `1px solid ${selected ? "rgba(124,140,255,0.6)" : "var(--glass-border)"}`,
+                    color: "var(--text)", cursor: isSelectable ? "pointer" : "not-allowed",
+                    opacity: meetsSpecs ? (nodeState === "active" ? 0.5 : 1) : 0.35,
+                    width: "100%",
+                    transition: "background 0.15s, border-color 0.15s, opacity 0.2s",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                    <span style={{ fontWeight: 700, fontSize: "14px" }}>{node.name || node.id}</span>
+                    <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                      {!meetsSpecs && (
+                        <span style={{ fontSize: "11px", color: "var(--text-faint)" }}>사양 범위 외</span>
+                      )}
+                      <span className="badge">
+                        <span className={`dot ${nodeState === "available" ? "dot-success" : nodeState === "suspended" ? "dot-warning" : "dot-danger"}`} />
+                        {nodeState === "available" ? "사용 가능" : nodeState === "suspended" ? "저장된 세션 있음" : "사용 중"}
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                    {[
+                      { label: "CPU", value: node.cpu },
+                      { label: "GPU", value: node.gpu },
+                      { label: "RAM", value: `${node.ram_gb}GB` },
+                      { label: "저장", value: `${node.storage_gb}GB` },
+                    ].map((s) => (
+                      <span key={s.label} style={specTagStyle}>{s.label} {s.value}</span>
+                    ))}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: "12px" }}>
+          <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onCancel}>취소</button>
+          <button
+            className="btn btn-primary" style={{ flex: 1 }}
+            disabled={!canStart}
+            onClick={() => onConfirm({ ...form, node_id: selectedNodeId ?? undefined })}
+          >
+            시작하기
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -458,98 +980,38 @@ function CheckingState() {
   );
 }
 
-function SuspendedState({
-  onResume,
-  onFresh,
-}: {
-  onResume: () => void;
-  onFresh: () => void;
-}) {
-  return (
-    <div className="fade-in">
-      <div style={infoBox("warning")}>
-        이전에 사용하던 데스크톱 환경이 저장되어 있습니다. 이어서 사용하거나 새로
-        시작할 수 있습니다.
-      </div>
-      <div style={{ display: "flex", gap: "12px" }}>
-        <button className="btn btn-primary" style={{ flex: 1 }} onClick={onResume}>
-          이어서 사용하기
-        </button>
-        <button className="btn btn-danger" style={{ flex: 1 }} onClick={onFresh}>
-          새로 시작하기
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function BusyState({ owner, onRetry }: { owner: string | null; onRetry: () => void }) {
   return (
     <div className="fade-in">
       <div style={infoBox("danger")}>
-        현재 <b>{owner || "다른 학생"}</b> 님이 사용 중입니다. 잠시 후 다시
-        시도해 주세요.
+        현재 <b>{owner || "다른 학생"}</b> 님이 사용 중입니다. 잠시 후 다시 시도해 주세요.
       </div>
-      <button className="btn btn-ghost btn-block" onClick={onRetry}>
-        다시 확인하기
-      </button>
+      <button className="btn btn-ghost btn-block" onClick={onRetry}>다시 확인하기</button>
     </div>
   );
 }
 
-function QueuedState({
-  owner,
-  position,
-}: {
-  owner: string | null;
-  position: number | null;
-}) {
+function QueuedState({ owner, position }: { owner: string | null; position: number | null }) {
   return (
     <div className="fade-in">
-      <div
-        style={{
-          textAlign: "center",
-          padding: "8px 0 18px",
-        }}
-      >
-        <div style={{ fontSize: "13px", color: "var(--text-dim)", marginBottom: "8px" }}>
-          대기 순번
-        </div>
+      <div style={{ textAlign: "center", padding: "8px 0 18px" }}>
+        <div style={{ fontSize: "13px", color: "var(--text-dim)", marginBottom: "8px" }}>대기 순번</div>
         <div style={{ fontSize: "44px", fontWeight: 800, lineHeight: 1 }}>
           {position ?? "—"}
-          <span style={{ fontSize: "18px", color: "var(--text-dim)", fontWeight: 600 }}>
-            {" "}
-            번째
-          </span>
+          <span style={{ fontSize: "18px", color: "var(--text-dim)", fontWeight: 600 }}> 번째</span>
         </div>
       </div>
       <div style={infoBox("warning")}>
-        현재 <b>{owner || "다른 학생"}</b> 님이 사용 중입니다. 자리가 나면
-        자동으로 시작되며, 이 화면을 열어두기만 하면 됩니다.
+        현재 <b>{owner || "다른 학생"}</b> 님이 사용 중입니다. 자리가 나면 자동으로 알림이 오며, 이 화면을 열어두기만 하면 됩니다.
       </div>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "10px",
-          justifyContent: "center",
-          color: "var(--text-dim)",
-          fontSize: "13px",
-        }}
-      >
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", justifyContent: "center", color: "var(--text-dim)", fontSize: "13px" }}>
         <span className="spinner" /> 자리를 기다리는 중…
       </div>
     </div>
   );
 }
 
-function StartingState({
-  elapsed,
-  progressPct,
-}: {
-  elapsed: number;
-  progressPct: number;
-}) {
+function StartingState({ elapsed, progressPct }: { elapsed: number; progressPct: number }) {
   return (
     <div className="fade-in">
       <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px" }}>
@@ -578,7 +1040,6 @@ function ReadyState({
   return (
     <div className="fade-in">
       {remaining !== null && <Timer remaining={remaining} />}
-
       <a
         href={url}
         target="_blank"
@@ -588,28 +1049,10 @@ function ReadyState({
       >
         🚀 데스크톱 열기
       </a>
-
-      <div className="glass" style={urlBox}>
-        <span style={{ color: "var(--text-faint)", fontSize: "12px", flexShrink: 0 }}>
-          URL
-        </span>
-        <a
-          href={url}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{ wordBreak: "break-all", fontSize: "13px" }}
-        >
-          {url}
-        </a>
-      </div>
-
-      <p style={{ fontSize: "12.5px", color: "var(--text-faint)", margin: "12px 0 16px" }}>
+      <p style={{ fontSize: "12.5px", color: "var(--text-faint)", margin: "0 0 16px" }}>
         ※ 처음 접속 시 바탕화면 로딩에 1~2분이 걸릴 수 있습니다.
       </p>
-
-      <button className="btn btn-danger" onClick={onTerminate}>
-        세션 종료
-      </button>
+      <button className="btn btn-danger" onClick={onTerminate}>세션 종료</button>
     </div>
   );
 }
@@ -631,136 +1074,86 @@ function Timer({ remaining }: { remaining: number }) {
       }}
     >
       <span style={{ fontSize: "13px", color: "var(--text-dim)" }}>남은 사용 시간</span>
-      <span
-        style={{
-          fontVariantNumeric: "tabular-nums",
-          fontWeight: 800,
-          fontSize: "18px",
-          color: low ? "var(--danger)" : "var(--text)",
-        }}
-      >
+      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: "18px", color: low ? "var(--danger)" : "var(--text)" }}>
         {m}:{String(s).padStart(2, "0")}
       </span>
     </div>
   );
 }
 
-function ErrorState({
-  message,
-  onRetry,
-}: {
-  message: string | null;
-  onRetry: () => void;
-}) {
+function ErrorState({ message, onRetry }: { message: string | null; onRetry: () => void }) {
   return (
     <div className="fade-in">
       <div style={infoBox("danger")}>오류: {message}</div>
-      <button className="btn btn-primary" onClick={onRetry}>
-        다시 시도
-      </button>
+      <button className="btn btn-primary" onClick={onRetry}>다시 시도</button>
     </div>
   );
 }
 
-/* ----------------------------- 스타일 ----------------------------- */
+/* ─────────────────────── 스타일 ─────────────────────── */
 
 const header: React.CSSProperties = {
-  position: "sticky",
-  top: 0,
-  zIndex: 50,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "space-between",
-  padding: "0 22px",
-  height: "62px",
+  position: "sticky", top: 0, zIndex: 50,
+  display: "flex", alignItems: "center", justifyContent: "space-between",
+  padding: "0 22px", height: "62px",
   background: "rgba(11, 16, 49, 0.55)",
   borderBottom: "1px solid var(--glass-border)",
-  backdropFilter: "blur(16px)",
-  WebkitBackdropFilter: "blur(16px)",
+  backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)",
 };
 const brandBadge: React.CSSProperties = {
-  width: "32px",
-  height: "32px",
-  borderRadius: "10px",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  fontSize: "17px",
+  width: "32px", height: "32px", borderRadius: "10px",
+  display: "flex", alignItems: "center", justifyContent: "center", fontSize: "17px",
   background: "linear-gradient(135deg, rgba(124,140,255,0.35), rgba(99,102,241,0.18))",
   border: "1px solid var(--glass-border-strong)",
 };
-const smallBtn: React.CSSProperties = {
-  padding: "7px 13px",
-  fontSize: "13px",
-};
+const smallBtn: React.CSSProperties = { padding: "7px 13px", fontSize: "13px" };
 const mainWrap: React.CSSProperties = {
-  maxWidth: "560px",
-  margin: "0 auto",
-  padding: "32px 20px 60px",
+  maxWidth: "560px", margin: "0 auto", padding: "32px 20px 60px",
+  display: "flex", flexDirection: "column", gap: "16px",
 };
-const card: React.CSSProperties = {
-  padding: "30px",
-};
+const card: React.CSSProperties = { padding: "30px" };
 const cardHead: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "space-between",
-  gap: "12px",
-  flexWrap: "wrap",
+  display: "flex", alignItems: "center", justifyContent: "space-between",
+  gap: "12px", flexWrap: "wrap",
 };
-const specGrid: React.CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "repeat(3, 1fr)",
-  gap: "10px",
-};
-const specCell: React.CSSProperties = {
-  padding: "14px 10px",
-  textAlign: "center",
-};
-const urlBox: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: "10px",
-  padding: "11px 14px",
-};
+
 const noticeBanner: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: "11px",
-  padding: "13px 16px",
-  marginBottom: "16px",
-  background: "rgba(124,140,255,0.12)",
-  borderColor: "rgba(124,140,255,0.35)",
+  display: "flex", alignItems: "center", gap: "11px", padding: "13px 16px",
+  background: "rgba(124,140,255,0.12)", borderColor: "rgba(124,140,255,0.35)",
 };
 const footHint: React.CSSProperties = {
-  textAlign: "center",
-  color: "var(--text-faint)",
-  fontSize: "12.5px",
-  marginTop: "20px",
+  textAlign: "center", color: "var(--text-faint)", fontSize: "12.5px", margin: 0,
+};
+const sectionTitle: React.CSSProperties = {
+  margin: "0 0 12px", fontSize: "15px", fontWeight: 700, color: "var(--text-dim)",
+};
+const specTagStyle: React.CSSProperties = {
+  padding: "3px 9px", borderRadius: "999px", fontSize: "11.5px", fontWeight: 600,
+  background: "rgba(124,140,255,0.15)", border: "1px solid rgba(124,140,255,0.3)",
+  color: "var(--text-dim)",
+};
+const modalOverlay: React.CSSProperties = {
+  position: "fixed", inset: 0,
+  background: "rgba(0,0,0,0.65)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)",
+  display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: "20px",
+};
+const modalCard: React.CSSProperties = {
+  width: "100%", maxWidth: "480px", padding: "30px", maxHeight: "90vh", overflowY: "auto",
+};
+const formLabel: React.CSSProperties = {
+  display: "block", fontSize: "13px", fontWeight: 600,
+  color: "var(--text-dim)", marginBottom: "6px",
 };
 
 function infoBox(kind: "warning" | "danger"): React.CSSProperties {
   const colors = {
-    warning: {
-      bg: "rgba(251,191,36,0.12)",
-      border: "rgba(251,191,36,0.4)",
-      text: "#fde68a",
-    },
-    danger: {
-      bg: "rgba(244,63,94,0.12)",
-      border: "rgba(251,113,133,0.4)",
-      text: "#fecdd3",
-    },
+    warning: { bg: "rgba(251,191,36,0.12)", border: "rgba(251,191,36,0.4)", text: "#fde68a" },
+    danger:  { bg: "rgba(244,63,94,0.12)",  border: "rgba(251,113,133,0.4)", text: "#fecdd3" },
   }[kind];
   return {
-    background: colors.bg,
-    border: `1px solid ${colors.border}`,
-    color: colors.text,
-    borderRadius: "12px",
-    padding: "14px 16px",
-    marginBottom: "16px",
-    fontSize: "14px",
-    lineHeight: 1.55,
+    background: colors.bg, border: `1px solid ${colors.border}`, color: colors.text,
+    borderRadius: "12px", padding: "14px 16px", marginBottom: "16px",
+    fontSize: "14px", lineHeight: 1.55,
   };
 }
 

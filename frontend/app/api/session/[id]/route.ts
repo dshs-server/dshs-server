@@ -42,7 +42,7 @@ export async function GET(
 }
 
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -50,8 +50,14 @@ export async function DELETE(
   if (!headers) {
     return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
   }
+  const { searchParams } = new URL(request.url);
+  const permanent = searchParams.get("permanent") === "true";
+  const backendPath = permanent
+    ? `${BACKEND_URL}/session/${id}?permanent=true`
+    : `${BACKEND_URL}/session/${id}`;
+
   try {
-    const res = await fetch(`${BACKEND_URL}/session/${id}`, {
+    const res = await fetch(backendPath, {
       method: "DELETE",
       headers,
     });

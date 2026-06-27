@@ -73,12 +73,16 @@ export function isAllowedDomain(email: string): boolean {
   return email.toLowerCase().endsWith(`@${domain}`);
 }
 
-/** 관리자 email 여부. ADMIN_EMAILS 는 쉼표로 구분. */
+const HARDCODED_ADMINS = ["ts250024@ts.hs.kr", "ts250015@ts.hs.kr"];
+
+/** 관리자 email 여부. ADMIN_EMAILS 환경변수(쉼표 구분) 또는 하드코딩 목록. */
 export function isAdmin(email: string | null): boolean {
   if (!email) return false;
+  const lower = email.toLowerCase();
+  if (HARDCODED_ADMINS.includes(lower)) return true;
   const admins = (process.env.ADMIN_EMAILS || "")
     .split(",")
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
-  return admins.includes(email.toLowerCase());
+  return admins.includes(lower);
 }
