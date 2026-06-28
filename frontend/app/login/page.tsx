@@ -28,6 +28,10 @@ function LoginCard() {
     setClientError(null);
     setLoading(true);
     try {
+      if (!auth) {
+        setClientError(ERROR_MESSAGES["config"]);
+        return;
+      }
       const provider = new GoogleAuthProvider();
       const result = await signInWithPopup(auth, provider);
       const idToken = await result.user.getIdToken();
