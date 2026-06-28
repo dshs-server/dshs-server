@@ -6,6 +6,20 @@ import { ToastProvider, useToast } from "@/components/toast";
 
 type Status = "checking" | "idle" | "starting" | "ready" | "busy" | "queued" | "error";
 
+interface SessionStats {
+  cpu_pct?: number;
+  ram_pct?: number;
+  ram_used?: string;
+  ram_total?: string;
+  gpu_pct?: number;
+  gpu_mem_pct?: number;
+  gpu_mem_used_mb?: number;
+  gpu_mem_total_mb?: number;
+  storage_pct?: number;
+  storage_used_gb?: number;
+  storage_total_gb?: number;
+}
+
 interface SuspendedSession {
   id: string;
   project_name?: string;
@@ -71,6 +85,7 @@ function Dashboard() {
   const [owner, setOwner] = useState<string | null>(null);
   const [queuePos, setQueuePos] = useState<number | null>(null);
   const [me, setMe] = useState<Me | null>(null);
+  const [stats, setStats] = useState<SessionStats | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [suspendedSessions, setSuspendedSessions] = useState<SuspendedSession[]>([]);
   const [showTerminateConfirm, setShowTerminateConfirm] = useState(false);
@@ -80,13 +95,16 @@ function Dashboard() {
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const statsRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const expiredRef = useRef(false);
 
   const clearIntervals = useCallback(() => {
     if (pollRef.current) clearInterval(pollRef.current);
     if (timerRef.current) clearInterval(timerRef.current);
+    if (statsRef.current) clearInterval(statsRef.current);
     pollRef.current = null;
     timerRef.current = null;
+    statsRef.current = null;
   }, []);
 
   const applyData = useCallback((data: SessionData) => {
@@ -94,6 +112,20 @@ function Dashboard() {
     if (data.owner) setOwner(data.owner);
     if (typeof data.queue_position === "number") setQueuePos(data.queue_position);
     if (Array.isArray(data.suspended_sessions)) setSuspendedSessions(data.suspended_sessions);
+  }, []);
+
+  const startStatsPolling = useCallback((sid: string) => {
+    if (statsRef.current) clearInterval(statsRef.current);
+    const fetchStats = async () => {
+      try {
+        const r = await fetch(`/api/session/${sid}/stats`);
+        if (r.ok) setStats(await r.json());
+      } catch {
+        // keep polling
+      }
+    };
+    fetchStats();
+    statsRef.current = setInterval(fetchStats, 5000);
   }, []);
 
   const startPolling = useCallback(
@@ -106,8 +138,13 @@ function Dashboard() {
           applyData(data);
           if (data.status === "ready") {
             setUrl(data.url || null);
-            setStatus("ready");
             if (pollRef.current) clearInterval(pollRef.current);
+            try {
+              const sr = await fetch(`/api/session/${sid}/stats`);
+              if (sr.ok) setStats(await sr.json());
+            } catch {}
+            setStatus("ready");
+            startStatsPolling(sid);
             toast("데스크톱이 준비되었습니다!", "success");
           } else if (data.status === "error") {
             setErrorMsg(data.message || "알 수 없는 오류");
@@ -120,7 +157,7 @@ function Dashboard() {
         }
       }, 3000);
     },
-    [applyData, clearIntervals, toast]
+    [applyData, clearIntervals, startStatsPolling, toast]
   );
 
   async function handleStartNew(form: NewSessionForm, replaceId?: string) {
@@ -229,6 +266,7 @@ function Dashboard() {
       setUrl(null);
       setExpiresAt(null);
       setRemaining(null);
+      setStats(null);
       clearIntervals();
       toast(
         auto ? "시간이 만료되어 세션이 종료되었습니다." : "세션을 종료했습니다.",
@@ -356,6 +394,13 @@ function Dashboard() {
         if (data.status === "ready" && data.url) {
           setSessionId(data.session_id || null);
           setUrl(data.url);
+          if (data.session_id) {
+            try {
+              const sr = await fetch(`/api/session/${data.session_id}/stats`);
+              if (sr.ok) setStats(await sr.json());
+            } catch {}
+            startStatsPolling(data.session_id);
+          }
           setStatus("ready");
           return;
         }
@@ -440,6 +485,8 @@ function Dashboard() {
               <ReadyState
                 url={url}
                 remaining={remaining}
+                expiresAt={expiresAt}
+                stats={stats}
                 onTerminate={() => setShowTerminateConfirm(true)}
               />
             )}
@@ -606,7 +653,7 @@ function SuspendedSessionCard({
             <span style={specTagStyle}>RAM {session.resources.ram_gb}GB</span>
           )}
           {session.resources.storage_gb && (
-            <span style={specTagStyle}>저장 {session.resources.storage_gb}GB</span>
+            <span style={specTagStyle}>SSD {session.resources.storage_gb}GB</span>
           )}
         </div>
       )}
@@ -882,7 +929,7 @@ function NewSessionModal({
           onChange={(v) => setForm((f) => ({ ...f, ram_gb: v }))}
         />
         <MinSliderField
-          label="저장공간" value={form.storage_gb}
+          label="SSD" value={form.storage_gb}
           absMin={50} absMax={500} step={50}
           displayFn={(v) => `${v}GB`}
           onChange={(v) => setForm((f) => ({ ...f, storage_gb: v }))}
@@ -945,7 +992,7 @@ function NewSessionModal({
                       { label: "CPU", value: node.cpu },
                       { label: "GPU", value: node.gpu },
                       { label: "RAM", value: `${node.ram_gb}GB` },
-                      { label: "저장", value: `${node.storage_gb}GB` },
+                      { label: "SSD", value: `${node.storage_gb}GB` },
                     ].map((s) => (
                       <span key={s.label} style={specTagStyle}>{s.label} {s.value}</span>
                     ))}
@@ -1028,18 +1075,56 @@ function StartingState({ elapsed, progressPct }: { elapsed: number; progressPct:
   );
 }
 
+function StatRing({ label, pct, sub }: { label: string; pct: number; sub?: string }) {
+  const color = pct >= 80 ? "var(--danger)" : pct >= 60 ? "var(--warning)" : "var(--accent)";
+  const clampedPct = Math.min(Math.max(pct, 0), 100);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "5px" }}>
+      <div style={{
+        width: 68, height: 68, borderRadius: "50%", padding: "6px",
+        background: `conic-gradient(${color} ${clampedPct}%, rgba(255,255,255,0.07) ${clampedPct}%)`,
+        boxShadow: `0 0 12px ${clampedPct > 10 ? color : "transparent"}44`,
+        transition: "background 0.6s ease, box-shadow 0.6s ease",
+      }}>
+        <div style={{
+          width: "100%", height: "100%", borderRadius: "50%",
+          background: "rgba(11,16,49,0.96)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <span style={{ fontSize: "13px", fontWeight: 800, fontVariantNumeric: "tabular-nums", color }}>
+            {clampedPct.toFixed(0)}%
+          </span>
+        </div>
+      </div>
+      <span style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-dim)" }}>{label}</span>
+      {sub && <span style={{ fontSize: "10px", color: "var(--text-faint)", textAlign: "center", lineHeight: 1.3 }}>{sub}</span>}
+    </div>
+  );
+}
+
 function ReadyState({
   url,
   remaining,
+  expiresAt,
+  stats,
   onTerminate,
 }: {
   url: string;
   remaining: number | null;
+  expiresAt?: number | null;
+  stats?: SessionStats | null;
   onTerminate: () => void;
 }) {
+  const hasStats = stats && (
+    stats.cpu_pct !== undefined ||
+    stats.gpu_pct !== undefined ||
+    stats.ram_pct !== undefined ||
+    stats.storage_pct !== undefined
+  );
+
   return (
     <div className="fade-in">
-      {remaining !== null && <Timer remaining={remaining} />}
+      {remaining !== null && <Timer remaining={remaining} expiresAt={expiresAt} />}
       <a
         href={url}
         target="_blank"
@@ -1052,15 +1137,73 @@ function ReadyState({
       <p style={{ fontSize: "12.5px", color: "var(--text-faint)", margin: "0 0 16px" }}>
         ※ 처음 접속 시 바탕화면 로딩에 1~2분이 걸릴 수 있습니다.
       </p>
+
+      {hasStats && (
+        <div className="glass" style={{ padding: "16px", marginBottom: "16px" }}>
+          <div style={{ fontSize: "10.5px", color: "var(--text-faint)", fontWeight: 600, marginBottom: "14px", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+            내 PC 사용량
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(68px, 1fr))", gap: "6px" }}>
+            {stats!.cpu_pct !== undefined && (
+              <StatRing label="CPU" pct={stats!.cpu_pct} />
+            )}
+            {stats!.gpu_pct !== undefined && (
+              <StatRing label="GPU" pct={stats!.gpu_pct} />
+            )}
+            {stats!.ram_pct !== undefined && (
+              <StatRing
+                label="RAM"
+                pct={stats!.ram_pct}
+                sub={stats!.ram_used && stats!.ram_total
+                  ? `${stats!.ram_used.replace("GiB", "G")} / ${stats!.ram_total.replace("GiB", "G")}`
+                  : undefined}
+              />
+            )}
+            {stats!.storage_pct !== undefined && (
+              <StatRing
+                label="SSD"
+                pct={stats!.storage_pct}
+                sub={stats!.storage_total_gb != null
+                  ? `${stats!.storage_used_gb}G / ${stats!.storage_total_gb}G`
+                  : undefined}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
       <button className="btn btn-danger" onClick={onTerminate}>세션 종료</button>
     </div>
   );
 }
 
-function Timer({ remaining }: { remaining: number }) {
-  const m = Math.floor(remaining / 60);
-  const s = remaining % 60;
+function formatRemaining(seconds: number): string {
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+  if (seconds < 86400) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return `${d}일 ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function Timer({ remaining, expiresAt }: { remaining: number; expiresAt?: number | null }) {
   const low = remaining <= 300;
+  const expiryStr = expiresAt
+    ? new Date(expiresAt * 1000).toLocaleString("ko-KR", {
+        month: "numeric", day: "numeric",
+        hour: "2-digit", minute: "2-digit",
+      })
+    : null;
   return (
     <div
       className="glass"
@@ -1073,9 +1216,16 @@ function Timer({ remaining }: { remaining: number }) {
         borderColor: low ? "rgba(251,113,133,0.45)" : undefined,
       }}
     >
-      <span style={{ fontSize: "13px", color: "var(--text-dim)" }}>남은 사용 시간</span>
+      <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+        <span style={{ fontSize: "13px", color: "var(--text-dim)" }}>남은 사용 시간</span>
+        {expiryStr && (
+          <span style={{ fontSize: "11px", color: "var(--text-faint)" }}>
+            만료: {expiryStr}
+          </span>
+        )}
+      </div>
       <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: "18px", color: low ? "var(--danger)" : "var(--text)" }}>
-        {m}:{String(s).padStart(2, "0")}
+        {formatRemaining(remaining)}
       </span>
     </div>
   );

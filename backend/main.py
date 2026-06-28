@@ -91,6 +91,42 @@ def _active_owner() -> Optional[str]:
 KASM_IMAGE = "dshs-kasm-win10"
 
 
+def _list_stopped_containers() -> list[dict]:
+    """중단된 Kasm 컨테이너 목록을 반환한다 (ACTIVE_CONTAINER 포함)."""
+    statuses = ["exited", "dead", "created"]
+    names: set[str] = set()
+    for st in statuses:
+        r = subprocess.run(
+            ["docker", "ps", "-a",
+             "--filter", f"ancestor={KASM_IMAGE}:latest",
+             "--filter", f"status={st}",
+             "--format", "{{.Names}}\t{{.Status}}"],
+            capture_output=True, text=True,
+        )
+        for line in r.stdout.strip().splitlines():
+            parts = line.strip().split("\t", 1)
+            if parts[0]:
+                names.add(parts[0].strip())
+    result = []
+    for name in sorted(names):
+        check = subprocess.run(
+            ["docker", "inspect", "-f",
+             "{{.State.Status}}\t{{.State.FinishedAt}}",
+             name],
+            capture_output=True, text=True,
+        )
+        if check.returncode != 0:
+            continue
+        parts = check.stdout.strip().split("\t", 1)
+        result.append({
+            "name": name,
+            "status": parts[0] if parts else "unknown",
+            "finished_at": parts[1].split(".")[0].replace("T", " ") if len(parts) > 1 else None,
+            "is_saved_session": name == ACTIVE_CONTAINER,
+        })
+    return result
+
+
 def _cleanup_stopped_containers() -> list[str]:
     """중단된 Kasm 컨테이너를 제거하고 삭제된 이름 목록을 반환한다.
     ACTIVE_CONTAINER는 저장된 세션일 수 있으므로 제외한다."""
@@ -405,6 +441,93 @@ async def create_session(
 
 
 @app.get(
+    "/session/{session_id}/stats",
+    dependencies=[Depends(require_key), Depends(require_user)],
+)
+async def get_session_stats(
+    session_id: str,
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    if session_id not in session_store:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    s = session_store[session_id]
+    me = (x_user_email or "").lower()
+    owner = (s.get("owner") or "").lower()
+    if x_user_admin != "1" and (not owner or owner != me):
+        raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
+
+    result: dict = {}
+
+    # CPU & RAM via docker stats
+    docker_r = subprocess.run(
+        ["docker", "stats", "--no-stream", "--format",
+         "{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}",
+         ACTIVE_CONTAINER],
+        capture_output=True, text=True, timeout=5,
+    )
+    if docker_r.returncode == 0:
+        parts = docker_r.stdout.strip().split("\t")
+        if len(parts) >= 3:
+            try:
+                result["cpu_pct"] = float(parts[0].strip().rstrip("%"))
+            except ValueError:
+                pass
+            mem_usage = parts[1].strip()
+            if " / " in mem_usage:
+                used_str, total_str = mem_usage.split(" / ", 1)
+                result["ram_used"] = used_str.strip()
+                result["ram_total"] = total_str.strip()
+            try:
+                result["ram_pct"] = float(parts[2].strip().rstrip("%"))
+            except ValueError:
+                pass
+
+    # GPU via nvidia-smi
+    gpu_r = subprocess.run(
+        ["nvidia-smi",
+         "--query-gpu=utilization.gpu,memory.used,memory.total",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if gpu_r.returncode == 0:
+        gpu_parts = [p.strip() for p in gpu_r.stdout.strip().split(",")]
+        if len(gpu_parts) >= 3:
+            try:
+                result["gpu_pct"] = float(gpu_parts[0])
+                gpu_used = int(gpu_parts[1])
+                gpu_total = int(gpu_parts[2])
+                result["gpu_mem_used_mb"] = gpu_used
+                result["gpu_mem_total_mb"] = gpu_total
+                result["gpu_mem_pct"] = round(gpu_used / gpu_total * 100, 1) if gpu_total else 0
+            except (ValueError, ZeroDivisionError):
+                pass
+
+    # Storage via docker exec df
+    df_r = subprocess.run(
+        ["docker", "exec", ACTIVE_CONTAINER, "df", "/home",
+         "--output=used,size", "-k"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if df_r.returncode == 0:
+        lines = df_r.stdout.strip().splitlines()
+        if len(lines) >= 2:
+            cols = lines[1].split()
+            if len(cols) >= 2:
+                try:
+                    used_kb = int(cols[0])
+                    total_kb = int(cols[1])
+                    result["storage_used_gb"] = round(used_kb / 1024 / 1024, 1)
+                    result["storage_total_gb"] = round(total_kb / 1024 / 1024, 1)
+                    result["storage_pct"] = round(used_kb / total_kb * 100, 1) if total_kb else 0
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+    return result
+
+
+@app.get(
     "/session/{session_id}",
     dependencies=[Depends(require_key), Depends(require_user)],
 )
@@ -463,6 +586,34 @@ async def delete_session(
     session_store.clear()
 
     return {"status": "suspended"}
+
+
+@app.get("/admin/containers", dependencies=[Depends(require_key)])
+async def list_containers():
+    """중단된 Kasm 컨테이너 목록을 반환한다."""
+    containers = _list_stopped_containers()
+    return {"containers": containers}
+
+
+@app.delete("/admin/containers/{name}", dependencies=[Depends(require_key)])
+async def delete_container(name: str):
+    """특정 Kasm 컨테이너를 강제 삭제한다."""
+    check = subprocess.run(
+        ["docker", "inspect", "-f", "{{.Config.Image}}", name],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0 or KASM_IMAGE not in check.stdout:
+        raise HTTPException(status_code=404, detail="컨테이너를 찾을 수 없습니다.")
+
+    r = subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"삭제 실패: {r.stderr.strip()}")
+
+    if name == ACTIVE_CONTAINER:
+        session_store.clear()
+        _clear_session_state()
+
+    return {"removed": name}
 
 
 @app.post("/admin/cleanup", dependencies=[Depends(require_key)])

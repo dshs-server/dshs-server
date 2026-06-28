@@ -36,9 +36,18 @@ interface NodeStatus {
   top_process?: string;
 }
 
-function fmtTime(epoch?: number) {
+interface StoppedContainer {
+  name: string;
+  status: string;
+  finished_at?: string | null;
+  is_saved_session: boolean;
+}
+
+function fmtDatetime(epoch?: number) {
   if (!epoch) return "—";
-  return new Date(epoch * 1000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+  return new Date(epoch * 1000).toLocaleString("ko-KR", {
+    month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
 }
 
 function usageColor(pct: number) {
@@ -112,7 +121,7 @@ function NodeTile({ node }: { node: NodeStatus }) {
           text={node.ram_total_gb ? `${(node.ram_used_gb ?? 0).toFixed(0)}/${node.ram_total_gb}GB` : `${ramPct}%`}
         />
         <UsageBar
-          label="저장"
+          label="SSD"
           pct={storagePct}
           text={node.storage_total_gb ? `${(node.storage_used_gb ?? 0).toFixed(0)}/${node.storage_total_gb}GB` : `${storagePct}%`}
         />
@@ -156,6 +165,9 @@ function AdminPanel() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [editingUser, setEditingUser] = useState<{ email: string; value: string } | null>(null);
   const [nodes, setNodes] = useState<NodeStatus[]>([]);
+  const [containers, setContainers] = useState<StoppedContainer[]>([]);
+  const [containersLoading, setContainersLoading] = useState(false);
+  const [deletingContainer, setDeletingContainer] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -197,10 +209,46 @@ function AdminPanel() {
     }
   }, []);
 
+  const loadContainers = useCallback(async () => {
+    setContainersLoading(true);
+    try {
+      const r = await fetch("/api/admin/containers");
+      if (r.ok) {
+        const d = await r.json();
+        setContainers(d.containers || []);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setContainersLoading(false);
+    }
+  }, []);
+
+  async function handleDeleteContainer(name: string) {
+    setDeletingContainer(name);
+    try {
+      const r = await fetch(`/api/admin/containers/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+      });
+      if (r.ok) {
+        toast(`${name} 삭제 완료`, "success");
+        setContainers((prev) => prev.filter((c) => c.name !== name));
+        load();
+      } else {
+        toast("삭제 실패", "error");
+      }
+    } catch {
+      toast("백엔드 연결 실패", "error");
+    } finally {
+      setDeletingContainer(null);
+    }
+  }
+
   useEffect(() => {
     load();
     loadNodes();
     loadUsers();
+    loadContainers();
     fetch("/api/notice")
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => d?.notice && setNotice(d.notice))
@@ -209,7 +257,7 @@ function AdminPanel() {
     const ivSession = setInterval(load, 5000);
     const ivNodes   = setInterval(loadNodes, 3000);
     return () => { clearInterval(ivSession); clearInterval(ivNodes); };
-  }, [load, loadNodes, loadUsers]);
+  }, [load, loadNodes, loadUsers, loadContainers]);
 
   async function doAction(action: string, label: string) {
     setBusy(true);
@@ -319,8 +367,8 @@ function AdminPanel() {
                 <div style={rowGrid}>
                   <Info label="사용자"    value={data.active.owner  || "—"} />
                   <Info label="상태"      value={data.active.status || "ready"} />
-                  <Info label="시작"      value={fmtTime(data.active.since)} />
-                  <Info label="만료 예정" value={fmtTime(data.active.expires_at)} />
+                  <Info label="시작"      value={fmtDatetime(data.active.since)} />
+                  <Info label="만료 예정" value={fmtDatetime(data.active.expires_at)} />
                 </div>
                 <button className="btn btn-danger" style={{ marginTop: "16px" }} disabled={busy}
                   onClick={() => doAction("terminate", "세션 강제 종료")}>
@@ -357,11 +405,54 @@ function AdminPanel() {
 
           {/* 유지보수 */}
           <section className="glass glass-strong fade-in" style={card}>
-            <h3 style={h3}>유지보수</h3>
-            <button className="btn btn-ghost" disabled={busy}
-              onClick={() => doAction("cleanup", "중단 컨테이너 정리")}>
-              중단된 컨테이너 정리
-            </button>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "14px", flexWrap: "wrap", gap: "8px" }}>
+              <h3 style={{ ...h3, margin: 0 }}>유지보수</h3>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <button className="btn btn-ghost" style={{ padding: "6px 12px", fontSize: "12px" }}
+                  disabled={containersLoading} onClick={loadContainers}>
+                  {containersLoading ? "조회 중…" : "목록 새로고침"}
+                </button>
+                <button className="btn btn-ghost" disabled={busy}
+                  onClick={() => { doAction("cleanup", "중단 컨테이너 전체 정리"); loadContainers(); }}>
+                  전체 정리
+                </button>
+              </div>
+            </div>
+
+            {containers.length === 0 ? (
+              <p style={{ color: "var(--text-dim)", fontSize: "13px", margin: 0 }}>
+                {containersLoading ? "조회 중…" : "중단된 컨테이너 없음"}
+              </p>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {containers.map((c) => (
+                  <div key={c.name} className="glass"
+                    style={{ padding: "12px 14px", display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: "13px", fontFamily: "monospace", wordBreak: "break-all" }}>
+                        {c.name}
+                        {c.is_saved_session && (
+                          <span style={{ marginLeft: "6px", fontSize: "11px", color: "var(--warning)", fontFamily: "sans-serif" }}>
+                            저장된 세션
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: "11px", color: "var(--text-faint)", marginTop: "2px" }}>
+                        {c.status}{c.finished_at ? ` · ${c.finished_at}` : ""}
+                      </div>
+                    </div>
+                    <button
+                      className="btn btn-danger"
+                      style={{ padding: "5px 12px", fontSize: "12px", flexShrink: 0 }}
+                      disabled={deletingContainer === c.name || busy}
+                      onClick={() => handleDeleteContainer(c.name)}
+                    >
+                      {deletingContainer === c.name ? "삭제 중…" : "강제 삭제"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
 
           {/* 사용자 관리 */}
