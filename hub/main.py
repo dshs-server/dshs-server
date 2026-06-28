@@ -1140,6 +1140,17 @@ async def admin_cleanup(node_id: Optional[str] = Query(None)):
     return {"nodes": results}
 
 
+@app.get("/admin/log", dependencies=[Depends(require_key)])
+async def get_today_log(date: Optional[str] = Query(None)):
+    target = date or datetime.now().strftime("%Y-%m-%d")
+    log_path = os.path.join(LOG_DIR, f"{target}.log")
+    if not os.path.isfile(log_path):
+        return {"date": target, "content": None}
+    with open(log_path, encoding="utf-8") as f:
+        content = f.read()
+    return {"date": target, "content": content}
+
+
 @app.get("/notice", dependencies=[Depends(require_key)])
 async def get_notice():
     doc = await db.collection(COL_CONFIG).document("notice").get()

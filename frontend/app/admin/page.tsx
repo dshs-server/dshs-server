@@ -168,6 +168,9 @@ function AdminPanel() {
   const [containers, setContainers] = useState<StoppedContainer[]>([]);
   const [containersLoading, setContainersLoading] = useState(false);
   const [deletingContainer, setDeletingContainer] = useState<string | null>(null);
+  const [logContent, setLogContent] = useState<string | null>(null);
+  const [logDate, setLogDate] = useState<string>("");
+  const [logLoading, setLogLoading] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -206,6 +209,23 @@ function AdminPanel() {
       }
     } catch {
       // ignore
+    }
+  }, []);
+
+  const loadLog = useCallback(async (date?: string) => {
+    setLogLoading(true);
+    try {
+      const url = date ? `/api/admin/log?date=${encodeURIComponent(date)}` : "/api/admin/log";
+      const r = await fetch(url);
+      if (r.ok) {
+        const d = await r.json();
+        setLogContent(d.content ?? null);
+        setLogDate(d.date ?? "");
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLogLoading(false);
     }
   }, []);
 
@@ -249,6 +269,7 @@ function AdminPanel() {
     loadNodes();
     loadUsers();
     loadContainers();
+    loadLog();
     fetch("/api/notice")
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => d?.notice && setNotice(d.notice))
@@ -257,7 +278,7 @@ function AdminPanel() {
     const ivSession = setInterval(load, 5000);
     const ivNodes   = setInterval(loadNodes, 3000);
     return () => { clearInterval(ivSession); clearInterval(ivNodes); };
-  }, [load, loadNodes, loadUsers, loadContainers]);
+  }, [load, loadNodes, loadUsers, loadContainers, loadLog]);
 
   async function doAction(action: string, label: string) {
     setBusy(true);
@@ -498,6 +519,39 @@ function AdminPanel() {
                   </div>
                 ))}
               </div>
+            )}
+          </section>
+          {/* 모니터링 로그 */}
+          <section className="glass glass-strong fade-in" style={card}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "14px", flexWrap: "wrap", gap: "8px" }}>
+              <h3 style={{ ...h3, margin: 0 }}>모니터링 로그</h3>
+              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                <input
+                  type="date"
+                  value={logDate}
+                  onChange={(e) => setLogDate(e.target.value)}
+                  style={{ padding: "5px 8px", borderRadius: "8px", background: "rgba(255,255,255,0.08)", border: "1px solid var(--glass-border)", color: "var(--text)", fontSize: "12px" }}
+                />
+                <button className="btn btn-ghost" style={{ padding: "6px 12px", fontSize: "12px" }}
+                  disabled={logLoading} onClick={() => loadLog(logDate || undefined)}>
+                  {logLoading ? "조회 중…" : "조회"}
+                </button>
+              </div>
+            </div>
+            {logContent === null ? (
+              <p style={{ color: "var(--text-dim)", fontSize: "13px", margin: 0 }}>
+                {logLoading ? "불러오는 중…" : `${logDate || "오늘"} 로그 없음 (10분마다 기록)`}
+              </p>
+            ) : (
+              <pre style={{
+                margin: 0, padding: "14px", borderRadius: "10px",
+                background: "rgba(0,0,0,0.3)", fontSize: "11.5px",
+                lineHeight: 1.65, overflowX: "auto", overflowY: "auto",
+                maxHeight: "480px", whiteSpace: "pre-wrap", wordBreak: "break-all",
+                color: "var(--text-dim)", fontFamily: "monospace",
+              }}>
+                {logContent}
+              </pre>
             )}
           </section>
         </div>
