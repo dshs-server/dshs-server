@@ -95,6 +95,7 @@ function Dashboard() {
   const [replaceSessionId, setReplaceSessionId] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [showGuide, setShowGuide] = useState(false);
+  const [showNavWarning, setShowNavWarning] = useState<"logout" | "admin" | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -172,6 +173,7 @@ function Dashboard() {
     setElapsed(0);
     setSessionId(null);
     expiredRef.current = false;
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
 
     try {
@@ -233,6 +235,7 @@ function Dashboard() {
     setElapsed(0);
     setSessionId(null);
     expiredRef.current = false;
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
 
     try {
@@ -309,10 +312,31 @@ function Dashboard() {
     }
   }
 
-  async function handleLogout() {
+  async function doLogout() {
     await fetch("/api/logout", { method: "POST" });
     router.push("/login");
   }
+
+  function handleLogout() {
+    if (status === "starting") { setShowNavWarning("logout"); return; }
+    doLogout();
+  }
+
+  function handleAdminNav() {
+    if (status === "starting") { setShowNavWarning("admin"); return; }
+    router.push("/admin");
+  }
+
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (status === "starting") {
+        e.preventDefault();
+        e.returnValue = "";
+      }
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [status]);
 
   useEffect(() => {
     if (status !== "ready" || !expiresAt) {
@@ -410,6 +434,10 @@ function Dashboard() {
         if (data.status === "starting" && data.session_id) {
           setSessionId(data.session_id);
           setStatus("starting");
+          setElapsed(0);
+          expiredRef.current = false;
+          if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+          timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
           startPolling(data.session_id);
           return;
         }
@@ -444,7 +472,7 @@ function Dashboard() {
 
   return (
     <div className="page">
-      <Header me={me} onLogout={handleLogout} onHelp={() => setShowGuide(true)} />
+      <Header me={me} onLogout={handleLogout} onHelp={() => setShowGuide(true)} onAdmin={handleAdminNav} />
 
       <main style={mainWrap}>
         {notice && <NoticeBanner text={notice} />}
@@ -550,6 +578,25 @@ function Dashboard() {
       )}
 
       <GuideModal open={showGuide} onClose={() => setShowGuide(false)} />
+
+      {showNavWarning && (
+        <ConfirmModal
+          title="데스크톱 준비 중"
+          message={
+            showNavWarning === "logout"
+              ? "데스크톱 환경을 준비하는 중입니다. 지금 로그아웃하면 준비가 중단될 수 있습니다. 로그아웃 하시겠습니까?"
+              : "데스크톱 환경을 준비하는 중입니다. 지금 관리자 페이지로 이동하면 준비가 중단될 수 있습니다. 계속 하시겠습니까?"
+          }
+          confirmLabel={showNavWarning === "logout" ? "로그아웃" : "이동"}
+          onConfirm={() => {
+            const target = showNavWarning;
+            setShowNavWarning(null);
+            if (target === "logout") doLogout();
+            else router.push("/admin");
+          }}
+          onCancel={() => setShowNavWarning(null)}
+        />
+      )}
     </div>
   );
 }
@@ -560,10 +607,12 @@ function Header({
   me,
   onLogout,
   onHelp,
+  onAdmin,
 }: {
   me: Me | null;
   onLogout: () => void;
   onHelp: () => void;
+  onAdmin: () => void;
 }) {
   return (
     <header style={header}>
@@ -582,9 +631,9 @@ function Header({
         )}
         <HelpButton onClick={onHelp} />
         {me?.isAdmin && (
-          <a href="/admin" className="btn btn-ghost" style={smallBtn}>
+          <button className="btn btn-ghost" style={smallBtn} onClick={onAdmin}>
             관리자
-          </a>
+          </button>
         )}
         <button className="btn btn-ghost" style={smallBtn} onClick={onLogout}>
           로그아웃

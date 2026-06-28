@@ -43,7 +43,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
 # 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
 SHARED_BASE = os.environ.get("SHARED_BASE", "")
 # 컨테이너 안에서 사용자에게 보이는 경로 (Kasm 기본 사용자 kasm-user의 바탕화면)
-DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/Desktop/받은파일")
+DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/받은파일")
 # 업로드 토큰 서명 키 — Vercel과 공유. 별도 설정 없으면 API_KEY 재사용.
 UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET", API_KEY)
 
@@ -276,10 +276,9 @@ def _container_name(session_id: str) -> str:
     return f"kasm_{session_id}"
 
 def _session_url(session_id: str, kasm_url: str) -> str:
-    base = kasm_url.removeprefix("https://").rstrip("/")
-    return f"https://{session_id}.{base}/"
+    return f"{kasm_url.rstrip('/')}/{session_id}/"
 
-async def _allocate_port(node_id: str) -> int:
+async def _allocate_port(node_id: str, node_ip: str, ssh_user: str) -> int:
     snap = await (
         db.collection(COL_SESSIONS)
         .where("node_id", "==", node_id)
@@ -287,17 +286,25 @@ async def _allocate_port(node_id: str) -> int:
         .get()
     )
     used = {s.to_dict().get("port") for s in snap if s.to_dict().get("port")}
+    # 실제 docker 포트도 확인 (Firestore에 없는 orphaned 컨테이너 대비)
+    stdout, _ = await _ssh(
+        node_ip,
+        "docker ps --format '{{.Ports}}' | grep -oP '0\\.0\\.0\\.0:\\K\\d+(?=->)'",
+        ssh_user,
+    )
+    for p in stdout.splitlines():
+        try:
+            used.add(int(p))
+        except ValueError:
+            pass
     for port in range(PORT_BASE, PORT_MAX + 1):
         if port not in used:
             return port
     raise HTTPException(503, "노드 포트 부족 — 최대 세션 수 초과")
 
-_NGINX_BLOCK = """\
-server {{
-    listen 80;
-    server_name {hostname};
-    location / {{
-        proxy_pass https://localhost:{port};
+_NGINX_LOCATION = """\
+    location /{session_id}/ {{
+        proxy_pass https://localhost:{port}/;
         proxy_set_header Authorization "Basic a2FzbV91c2VyOnRlc3QxMjM0";
         proxy_set_header Host $host;
         proxy_ssl_verify off;
@@ -306,8 +313,7 @@ server {{
         proxy_set_header Connection "upgrade";
         proxy_read_timeout 3600;
         proxy_send_timeout 3600;
-    }}
-}}"""
+    }}"""
 
 async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str):
     snap = await (
@@ -316,13 +322,14 @@ async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str
         .where("status", "in", ["active", "starting", "suspended"])
         .get()
     )
-    base = kasm_url.removeprefix("https://").rstrip("/")
-    blocks = [
-        _NGINX_BLOCK.format(hostname=f"{doc.id}.{base}", port=s["port"])
+    domain = kasm_url.removeprefix("https://").rstrip("/")
+    locations = [
+        _NGINX_LOCATION.format(session_id=doc.id, port=s["port"])
         for doc in snap
         if (s := doc.to_dict()).get("port")
     ]
-    config = "\n\n".join(blocks) if blocks else "# no sessions"
+    inner = "\n".join(locations) if locations else "    # no sessions"
+    config = f"server {{\n    listen 80;\n    server_name {domain};\n{inner}\n}}"
     b64 = base64.b64encode(config.encode()).decode()
     cmd = (
         f"echo {b64} | base64 -d > /home/{ssh_user}/.nginx-kasm.conf "
@@ -528,6 +535,23 @@ async def get_session(
             "suspended_sessions": suspended_sessions,
         }
 
+    if dock in ("none", "dead"):
+        # 컨테이너가 없거나 완전히 죽음 — stale 세션 정리
+        await db.collection(COL_SESSIONS).document(session_id).delete()
+        return {"status": "none", "suspended_sessions": suspended_sessions}
+
+    if dock == "exited":
+        # 컨테이너가 중지됨 — suspended로 전환
+        await db.collection(COL_SESSIONS).document(session_id).update({
+            "status": "suspended",
+            "suspended_at": time.time(),
+        })
+        suspended_sessions = [{"id": session_id, "project_name": s.get("project_name", ""),
+                                "saved_at": time.time(), "team_members": s.get("team_members", []),
+                                "resources": s.get("resources", {})}] + suspended_sessions
+        return {"status": "none", "suspended_sessions": suspended_sessions}
+
+    # restarting, paused 등 — 실제로 준비 중
     return {"status": "starting", "session_id": session_id, "suspended_sessions": suspended_sessions}
 
 
@@ -553,6 +577,8 @@ async def poll_session(
     if dock == "running":
         url = s.get("url") or _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
         return {"status": "ready", "url": url}
+    if dock in ("exited", "dead"):
+        return {"status": "error", "message": "컨테이너가 예기치 않게 종료되었습니다."}
     return {"status": "starting"}
 
 
@@ -645,7 +671,7 @@ async def create_session(
     kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
 
     new_id = uuid.uuid4().hex[:8]
-    port = await _allocate_port(node_id)
+    port = await _allocate_port(node_id, node["ip"], _suser)
     container = _container_name(new_id)
 
     # 사용자별 공유 폴더 준비 후 컨테이너 바탕화면에 bind-mount → 업로드한 파일이 보임
@@ -663,7 +689,16 @@ async def create_session(
     )
     stdout, rc = await _ssh(node["ip"], cmd, _suser)
     if rc != 0:
-        raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
+        # GPU 드라이버 미매치(NVML error, rc=125) 등 GPU 실패 → CPU 모드로 재시도
+        await _ssh(node["ip"], f"docker rm -f {container} 2>/dev/null || true", _suser)
+        cmd_no_gpu = (
+            f"docker run -d --name {container} --restart unless-stopped "
+            f"--shm-size=2gb -p {port}:6901 {_mount_arg(me, _suser)} "
+            f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
+        )
+        stdout, rc = await _ssh(node["ip"], cmd_no_gpu, _suser)
+        if rc != 0:
+            raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
 
     duration = (body.duration_days if body else None) or 7
     await db.collection(COL_SESSIONS).document(new_id).set({
