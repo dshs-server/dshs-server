@@ -108,14 +108,14 @@ PYEOF"""
 _DOCKER_STATUS_CMD = "docker inspect active_session 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d[0]['State']['Status'])\" 2>/dev/null || echo none"
 
 
-async def _ssh(host: str, command: str) -> tuple[str, int]:
+async def _ssh(host: str, command: str, ssh_user: str = SSH_USER) -> tuple[str, int]:
     """Run command on remote node. Returns (stdout, returncode). -1 on connection failure."""
     try:
         async with asyncssh.connect(
             host,
-            username=SSH_USER,
+            username=ssh_user,
             password=SSH_PASSWORD,
-            known_hosts=None,  # Tailscale 내부망 — 호스트 검증 불필요
+            known_hosts=None,  # 내부망 직통 — 호스트 검증 불필요
             connect_timeout=10,
         ) as conn:
             r = await conn.run(command)
@@ -127,8 +127,8 @@ async def _ssh(host: str, command: str) -> tuple[str, int]:
 # ── Background polling ────────────────────────────────────────────────────────
 
 
-async def _collect_metrics(node_id: str, ip: str) -> dict:
-    stdout, rc = await _ssh(ip, _METRICS_SCRIPT)
+async def _collect_metrics(node_id: str, ip: str, ssh_user: str = SSH_USER) -> dict:
+    stdout, rc = await _ssh(ip, _METRICS_SCRIPT, ssh_user)
     if rc != 0 or not stdout:
         return {"offline": True}
     try:
@@ -148,11 +148,11 @@ async def _poll_nodes_loop():
 
             if nodes:
                 results = await asyncio.gather(
-                    *[_collect_metrics(n["id"], n["tailscale_ip"]) for n in nodes],
+                    *[_collect_metrics(n["id"], n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes],
                     return_exceptions=True,
                 )
-                # node_id → tailscale_ip lookup (metrics dict에는 IP 없음)
-                node_ips = {n["id"]: n["tailscale_ip"] for n in nodes}
+                # node_id → (ip, ssh_user) lookup
+                node_info = {n["id"]: (n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes}
 
                 for node, result in zip(nodes, results):
                     if isinstance(result, Exception):
@@ -172,9 +172,9 @@ async def _poll_nodes_loop():
                     nid = s.get("node_id", "")
                     # Auto-expire
                     if s.get("expires_at") and now >= s["expires_at"]:
-                        ip = node_ips.get(nid)
-                        if ip and not _metrics.get(nid, {}).get("offline"):
-                            await _ssh(ip, f"docker stop {ACTIVE_CONTAINER}")
+                        node_ip, node_suser = node_info.get(nid, (None, SSH_USER))
+                        if node_ip and not _metrics.get(nid, {}).get("offline"):
+                            await _ssh(node_ip, f"docker stop {ACTIVE_CONTAINER}", node_suser)
                         await doc.reference.update({"status": "suspended", "suspended_at": now})
                         continue
                     # starting → active when docker running
@@ -247,12 +247,12 @@ async def _count_active_sessions(email: str) -> int:
     return len(docs)
 
 
-async def _docker_status(node_id: str, ip: str) -> str:
+async def _docker_status(node_id: str, ip: str, ssh_user: str = SSH_USER) -> str:
     """Docker status from cache if fresh (<20s), else direct SSH."""
     m = _metrics.get(node_id, {})
     if not m.get("offline") and time.time() - m.get("last_seen", 0) < 20:
         return m.get("docker", "none")
-    stdout, rc = await _ssh(ip, _DOCKER_STATUS_CMD)
+    stdout, rc = await _ssh(ip, _DOCKER_STATUS_CMD, ssh_user)
     return stdout if rc == 0 and stdout else "none"
 
 
@@ -387,7 +387,7 @@ async def get_session(
 
     session_id, s = active[0]
     node = await _get_node(s["node_id"])
-    dock = await _docker_status(s["node_id"], node["tailscale_ip"])
+    dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
 
     if dock == "running":
         return {
@@ -417,7 +417,7 @@ async def poll_session(
         raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
 
     node = await _get_node(s["node_id"])
-    dock = await _docker_status(s["node_id"], node["tailscale_ip"])
+    dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
 
     if dock == "running":
         return {"status": "ready", "url": node.get("kasm_url", "https://kasm.dshs-app.net")}
@@ -448,8 +448,9 @@ async def create_session(
         target = next((d for d in docs if d.id == session_id), docs[0]) if session_id else docs[0]
         s = target.to_dict()
         node = await _get_node(s["node_id"])
+        _suser = node.get("ssh_user", SSH_USER)
 
-        stdout, rc = await _ssh(node["tailscale_ip"], f"docker start {ACTIVE_CONTAINER}")
+        stdout, rc = await _ssh(node["ip"], f"docker start {ACTIVE_CONTAINER}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
 
@@ -471,7 +472,7 @@ async def create_session(
             old_s = old_doc.to_dict()
             if old_s.get("owner") == me or is_admin:
                 node = await _get_node(old_s["node_id"])
-                await _ssh(node["tailscale_ip"], f"docker rm -f {ACTIVE_CONTAINER}")
+                await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
                 await old_doc.reference.delete()
 
     # Pick node
@@ -492,15 +493,16 @@ async def create_session(
             raise HTTPException(status_code=503, detail="사용 가능한 PC가 없습니다.")
 
     node = await _get_node(node_id)
+    _suser = node.get("ssh_user", SSH_USER)
 
     # Tear down any existing container on this node
-    await _ssh(node["tailscale_ip"], f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true")
+    await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true", _suser)
 
     cmd = (
         f"docker run -d --name {ACTIVE_CONTAINER} --restart unless-stopped "
         f"--gpus all --shm-size=2gb -p 8080:6901 -e VNC_PW=test1234 {KASM_IMAGE}:latest"
     )
-    stdout, rc = await _ssh(node["tailscale_ip"], cmd)
+    stdout, rc = await _ssh(node["ip"], cmd, _suser)
     if rc != 0:
         raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
 
@@ -537,13 +539,14 @@ async def delete_session(
         raise HTTPException(status_code=403, detail="본인 세션만 종료할 수 있습니다.")
 
     node = await _get_node(s["node_id"])
+    _suser = node.get("ssh_user", SSH_USER)
 
     if permanent:
-        await _ssh(node["tailscale_ip"], f"docker rm -f {ACTIVE_CONTAINER}")
+        await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", _suser)
         await doc.reference.delete()
         return {"message": "세션을 완전히 삭제했습니다."}
 
-    await _ssh(node["tailscale_ip"], f"docker stop {ACTIVE_CONTAINER}")
+    await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", _suser)
     await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
     return {"status": "suspended"}
 
@@ -640,8 +643,8 @@ async def update_user(email: str, body: dict):
 
 class NodeBody(BaseModel):
     name: str
-    tailscale_ip: str
-    ssh_user: str = "admin-swai"
+    ip: str
+    ssh_user: str = "ai-admin"
     cpu: str = ""
     cpu_cores: int = 0
     gpu: str = ""
@@ -709,7 +712,7 @@ async def admin_terminate(node_id: Optional[str] = Query(None)):
         if node_id and s.get("node_id") != node_id:
             continue
         node = await _get_node(s["node_id"])
-        await _ssh(node["tailscale_ip"], f"docker stop {ACTIVE_CONTAINER}")
+        await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
         await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
         terminated.append(doc.id)
     return {"terminated": terminated, "count": len(terminated)}
@@ -723,7 +726,7 @@ async def admin_cleanup(node_id: Optional[str] = Query(None)):
         if node_id and doc.id != node_id:
             continue
         n = doc.to_dict()
-        stdout, rc = await _ssh(n["tailscale_ip"], _CLEANUP_CMD)
+        stdout, rc = await _ssh(n["ip"], _CLEANUP_CMD, n.get("ssh_user", SSH_USER))
         results[doc.id] = {"removed": stdout.strip(), "ok": rc == 0}
     return {"nodes": results}
 
