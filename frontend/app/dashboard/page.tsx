@@ -3,6 +3,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { ToastProvider, useToast } from "@/components/toast";
+import { HelpButton, GuideBanner, GuideModal } from "@/components/guide";
+import { UploadButton } from "@/components/upload";
 
 type Status = "checking" | "idle" | "starting" | "ready" | "busy" | "queued" | "error";
 
@@ -77,6 +79,7 @@ function Dashboard() {
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [replaceSessionId, setReplaceSessionId] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [showGuide, setShowGuide] = useState(false);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -396,10 +399,11 @@ function Dashboard() {
 
   return (
     <div className="page">
-      <Header me={me} onLogout={handleLogout} />
+      <Header me={me} onLogout={handleLogout} onHelp={() => setShowGuide(true)} />
 
       <main style={mainWrap}>
         {notice && <NoticeBanner text={notice} />}
+        <GuideBanner onOpen={() => setShowGuide(true)} />
 
         <div className="glass glass-strong fade-in" style={card}>
           <div style={cardHead}>
@@ -497,13 +501,23 @@ function Dashboard() {
           onCancel={() => setPendingDeleteId(null)}
         />
       )}
+
+      <GuideModal open={showGuide} onClose={() => setShowGuide(false)} />
     </div>
   );
 }
 
 /* ─────────────────────── 하위 컴포넌트 ─────────────────────── */
 
-function Header({ me, onLogout }: { me: Me | null; onLogout: () => void }) {
+function Header({
+  me,
+  onLogout,
+  onHelp,
+}: {
+  me: Me | null;
+  onLogout: () => void;
+  onHelp: () => void;
+}) {
   return (
     <header style={header}>
       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -519,6 +533,7 @@ function Header({ me, onLogout }: { me: Me | null; onLogout: () => void }) {
             {me.email}
           </span>
         )}
+        <HelpButton onClick={onHelp} />
         {me?.isAdmin && (
           <a href="/admin" className="btn btn-ghost" style={smallBtn}>
             관리자
@@ -1052,6 +1067,7 @@ function ReadyState({
       <p style={{ fontSize: "12.5px", color: "var(--text-faint)", margin: "0 0 16px" }}>
         ※ 처음 접속 시 바탕화면 로딩에 1~2분이 걸릴 수 있습니다.
       </p>
+      <UploadButton />
       <button className="btn btn-danger" onClick={onTerminate}>세션 종료</button>
     </div>
   );
