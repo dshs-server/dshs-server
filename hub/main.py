@@ -6,8 +6,13 @@ Architecture:
   In-memory metrics cache: updated every 10s via SSH from each node
 """
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
+import re
+import shlex
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,7 +21,7 @@ from typing import Optional
 import asyncssh
 import firebase_admin
 from firebase_admin import credentials, firestore_async
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -31,6 +36,14 @@ if not SSH_PASSWORD:
 KASM_IMAGE = os.environ.get("KASM_IMAGE", "dshs-kasm-win10")
 ACTIVE_CONTAINER = "active_session"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
+
+# 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
+# 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
+SHARED_BASE = os.environ.get("SHARED_BASE", "")
+# 컨테이너 안에서 사용자에게 보이는 경로 (Kasm 기본 사용자 kasm-user의 바탕화면)
+DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/Desktop/받은파일")
+# 업로드 토큰 서명 키 — Vercel과 공유. 별도 설정 없으면 API_KEY 재사용.
+UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET", API_KEY)
 
 # ── Firebase ──────────────────────────────────────────────────────────────────
 
@@ -264,6 +277,59 @@ def _node_session_state(node_id: str, sessions: list[dict]) -> str:
             if s.get("status") == "suspended":
                 return "suspended"
     return "none"
+
+
+# ── File transfer helpers ─────────────────────────────────────────────────────
+
+
+def _share_key(email: str) -> str:
+    """이메일을 안전한 디렉터리 이름으로 변환한다 (사용자별 공유 폴더 키)."""
+    return re.sub(r"[^a-z0-9._@-]", "_", (email or "anon").lower()) or "anon"
+
+
+def _shared_base(ssh_user: str) -> str:
+    """노드 호스트의 공유 폴더 베이스. SHARED_BASE env가 있으면 그대로, 없으면 노드 ssh_user 홈 기준."""
+    return SHARED_BASE or f"/home/{ssh_user}/dshs-shared"
+
+
+def _share_dir(email: str, ssh_user: str) -> str:
+    return f"{_shared_base(ssh_user)}/{_share_key(email)}"
+
+
+def _mount_arg(email: str, ssh_user: str) -> str:
+    """docker run 에 붙일 -v 옵션 문자열. 사용자 공유 폴더 → 컨테이너 바탕화면."""
+    return f"-v {shlex.quote(_share_dir(email, ssh_user))}:{shlex.quote(DESKTOP_SHARE)}"
+
+
+def _verify_upload_token(token: str) -> str:
+    """Vercel이 발급한 HMAC 업로드 토큰을 검증하고 email을 반환한다.
+
+    토큰 형식: base64url(`<email>|<exp>`) + '.' + HMAC-SHA256(UPLOAD_SECRET, payload_b64)
+    """
+    if not token or "." not in token:
+        raise HTTPException(status_code=401, detail="업로드 토큰이 없습니다.")
+    payload_b64, sig = token.rsplit(".", 1)
+    expected = hmac.new(
+        UPLOAD_SECRET.encode(), payload_b64.encode(), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(status_code=401, detail="업로드 토큰 서명이 올바르지 않습니다.")
+    try:
+        pad = "=" * (-len(payload_b64) % 4)
+        payload = base64.urlsafe_b64decode(payload_b64 + pad).decode()
+        email, exp = payload.rsplit("|", 1)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=401, detail="업로드 토큰 형식이 올바르지 않습니다.")
+    if time.time() > float(exp):
+        raise HTTPException(status_code=401, detail="업로드 토큰이 만료되었습니다. 새로고침 후 다시 시도해주세요.")
+    return email.lower()
+
+
+async def _container_has_share_mount(host: str, ssh_user: str = SSH_USER) -> bool:
+    """실행 중인 컨테이너에 받은파일 bind-mount가 이미 걸려 있는지 확인한다."""
+    tmpl = "{{range .Mounts}}{{.Destination}}\n{{end}}"
+    out, rc = await _ssh(host, f"docker inspect -f '{tmpl}' {ACTIVE_CONTAINER}", ssh_user)
+    return rc == 0 and DESKTOP_SHARE in out
 
 
 # ── Routes: health ────────────────────────────────────────────────────────────
@@ -525,9 +591,18 @@ async def create_session(
     # (replace_session_id case already cleaned up above; auto-picked node is guaranteed clean)
     await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true", _suser)
 
+    # 사용자별 공유 폴더 준비 후 컨테이너 바탕화면에 bind-mount → 업로드한 파일이 보임
+    share_dir = _share_dir(me, _suser)
+    await _ssh(
+        node["ip"],
+        f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}",
+        _suser,
+    )
+
     cmd = (
         f"docker run -d --name {ACTIVE_CONTAINER} --restart unless-stopped "
-        f"--gpus all --shm-size=2gb -p 8080:6901 -e VNC_PW=test1234 {KASM_IMAGE}:latest"
+        f"--gpus all --shm-size=2gb -p 8080:6901 {_mount_arg(me, _suser)} "
+        f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
     )
     stdout, rc = await _ssh(node["ip"], cmd, _suser)
     if rc != 0:
@@ -576,6 +651,86 @@ async def delete_session(
     await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", _suser)
     await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
     return {"status": "suspended"}
+
+
+# ── Routes: file upload ───────────────────────────────────────────────────────
+
+
+@app.post("/upload")
+async def upload_files(
+    files: list[UploadFile] = File(...),
+    x_upload_token: str = Header(""),
+):
+    """학생 브라우저가 LAN으로 직접 호출. 토큰으로 본인 확인 후, 본인 세션이
+    떠 있는 노드의 공유 폴더로 파일을 전송한다. 컨테이너 바탕화면/받은파일에서 보임."""
+    email = _verify_upload_token(x_upload_token)
+
+    # 본인의 세션 노드 찾기 (활성/시작중 우선, 없으면 저장된 세션)
+    snap = await db.collection(COL_SESSIONS).where("owner", "==", email).get()
+    sessions = [doc.to_dict() for doc in snap]
+    target = next(
+        (s for s in sessions if s.get("status") in ("active", "starting")),
+        next((s for s in sessions if s.get("status") == "suspended"), None),
+    )
+    if not target:
+        raise HTTPException(
+            status_code=400, detail="먼저 PC 세션을 시작한 뒤 파일을 보낼 수 있습니다."
+        )
+
+    node = await _get_node(target["node_id"])
+    host = node["ip"]
+    ssh_user = node.get("ssh_user", SSH_USER)
+    share_dir = _share_dir(email, ssh_user)
+
+    await _ssh(host, f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}", ssh_user)
+    has_mount = await _container_has_share_mount(host, ssh_user)
+
+    saved: list[str] = []
+    try:
+        async with asyncssh.connect(
+            host,
+            username=ssh_user,
+            password=SSH_PASSWORD,
+            known_hosts=None,
+            connect_timeout=10,
+        ) as conn:
+            async with conn.start_sftp_client() as sftp:
+                for f in files:
+                    fname = os.path.basename(f.filename or "file") or "file"
+                    remote = f"{share_dir}/{fname}"
+                    async with sftp.open(remote, "wb") as rf:
+                        while True:
+                            chunk = await f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            await rf.write(chunk)
+                    await conn.run(f"chmod 666 {shlex.quote(remote)}")
+                    saved.append(fname)
+
+            # 마운트 없이 이미 떠 있는 컨테이너에는 docker cp로 즉시 반영
+            if not has_mount:
+                await conn.run(
+                    f"docker exec -u root {ACTIVE_CONTAINER} mkdir -p {shlex.quote(DESKTOP_SHARE)}"
+                )
+                for fname in saved:
+                    remote = f"{share_dir}/{fname}"
+                    await conn.run(
+                        f"docker cp {shlex.quote(remote)} "
+                        f"{ACTIVE_CONTAINER}:{shlex.quote(DESKTOP_SHARE + '/')}"
+                    )
+                await conn.run(
+                    f"docker exec -u root {ACTIVE_CONTAINER} "
+                    f"chown -R 1000:1000 {shlex.quote(DESKTOP_SHARE)}"
+                )
+    except (OSError, asyncssh.Error) as e:
+        raise HTTPException(status_code=502, detail=f"노드 전송 실패: {e}")
+
+    return {
+        "uploaded": saved,
+        "count": len(saved),
+        "node": node.get("name", target["node_id"]),
+        "live": has_mount or target.get("status") in ("active", "starting"),
+    }
 
 
 # ── Routes: admin monitoring ──────────────────────────────────────────────────
