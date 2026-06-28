@@ -38,8 +38,8 @@ ACTIVE_CONTAINER = "active_session"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
 
 # 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
-# SSH_USER 홈 아래에 두어 sudo 없이 쓰기 가능하게 한다.
-SHARED_BASE = os.environ.get("SHARED_BASE", f"/home/{SSH_USER}/dshs-shared")
+# 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
+SHARED_BASE = os.environ.get("SHARED_BASE", "")
 # 컨테이너 안에서 사용자에게 보이는 경로 (Kasm 기본 사용자 kasm-user의 바탕화면)
 DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/Desktop/받은파일")
 # 업로드 토큰 서명 키 — Vercel과 공유. 별도 설정 없으면 API_KEY 재사용.
@@ -121,14 +121,14 @@ PYEOF"""
 _DOCKER_STATUS_CMD = "docker inspect active_session 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d[0]['State']['Status'])\" 2>/dev/null || echo none"
 
 
-async def _ssh(host: str, command: str) -> tuple[str, int]:
+async def _ssh(host: str, command: str, ssh_user: str = SSH_USER) -> tuple[str, int]:
     """Run command on remote node. Returns (stdout, returncode). -1 on connection failure."""
     try:
         async with asyncssh.connect(
             host,
-            username=SSH_USER,
+            username=ssh_user,
             password=SSH_PASSWORD,
-            known_hosts=None,  # Tailscale 내부망 — 호스트 검증 불필요
+            known_hosts=None,  # 내부망 직통 — 호스트 검증 불필요
             connect_timeout=10,
         ) as conn:
             r = await conn.run(command)
@@ -140,8 +140,8 @@ async def _ssh(host: str, command: str) -> tuple[str, int]:
 # ── Background polling ────────────────────────────────────────────────────────
 
 
-async def _collect_metrics(node_id: str, ip: str) -> dict:
-    stdout, rc = await _ssh(ip, _METRICS_SCRIPT)
+async def _collect_metrics(node_id: str, ip: str, ssh_user: str = SSH_USER) -> dict:
+    stdout, rc = await _ssh(ip, _METRICS_SCRIPT, ssh_user)
     if rc != 0 or not stdout:
         return {"offline": True}
     try:
@@ -161,11 +161,11 @@ async def _poll_nodes_loop():
 
             if nodes:
                 results = await asyncio.gather(
-                    *[_collect_metrics(n["id"], n["tailscale_ip"]) for n in nodes],
+                    *[_collect_metrics(n["id"], n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes],
                     return_exceptions=True,
                 )
-                # node_id → tailscale_ip lookup (metrics dict에는 IP 없음)
-                node_ips = {n["id"]: n["tailscale_ip"] for n in nodes}
+                # node_id → (ip, ssh_user) lookup
+                node_info = {n["id"]: (n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes}
 
                 for node, result in zip(nodes, results):
                     if isinstance(result, Exception):
@@ -185,9 +185,9 @@ async def _poll_nodes_loop():
                     nid = s.get("node_id", "")
                     # Auto-expire
                     if s.get("expires_at") and now >= s["expires_at"]:
-                        ip = node_ips.get(nid)
-                        if ip and not _metrics.get(nid, {}).get("offline"):
-                            await _ssh(ip, f"docker stop {ACTIVE_CONTAINER}")
+                        node_ip, node_suser = node_info.get(nid, (None, SSH_USER))
+                        if node_ip and not _metrics.get(nid, {}).get("offline"):
+                            await _ssh(node_ip, f"docker stop {ACTIVE_CONTAINER}", node_suser)
                         await doc.reference.update({"status": "suspended", "suspended_at": now})
                         continue
                     # starting → active when docker running
@@ -260,12 +260,12 @@ async def _count_active_sessions(email: str) -> int:
     return len(docs)
 
 
-async def _docker_status(node_id: str, ip: str) -> str:
+async def _docker_status(node_id: str, ip: str, ssh_user: str = SSH_USER) -> str:
     """Docker status from cache if fresh (<20s), else direct SSH."""
     m = _metrics.get(node_id, {})
     if not m.get("offline") and time.time() - m.get("last_seen", 0) < 20:
         return m.get("docker", "none")
-    stdout, rc = await _ssh(ip, _DOCKER_STATUS_CMD)
+    stdout, rc = await _ssh(ip, _DOCKER_STATUS_CMD, ssh_user)
     return stdout if rc == 0 and stdout else "none"
 
 
@@ -287,13 +287,18 @@ def _share_key(email: str) -> str:
     return re.sub(r"[^a-z0-9._@-]", "_", (email or "anon").lower()) or "anon"
 
 
-def _share_dir(email: str) -> str:
-    return f"{SHARED_BASE}/{_share_key(email)}"
+def _shared_base(ssh_user: str) -> str:
+    """노드 호스트의 공유 폴더 베이스. SHARED_BASE env가 있으면 그대로, 없으면 노드 ssh_user 홈 기준."""
+    return SHARED_BASE or f"/home/{ssh_user}/dshs-shared"
 
 
-def _mount_arg(email: str) -> str:
+def _share_dir(email: str, ssh_user: str) -> str:
+    return f"{_shared_base(ssh_user)}/{_share_key(email)}"
+
+
+def _mount_arg(email: str, ssh_user: str) -> str:
     """docker run 에 붙일 -v 옵션 문자열. 사용자 공유 폴더 → 컨테이너 바탕화면."""
-    return f"-v {shlex.quote(_share_dir(email))}:{shlex.quote(DESKTOP_SHARE)}"
+    return f"-v {shlex.quote(_share_dir(email, ssh_user))}:{shlex.quote(DESKTOP_SHARE)}"
 
 
 def _verify_upload_token(token: str) -> str:
@@ -320,10 +325,10 @@ def _verify_upload_token(token: str) -> str:
     return email.lower()
 
 
-async def _container_has_share_mount(host: str) -> bool:
+async def _container_has_share_mount(host: str, ssh_user: str = SSH_USER) -> bool:
     """실행 중인 컨테이너에 받은파일 bind-mount가 이미 걸려 있는지 확인한다."""
     tmpl = "{{range .Mounts}}{{.Destination}}\n{{end}}"
-    out, rc = await _ssh(host, f"docker inspect -f '{tmpl}' {ACTIVE_CONTAINER}")
+    out, rc = await _ssh(host, f"docker inspect -f '{tmpl}' {ACTIVE_CONTAINER}", ssh_user)
     return rc == 0 and DESKTOP_SHARE in out
 
 
@@ -448,7 +453,7 @@ async def get_session(
 
     session_id, s = active[0]
     node = await _get_node(s["node_id"])
-    dock = await _docker_status(s["node_id"], node["tailscale_ip"])
+    dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
 
     if dock == "running":
         return {
@@ -478,7 +483,7 @@ async def poll_session(
         raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
 
     node = await _get_node(s["node_id"])
-    dock = await _docker_status(s["node_id"], node["tailscale_ip"])
+    dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
 
     if dock == "running":
         return {"status": "ready", "url": node.get("kasm_url", "https://kasm.dshs-app.net")}
@@ -509,8 +514,9 @@ async def create_session(
         target = next((d for d in docs if d.id == session_id), docs[0]) if session_id else docs[0]
         s = target.to_dict()
         node = await _get_node(s["node_id"])
+        _suser = node.get("ssh_user", SSH_USER)
 
-        stdout, rc = await _ssh(node["tailscale_ip"], f"docker start {ACTIVE_CONTAINER}")
+        stdout, rc = await _ssh(node["ip"], f"docker start {ACTIVE_CONTAINER}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
 
@@ -532,7 +538,7 @@ async def create_session(
             old_s = old_doc.to_dict()
             if old_s.get("owner") == me or is_admin:
                 node = await _get_node(old_s["node_id"])
-                await _ssh(node["tailscale_ip"], f"docker rm -f {ACTIVE_CONTAINER}")
+                await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
                 await old_doc.reference.delete()
 
     # Pick node
@@ -553,23 +559,25 @@ async def create_session(
             raise HTTPException(status_code=503, detail="사용 가능한 PC가 없습니다.")
 
     node = await _get_node(node_id)
+    _suser = node.get("ssh_user", SSH_USER)
 
     # Tear down any existing container on this node
-    await _ssh(node["tailscale_ip"], f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true")
+    await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true", _suser)
 
     # 사용자별 공유 폴더 준비 후 컨테이너 바탕화면에 bind-mount → 업로드한 파일이 보임
-    share_dir = _share_dir(me)
+    share_dir = _share_dir(me, _suser)
     await _ssh(
-        node["tailscale_ip"],
+        node["ip"],
         f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}",
+        _suser,
     )
 
     cmd = (
         f"docker run -d --name {ACTIVE_CONTAINER} --restart unless-stopped "
-        f"--gpus all --shm-size=2gb -p 8080:6901 {_mount_arg(me)} "
+        f"--gpus all --shm-size=2gb -p 8080:6901 {_mount_arg(me, _suser)} "
         f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
     )
-    stdout, rc = await _ssh(node["tailscale_ip"], cmd)
+    stdout, rc = await _ssh(node["ip"], cmd, _suser)
     if rc != 0:
         raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
 
@@ -606,13 +614,14 @@ async def delete_session(
         raise HTTPException(status_code=403, detail="본인 세션만 종료할 수 있습니다.")
 
     node = await _get_node(s["node_id"])
+    _suser = node.get("ssh_user", SSH_USER)
 
     if permanent:
-        await _ssh(node["tailscale_ip"], f"docker rm -f {ACTIVE_CONTAINER}")
+        await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", _suser)
         await doc.reference.delete()
         return {"message": "세션을 완전히 삭제했습니다."}
 
-    await _ssh(node["tailscale_ip"], f"docker stop {ACTIVE_CONTAINER}")
+    await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", _suser)
     await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
     return {"status": "suspended"}
 
@@ -642,17 +651,18 @@ async def upload_files(
         )
 
     node = await _get_node(target["node_id"])
-    host = node["tailscale_ip"]
-    share_dir = _share_dir(email)
+    host = node["ip"]
+    ssh_user = node.get("ssh_user", SSH_USER)
+    share_dir = _share_dir(email, ssh_user)
 
-    await _ssh(host, f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}")
-    has_mount = await _container_has_share_mount(host)
+    await _ssh(host, f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}", ssh_user)
+    has_mount = await _container_has_share_mount(host, ssh_user)
 
     saved: list[str] = []
     try:
         async with asyncssh.connect(
             host,
-            username=SSH_USER,
+            username=ssh_user,
             password=SSH_PASSWORD,
             known_hosts=None,
             connect_timeout=10,
@@ -788,8 +798,8 @@ async def update_user(email: str, body: dict):
 
 class NodeBody(BaseModel):
     name: str
-    tailscale_ip: str
-    ssh_user: str = "admin-swai"
+    ip: str
+    ssh_user: str = "ai-admin"
     cpu: str = ""
     cpu_cores: int = 0
     gpu: str = ""
@@ -857,7 +867,7 @@ async def admin_terminate(node_id: Optional[str] = Query(None)):
         if node_id and s.get("node_id") != node_id:
             continue
         node = await _get_node(s["node_id"])
-        await _ssh(node["tailscale_ip"], f"docker stop {ACTIVE_CONTAINER}")
+        await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
         await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
         terminated.append(doc.id)
     return {"terminated": terminated, "count": len(terminated)}
@@ -871,7 +881,7 @@ async def admin_cleanup(node_id: Optional[str] = Query(None)):
         if node_id and doc.id != node_id:
             continue
         n = doc.to_dict()
-        stdout, rc = await _ssh(n["tailscale_ip"], _CLEANUP_CMD)
+        stdout, rc = await _ssh(n["ip"], _CLEANUP_CMD, n.get("ssh_user", SSH_USER))
         results[doc.id] = {"removed": stdout.strip(), "ok": rc == 0}
     return {"nodes": results}
 
