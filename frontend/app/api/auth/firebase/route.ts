@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getApps } from "firebase-admin/app";
 import "@/lib/firebase-admin";
 import { getAuth } from "firebase-admin/auth";
 import { makeToken, isAllowedDomain, COOKIE_NAME } from "@/lib/auth";
@@ -16,11 +17,14 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "missing_token" }, { status: 400 });
   }
 
+  console.log("[firebase/route] apps initialized:", getApps().length, "PROJECT_ID:", !!process.env.FIREBASE_PROJECT_ID);
+
   let decoded: import("firebase-admin/auth").DecodedIdToken;
   try {
     decoded = await getAuth().verifyIdToken(idToken);
-  } catch {
-    return NextResponse.json({ error: "oauth" }, { status: 401 });
+  } catch (e) {
+    console.error("[firebase/route] verifyIdToken failed:", e);
+    return NextResponse.json({ error: "oauth", detail: String(e) }, { status: 401 });
   }
 
   const email = decoded.email?.toLowerCase();
