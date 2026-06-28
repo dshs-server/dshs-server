@@ -450,6 +450,17 @@ async def create_session(
         node = await _get_node(s["node_id"])
         _suser = node.get("ssh_user", SSH_USER)
 
+        # Block resume if another user's session is active on the same node
+        active_on_node = await (
+            db.collection(COL_SESSIONS)
+            .where("node_id", "==", s["node_id"])
+            .where("status", "in", ["active", "starting"])
+            .get()
+        )
+        for a in active_on_node:
+            if a.id != target.id and a.to_dict().get("owner") != me:
+                raise HTTPException(status_code=409, detail="해당 PC에 다른 사용자의 활성 세션이 있습니다.")
+
         stdout, rc = await _ssh(node["ip"], f"docker start {ACTIVE_CONTAINER}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
@@ -479,23 +490,39 @@ async def create_session(
     node_id = body.node_id if body else None
     if not node_id:
         nodes_snap = await db.collection(COL_NODES).get()
-        active_snap = await (
+        busy_snap = await (
             db.collection(COL_SESSIONS)
-            .where("status", "in", ["active", "starting"])
+            .where("status", "in", ["active", "starting", "suspended"])
             .get()
         )
-        busy_nodes = {s.to_dict().get("node_id") for s in active_snap}
+        busy_nodes = {s.to_dict().get("node_id") for s in busy_snap}
         for doc in nodes_snap:
             if doc.id not in busy_nodes:
                 node_id = doc.id
                 break
         if not node_id:
             raise HTTPException(status_code=503, detail="사용 가능한 PC가 없습니다.")
+    else:
+        # Explicit node_id: verify no active or suspended session from another user
+        conflict_snap = await (
+            db.collection(COL_SESSIONS)
+            .where("node_id", "==", node_id)
+            .where("status", "in", ["active", "starting", "suspended"])
+            .get()
+        )
+        for conflict_doc in conflict_snap:
+            conflict_s = conflict_doc.to_dict()
+            if conflict_s.get("owner") != me:
+                raise HTTPException(status_code=409, detail="해당 PC에 다른 사용자의 세션이 있습니다.")
+            # Same user's suspended session must be resumed, not replaced (unless replace_session_id given)
+            if conflict_s.get("status") == "suspended" and not (body and body.replace_session_id):
+                raise HTTPException(status_code=409, detail="저장된 세션이 있습니다. 복원하거나 새로 시작하기를 선택하세요.")
 
     node = await _get_node(node_id)
     _suser = node.get("ssh_user", SSH_USER)
 
-    # Tear down any existing container on this node
+    # Tear down only if there's no suspended session from another user
+    # (replace_session_id case already cleaned up above; auto-picked node is guaranteed clean)
     await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true", _suser)
 
     cmd = (
