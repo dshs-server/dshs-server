@@ -16,6 +16,7 @@ import shlex
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 import asyncssh
@@ -37,7 +38,10 @@ KASM_IMAGE = os.environ.get("KASM_IMAGE", "dshs-kasm-win10")
 ACTIVE_CONTAINER = "active_session"  # legacy sessions only
 PORT_BASE = 8081   # multi-session container port range start
 PORT_MAX  = 8199   # max 119 concurrent sessions per node
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))        # seconds (세션 있는 노드)
+IDLE_POLL_INTERVAL = int(os.environ.get("IDLE_POLL_INTERVAL", "60"))  # seconds (세션 없는 노드)
+LOG_INTERVAL = int(os.environ.get("LOG_INTERVAL", "600"))             # seconds (10분)
+LOG_DIR = os.path.expanduser(os.environ.get("LOG_DIR", "~/hub/logs"))
 
 # 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
 # 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
@@ -61,6 +65,7 @@ COL_USERS = "users"
 # node_id → {cpu, ram_used_gb, ram_total_gb, storage_used_gb, storage_total_gb,
 #             gpu, top, docker, offline, last_seen}
 _metrics: dict[str, dict] = {}
+_last_polled: dict[str, float] = {}  # node_id → last SSH poll timestamp
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
 
@@ -163,14 +168,31 @@ async def _poll_nodes_loop():
             nodes = [{"id": d.id, **d.to_dict()} for d in snap]
 
             if nodes:
+                # 어느 노드에 활성 세션이 있는지 파악
+                active_snap = await (
+                    db.collection(COL_SESSIONS)
+                    .where("status", "in", ["active", "starting"])
+                    .get()
+                )
+                active_node_ids = {s.to_dict().get("node_id") for s in active_snap}
+
+                now = time.time()
+                # 세션 있으면 항상 폴링, 없으면 IDLE_POLL_INTERVAL 경과 시에만
+                nodes_to_poll = [
+                    n for n in nodes
+                    if n["id"] in active_node_ids
+                    or now - _last_polled.get(n["id"], 0) >= IDLE_POLL_INTERVAL
+                ]
+
                 results = await asyncio.gather(
-                    *[_collect_metrics(n["id"], n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes],
+                    *[_collect_metrics(n["id"], n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes_to_poll],
                     return_exceptions=True,
                 )
                 # node_id → (ip, ssh_user) lookup
                 node_info = {n["id"]: (n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes}
 
-                for node, result in zip(nodes, results):
+                for node, result in zip(nodes_to_poll, results):
+                    _last_polled[node["id"]] = now
                     if isinstance(result, Exception):
                         _metrics[node["id"]] = {"offline": True}
                     else:
@@ -206,18 +228,123 @@ async def _poll_nodes_loop():
         await asyncio.sleep(POLL_INTERVAL)
 
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+
+async def _get_container_top3(node_ip: str, ssh_user: str, container: str) -> list[str]:
+    stdout, rc = await _ssh(
+        node_ip,
+        f"docker top {container} -eo comm,pcpu --sort=-pcpu 2>/dev/null"
+        f" | tail -n +2 | head -3 | awk '{{print $1}}'",
+        ssh_user,
+    )
+    if rc != 0 or not stdout:
+        return []
+    return [l.strip() for l in stdout.splitlines() if l.strip()]
+
+
+async def _write_log():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    now = datetime.now()
+    log_path = os.path.join(LOG_DIR, now.strftime("%Y-%m-%d") + ".log")
+
+    nodes_snap = await db.collection(COL_NODES).get()
+    nodes = {d.id: d.to_dict() for d in nodes_snap}
+
+    sessions_snap = await db.collection(COL_SESSIONS).get()
+    all_sessions = [{"id": d.id, **d.to_dict()} for d in sessions_snap]
+    active_sessions = [s for s in all_sessions if s.get("status") in ("active", "starting")]
+    suspended_sessions = [s for s in all_sessions if s.get("status") == "suspended"]
+
+    # 활성 세션별 컨테이너 top3 (병렬)
+    top3_results = await asyncio.gather(
+        *[
+            _get_container_top3(
+                nodes[s["node_id"]]["ip"],
+                nodes[s["node_id"]].get("ssh_user", SSH_USER),
+                _container_name(s["id"]),
+            )
+            for s in active_sessions
+            if s.get("node_id") in nodes
+        ],
+        return_exceptions=True,
+    )
+    session_top3: dict[str, list[str]] = {}
+    idx = 0
+    for s in active_sessions:
+        if s.get("node_id") in nodes:
+            r = top3_results[idx]
+            session_top3[s["id"]] = r if isinstance(r, list) else []
+            idx += 1
+
+    lines = [f"=== {now.strftime('%Y-%m-%d %H:%M:%S')} ===", ""]
+
+    lines.append(f"[노드 상태] ({len(nodes)}대)")
+    for nid, node in sorted(nodes.items()):
+        m = _metrics.get(nid, {})
+        if m.get("offline"):
+            lines.append(f"  {nid} ({node.get('name', '')}): OFFLINE")
+        elif not m:
+            lines.append(f"  {nid} ({node.get('name', '')}): 미조회")
+        else:
+            lines.append(
+                f"  {nid} ({node.get('name', '')}): "
+                f"CPU {m.get('cpu', '?')}% | "
+                f"RAM {m.get('ram_used_gb', '?')}/{m.get('ram_total_gb', '?')}GB | "
+                f"GPU {m.get('gpu', '?')}% | "
+                f"kasm {m.get('kasm_running', '?')}세션"
+            )
+
+    lines.append("")
+    lines.append(f"[활성 세션] {len(active_sessions)}개")
+    for s in active_sessions:
+        top3 = session_top3.get(s["id"], [])
+        lines.append(
+            f"  [{s['id']}] {s.get('owner', '?')} @ {s.get('node_id', '?')}"
+            f" ({s.get('status', '?')})"
+        )
+        lines.append(f"    프로세스: {', '.join(top3) if top3 else '없음'}")
+
+    lines.append("")
+    lines.append(f"[저장된 세션] {len(suspended_sessions)}개")
+    for s in suspended_sessions:
+        ts = s.get("suspended_at")
+        saved = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
+        lines.append(
+            f"  [{s['id']}] {s.get('owner', '?')} @ {s.get('node_id', '?')}"
+            f" (저장: {saved})"
+        )
+
+    lines.append("")
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+async def _log_loop():
+    await asyncio.sleep(LOG_INTERVAL)  # 첫 실행은 10분 후
+    while True:
+        try:
+            await _write_log()
+        except Exception:
+            pass
+        await asyncio.sleep(LOG_INTERVAL)
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_poll_nodes_loop())
+    poll_task = asyncio.create_task(_poll_nodes_loop())
+    log_task = asyncio.create_task(_log_loop())
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for t in (poll_task, log_task):
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
