@@ -34,7 +34,9 @@ SSH_PASSWORD = os.environ.get("SSH_PASSWORD", "")
 if not SSH_PASSWORD:
     raise RuntimeError("SSH_PASSWORD environment variable is required")
 KASM_IMAGE = os.environ.get("KASM_IMAGE", "dshs-kasm-win10")
-ACTIVE_CONTAINER = "active_session"
+ACTIVE_CONTAINER = "active_session"  # legacy sessions only
+PORT_BASE = 8081   # multi-session container port range start
+PORT_MAX  = 8199   # max 119 concurrent sessions per node
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))  # seconds
 
 # 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
@@ -98,13 +100,9 @@ gpu = float(gpu_raw.splitlines()[0]) if gpu_raw.strip() else 0.0
 # Top process by CPU
 top = sh("ps -eo comm --sort=-%cpu | sed -n '2p'") or None
 
-# Docker status
-d_json = sh('docker inspect active_session')
-if d_json:
-    try: dock = json.loads(d_json)[0]['State']['Status']
-    except: dock = 'none'
-else:
-    dock = 'none'
+# Count running kasm_* containers
+kasm_raw = sh("docker ps --filter 'name=kasm_' --format '{{.Names}}'")
+kasm_running = len([x for x in kasm_raw.splitlines() if x.strip()]) if kasm_raw.strip() else 0
 
 print(json.dumps({
     'cpu': cpu,
@@ -114,11 +112,16 @@ print(json.dumps({
     'storage_total_gb': round(st / 1048576, 1),
     'gpu': gpu,
     'top': top,
-    'docker': dock,
+    'kasm_running': kasm_running,
 }))
 PYEOF"""
 
-_DOCKER_STATUS_CMD = "docker inspect active_session 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(d[0]['State']['Status'])\" 2>/dev/null || echo none"
+def _docker_status_cmd(container: str) -> str:
+    return (
+        f"docker inspect {container} 2>/dev/null | "
+        f"python3 -c \"import json,sys; d=json.load(sys.stdin); print(d[0]['State']['Status'])\" "
+        f"2>/dev/null || echo none"
+    )
 
 
 async def _ssh(host: str, command: str, ssh_user: str = SSH_USER) -> tuple[str, int]:
@@ -187,13 +190,16 @@ async def _poll_nodes_loop():
                     if s.get("expires_at") and now >= s["expires_at"]:
                         node_ip, node_suser = node_info.get(nid, (None, SSH_USER))
                         if node_ip and not _metrics.get(nid, {}).get("offline"):
-                            await _ssh(node_ip, f"docker stop {ACTIVE_CONTAINER}", node_suser)
+                            await _ssh(node_ip, f"docker stop {_container_name(doc.id)}", node_suser)
                         await doc.reference.update({"status": "suspended", "suspended_at": now})
                         continue
-                    # starting → active when docker running
+                    # starting → active when container running
                     if s.get("status") == "starting":
-                        if _metrics.get(nid, {}).get("docker") == "running":
-                            await doc.reference.update({"status": "active"})
+                        node_ip, node_suser = node_info.get(nid, (None, SSH_USER))
+                        if node_ip:
+                            dock = await _docker_status(node_ip, node_suser, _container_name(doc.id))
+                            if dock == "running":
+                                await doc.reference.update({"status": "active"})
         except Exception:
             pass
 
@@ -260,13 +266,69 @@ async def _count_active_sessions(email: str) -> int:
     return len(docs)
 
 
-async def _docker_status(node_id: str, ip: str, ssh_user: str = SSH_USER) -> str:
-    """Docker status from cache if fresh (<20s), else direct SSH."""
-    m = _metrics.get(node_id, {})
-    if not m.get("offline") and time.time() - m.get("last_seen", 0) < 20:
-        return m.get("docker", "none")
-    stdout, rc = await _ssh(ip, _DOCKER_STATUS_CMD, ssh_user)
+async def _docker_status(ip: str, ssh_user: str, container: str) -> str:
+    """Direct SSH check for specific container status."""
+    stdout, rc = await _ssh(ip, _docker_status_cmd(container), ssh_user)
     return stdout if rc == 0 and stdout else "none"
+
+
+def _container_name(session_id: str) -> str:
+    return f"kasm_{session_id}"
+
+def _session_url(session_id: str, kasm_url: str) -> str:
+    base = kasm_url.removeprefix("https://").rstrip("/")
+    return f"https://{session_id}.{base}/"
+
+async def _allocate_port(node_id: str) -> int:
+    snap = await (
+        db.collection(COL_SESSIONS)
+        .where("node_id", "==", node_id)
+        .where("status", "in", ["active", "starting", "suspended"])
+        .get()
+    )
+    used = {s.to_dict().get("port") for s in snap if s.to_dict().get("port")}
+    for port in range(PORT_BASE, PORT_MAX + 1):
+        if port not in used:
+            return port
+    raise HTTPException(503, "노드 포트 부족 — 최대 세션 수 초과")
+
+_NGINX_BLOCK = """\
+server {{
+    listen 80;
+    server_name {hostname};
+    location / {{
+        proxy_pass https://localhost:{port};
+        proxy_set_header Authorization "Basic a2FzbV91c2VyOnRlc3QxMjM0";
+        proxy_set_header Host $host;
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+    }}
+}}"""
+
+async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str):
+    snap = await (
+        db.collection(COL_SESSIONS)
+        .where("node_id", "==", node_id)
+        .where("status", "in", ["active", "starting", "suspended"])
+        .get()
+    )
+    base = kasm_url.removeprefix("https://").rstrip("/")
+    blocks = [
+        _NGINX_BLOCK.format(hostname=f"{doc.id}.{base}", port=s["port"])
+        for doc in snap
+        if (s := doc.to_dict()).get("port")
+    ]
+    config = "\n\n".join(blocks) if blocks else "# no sessions"
+    b64 = base64.b64encode(config.encode()).decode()
+    cmd = (
+        f"echo {b64} | base64 -d > /home/{ssh_user}/.nginx-kasm.conf "
+        f"&& sudo nginx -s reload"
+    )
+    await _ssh(node_ip, cmd, ssh_user)
 
 
 def _node_session_state(node_id: str, sessions: list[dict]) -> str:
@@ -325,10 +387,10 @@ def _verify_upload_token(token: str) -> str:
     return email.lower()
 
 
-async def _container_has_share_mount(host: str, ssh_user: str = SSH_USER) -> bool:
+async def _container_has_share_mount(host: str, container: str, ssh_user: str = SSH_USER) -> bool:
     """실행 중인 컨테이너에 받은파일 bind-mount가 이미 걸려 있는지 확인한다."""
     tmpl = "{{range .Mounts}}{{.Destination}}\n{{end}}"
-    out, rc = await _ssh(host, f"docker inspect -f '{tmpl}' {ACTIVE_CONTAINER}", ssh_user)
+    out, rc = await _ssh(host, f"docker inspect -f '{tmpl}' {container}", ssh_user)
     return rc == 0 and DESKTOP_SHARE in out
 
 
@@ -453,13 +515,15 @@ async def get_session(
 
     session_id, s = active[0]
     node = await _get_node(s["node_id"])
-    dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
+    _suser = node.get("ssh_user", SSH_USER)
+    dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
 
     if dock == "running":
+        url = s.get("url") or _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
         return {
             "status": "ready",
             "session_id": session_id,
-            "url": node.get("kasm_url", "https://kasm.dshs-app.net"),
+            "url": url,
             "expires_at": s.get("expires_at"),
             "suspended_sessions": suspended_sessions,
         }
@@ -483,10 +547,12 @@ async def poll_session(
         raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
 
     node = await _get_node(s["node_id"])
-    dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
+    _suser = node.get("ssh_user", SSH_USER)
+    dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
 
     if dock == "running":
-        return {"status": "ready", "url": node.get("kasm_url", "https://kasm.dshs-app.net")}
+        url = s.get("url") or _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
+        return {"status": "ready", "url": url}
     return {"status": "starting"}
 
 
@@ -516,22 +582,14 @@ async def create_session(
         node = await _get_node(s["node_id"])
         _suser = node.get("ssh_user", SSH_USER)
 
-        # Block resume if another user's session is active on the same node
-        active_on_node = await (
-            db.collection(COL_SESSIONS)
-            .where("node_id", "==", s["node_id"])
-            .where("status", "in", ["active", "starting"])
-            .get()
-        )
-        for a in active_on_node:
-            if a.id != target.id and a.to_dict().get("owner") != me:
-                raise HTTPException(status_code=409, detail="해당 PC에 다른 사용자의 활성 세션이 있습니다.")
-
-        stdout, rc = await _ssh(node["ip"], f"docker start {ACTIVE_CONTAINER}", _suser)
+        container = _container_name(target.id)
+        stdout, rc = await _ssh(node["ip"], f"docker start {container}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
 
         await target.reference.update({"status": "starting", "created_at": time.time()})
+        if s.get("port"):
+            await _nginx_update(s["node_id"], node["ip"], _suser, node.get("kasm_url", ""))
         return {"session_id": target.id, "status": "starting"}
 
     # ── New session ────────────────────────────────────────────────────────────
@@ -548,48 +606,47 @@ async def create_session(
         if old_doc.exists:
             old_s = old_doc.to_dict()
             if old_s.get("owner") == me or is_admin:
-                node = await _get_node(old_s["node_id"])
-                await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
+                old_node = await _get_node(old_s["node_id"])
+                old_container = _container_name(body.replace_session_id)
+                await _ssh(
+                    old_node["ip"],
+                    f"docker rm -f {old_container} 2>/dev/null || true",
+                    old_node.get("ssh_user", SSH_USER),
+                )
                 await old_doc.reference.delete()
 
-    # Pick node
+    # Pick node — least-loaded with remaining port capacity
     node_id = body.node_id if body else None
     if not node_id:
         nodes_snap = await db.collection(COL_NODES).get()
-        busy_snap = await (
+        sessions_snap = await (
             db.collection(COL_SESSIONS)
             .where("status", "in", ["active", "starting", "suspended"])
             .get()
         )
-        busy_nodes = {s.to_dict().get("node_id") for s in busy_snap}
+        session_counts: dict[str, int] = {}
+        for sn in sessions_snap:
+            nid2 = sn.to_dict().get("node_id", "")
+            session_counts[nid2] = session_counts.get(nid2, 0) + 1
+
+        best_node: Optional[str] = None
+        best_count = PORT_MAX - PORT_BASE + 1  # max capacity
         for doc in nodes_snap:
-            if doc.id not in busy_nodes:
-                node_id = doc.id
-                break
-        if not node_id:
+            count = session_counts.get(doc.id, 0)
+            if count < best_count:
+                best_count = count
+                best_node = doc.id
+        if not best_node:
             raise HTTPException(status_code=503, detail="사용 가능한 PC가 없습니다.")
-    else:
-        # Explicit node_id: verify no active or suspended session from another user
-        conflict_snap = await (
-            db.collection(COL_SESSIONS)
-            .where("node_id", "==", node_id)
-            .where("status", "in", ["active", "starting", "suspended"])
-            .get()
-        )
-        for conflict_doc in conflict_snap:
-            conflict_s = conflict_doc.to_dict()
-            if conflict_s.get("owner") != me:
-                raise HTTPException(status_code=409, detail="해당 PC에 다른 사용자의 세션이 있습니다.")
-            # Same user's suspended session must be resumed, not replaced (unless replace_session_id given)
-            if conflict_s.get("status") == "suspended" and not (body and body.replace_session_id):
-                raise HTTPException(status_code=409, detail="저장된 세션이 있습니다. 복원하거나 새로 시작하기를 선택하세요.")
+        node_id = best_node
 
     node = await _get_node(node_id)
     _suser = node.get("ssh_user", SSH_USER)
+    kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
 
-    # Tear down only if there's no suspended session from another user
-    # (replace_session_id case already cleaned up above; auto-picked node is guaranteed clean)
-    await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true", _suser)
+    new_id = uuid.uuid4().hex[:8]
+    port = await _allocate_port(node_id)
+    container = _container_name(new_id)
 
     # 사용자별 공유 폴더 준비 후 컨테이너 바탕화면에 bind-mount → 업로드한 파일이 보임
     share_dir = _share_dir(me, _suser)
@@ -600,8 +657,8 @@ async def create_session(
     )
 
     cmd = (
-        f"docker run -d --name {ACTIVE_CONTAINER} --restart unless-stopped "
-        f"--gpus all --shm-size=2gb -p 8080:6901 {_mount_arg(me, _suser)} "
+        f"docker run -d --name {container} --restart unless-stopped "
+        f"--gpus all --shm-size=2gb -p {port}:6901 {_mount_arg(me, _suser)} "
         f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
     )
     stdout, rc = await _ssh(node["ip"], cmd, _suser)
@@ -609,7 +666,6 @@ async def create_session(
         raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
 
     duration = (body.duration_days if body else None) or 7
-    new_id = uuid.uuid4().hex[:8]
     await db.collection(COL_SESSIONS).document(new_id).set({
         "node_id": node_id,
         "owner": me,
@@ -619,8 +675,11 @@ async def create_session(
         "created_at": time.time(),
         "expires_at": time.time() + duration * 86400,
         "resources": (body.resources if body else None) or {},
+        "port": port,
+        "url": _session_url(new_id, kasm_url),
     })
 
+    await _nginx_update(node_id, node["ip"], _suser, kasm_url)
     return {"session_id": new_id, "status": "starting"}
 
 
@@ -642,14 +701,18 @@ async def delete_session(
 
     node = await _get_node(s["node_id"])
     _suser = node.get("ssh_user", SSH_USER)
+    container = _container_name(session_id)
+    kasm_url = node.get("kasm_url", "")
 
     if permanent:
-        await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", _suser)
+        await _ssh(node["ip"], f"docker rm -f {container}", _suser)
         await doc.reference.delete()
+        await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
         return {"message": "세션을 완전히 삭제했습니다."}
 
-    await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", _suser)
+    await _ssh(node["ip"], f"docker stop {container}", _suser)
     await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
+    await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
     return {"status": "suspended"}
 
 
@@ -667,23 +730,25 @@ async def upload_files(
 
     # 본인의 세션 노드 찾기 (활성/시작중 우선, 없으면 저장된 세션)
     snap = await db.collection(COL_SESSIONS).where("owner", "==", email).get()
-    sessions = [doc.to_dict() for doc in snap]
-    target = next(
-        (s for s in sessions if s.get("status") in ("active", "starting")),
-        next((s for s in sessions if s.get("status") == "suspended"), None),
+    session_pairs = [(doc.id, doc.to_dict()) for doc in snap]
+    target_pair = next(
+        ((sid, s) for sid, s in session_pairs if s.get("status") in ("active", "starting")),
+        next(((sid, s) for sid, s in session_pairs if s.get("status") == "suspended"), None),
     )
-    if not target:
+    if not target_pair:
         raise HTTPException(
             status_code=400, detail="먼저 PC 세션을 시작한 뒤 파일을 보낼 수 있습니다."
         )
 
+    target_sid, target = target_pair
     node = await _get_node(target["node_id"])
     host = node["ip"]
     ssh_user = node.get("ssh_user", SSH_USER)
     share_dir = _share_dir(email, ssh_user)
+    upload_container = _container_name(target_sid)
 
     await _ssh(host, f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}", ssh_user)
-    has_mount = await _container_has_share_mount(host, ssh_user)
+    has_mount = await _container_has_share_mount(host, upload_container, ssh_user)
 
     saved: list[str] = []
     try:
@@ -710,16 +775,16 @@ async def upload_files(
             # 마운트 없이 이미 떠 있는 컨테이너에는 docker cp로 즉시 반영
             if not has_mount:
                 await conn.run(
-                    f"docker exec -u root {ACTIVE_CONTAINER} mkdir -p {shlex.quote(DESKTOP_SHARE)}"
+                    f"docker exec -u root {upload_container} mkdir -p {shlex.quote(DESKTOP_SHARE)}"
                 )
                 for fname in saved:
                     remote = f"{share_dir}/{fname}"
                     await conn.run(
                         f"docker cp {shlex.quote(remote)} "
-                        f"{ACTIVE_CONTAINER}:{shlex.quote(DESKTOP_SHARE + '/')}"
+                        f"{upload_container}:{shlex.quote(DESKTOP_SHARE + '/')}"
                     )
                 await conn.run(
-                    f"docker exec -u root {ACTIVE_CONTAINER} "
+                    f"docker exec -u root {upload_container} "
                     f"chown -R 1000:1000 {shlex.quote(DESKTOP_SHARE)}"
                 )
     except (OSError, asyncssh.Error) as e:
@@ -753,7 +818,7 @@ async def admin_nodes():
 
         if not m or m.get("offline"):
             status = "offline"
-        elif m.get("docker") == "running":
+        elif m.get("kasm_running", 0) > 0:
             status = "in_use"
         else:
             status = "idle"
@@ -855,7 +920,7 @@ COL_CONFIG = "config"
 
 _CLEANUP_CMD = (
     "docker ps -a --filter status=exited --filter status=dead "
-    f"--format '{{{{.Names}}}}' | grep -v '^{ACTIVE_CONTAINER}$' | xargs -r docker rm -f"
+    "--format '{{.Names}}' | grep '^kasm_' | xargs -r docker rm -f"
 )
 
 
@@ -894,7 +959,7 @@ async def admin_terminate(node_id: Optional[str] = Query(None)):
         if node_id and s.get("node_id") != node_id:
             continue
         node = await _get_node(s["node_id"])
-        await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
+        await _ssh(node["ip"], f"docker stop {_container_name(doc.id)}", node.get("ssh_user", SSH_USER))
         await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
         terminated.append(doc.id)
     return {"terminated": terminated, "count": len(terminated)}

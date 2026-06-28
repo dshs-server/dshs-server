@@ -1,0 +1,26 @@
+{
+  "server-01": {
+    "num": "01",
+    "tunnel_id": "a3e0c5e1-b71c-48f4-991a-5f3ec4810229",
+    "tunnel_name": "kasm-session",
+    "kasm_url": "https://kasm.dshs-app.net",
+    "cred_file_on_node": "/home/admin-swai/.cloudflared/a3e0c5e1-b71c-48f4-991a-5f3ec4810229.json",
+    "node_ip": "10.72.117.23",
+    "ssh_user": "admin-swai",
+    "status": "active"
+  },
+  "server-02": { "num": "02", "tunnel_id": "c6cae970-a1dd-4f89-a417-45e821ad94dd", "tunnel_name": "kasm-02-tunnel", "kasm_url": "https://kasm-02.dshs-app.net", "status": "pending" },
+  "server-03": { "num": "03", "tunnel_id": "48003386-ec4f-4604-9ad5-416abda70bce", "tunnel_name": "kasm-03-tunnel", "kasm_url": "https://kasm-03.dshs-app.net", "status": "pending" },
+  "server-04": { "num": "04", "tunnel_id": "7ec22f59-fcfe-4936-b23e-4c8fb981be91", "tunnel_name": "kasm-04-tunnel", "kasm_url": "https://kasm-04.dshs-app.net", "status": "pending" },
+  "server-05": { "num": "05", "tunnel_id": "188ccaf0-de2f-4507-87ab-2b80d8326f51", "tunnel_name": "kasm-05-tunnel", "kasm_url": "https://kasm-05.dshs-app.net", "status": "pending" },
+  "server-06": { "num": "06", "tunnel_id": "add56374-72d1-4436-a038-9f83d9925812", "tunnel_name": "kasm-06-tunnel", "kasm_url": "https://kasm-06.dshs-app.net", "status": "pending" },
+  "server-07": { "num": "07", "tunnel_id": "3ed103c2-7e60-477c-9c6f-98a0a45a1378", "tunnel_name": "kasm-07-tunnel", "kasm_url": "https://kasm-07.dshs-app.net", "status": "pending" },
+  "server-08": { "num": "08", "tunnel_id": "b195c027-7295-4efa-a6a7-99be144ec2ae", "tunnel_name": "kasm-08-tunnel", "kasm_url": "https://kasm-08.dshs-app.net", "status": "pending" },
+  "server-09": { "num": "09", "tunnel_id": "5f9aeedd-28b1-4e18-b11c-946192be13c8", "tunnel_name": "kasm-09-tunnel", "kasm_url": "https://kasm-09.dshs-app.net", "status": "pending" },
+  "server-10": { "num": "10", "tunnel_id": "b534b8a9-9c08-4eda-8ea3-0958931a2633", "tunnel_name": "kasm-10-tunnel", "kasm_url": "https://kasm-10.dshs-app.net", "status": "pending" },
+  "server-11": { "num": "11", "tunnel_id": "26927c2c-c315-4283-a7c6-d186e62e7e4c", "tunnel_name": "kasm-11-tunnel", "kasm_url": "https://kasm-11.dshs-app.net", "status": "pending" },
+  "server-12": { "num": "12", "tunnel_id": "0df6df0b-8f95-47e1-bf9e-8ceea5bc6034", "tunnel_name": "kasm-12-tunnel", "kasm_url": "https://kasm-12.dshs-app.net", "status": "pending" },
+  "server-13": { "num": "13", "tunnel_id": "a4efe3ad-4808-4aa2-b5a0-2b17e34499cb", "tunnel_name": "kasm-13-tunnel", "kasm_url": "https://kasm-13.dshs-app.net", "status": "pending" },
+  "server-14": { "num": "14", "tunnel_id": "71cea81e-2c9d-4e07-9178-13484a9eda11", "tunnel_name": "kasm-14-tunnel", "kasm_url": "https://kasm-14.dshs-app.net", "status": "pending" },
+  "server-15": { "num": "15", "tunnel_id": "c2475a09-7ec8-488a-a177-e48d8e60203f", "tunnel_name": "kasm-15-tunnel", "kasm_url": "https://kasm-15.dshs-app.net", "status": "pending" }
+}
