@@ -249,6 +249,12 @@ async def _poll_nodes_loop():
                         if node_ip and not _metrics.get(nid, {}).get("offline"):
                             await _ssh(node_ip, f"docker stop {_container_name(doc.id)}", node_suser)
                         await doc.reference.update({"status": "suspended", "suspended_at": now})
+                        await _send_email(
+                            s.get("owner", ""),
+                            "[PC대여] 세션이 만료되어 일시중지되었습니다",
+                            f"'{s.get('project_name') or doc.id}' 세션이 대여 기간 만료로 자동 일시중지되었습니다.\n"
+                            f"포털(https://dshs-app.net)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
+                        )
                         continue
                     # starting → active when container running
                     if s.get("status") == "starting":
