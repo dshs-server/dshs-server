@@ -10,20 +10,30 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shlex
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import unquote
 
 import asyncssh
 import firebase_admin
 from firebase_admin import credentials, firestore_async
-from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+try:
+    from .notifications import email_configured, send_email
+except ImportError:  # uvicorn main:app launched from the hub directory
+    from notifications import email_configured, send_email
+
+logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -44,6 +54,27 @@ SHARED_BASE = os.environ.get("SHARED_BASE", "")
 DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/Desktop/받은파일")
 # 업로드 토큰 서명 키 — Vercel과 공유. 별도 설정 없으면 API_KEY 재사용.
 UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET", API_KEY)
+# 브라우저가 큰 파일을 나누는 고정 조각 크기. Cloudflare 100MB 요청 제한보다 작게 둔다.
+UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024
+
+# 세션 종료 후 보존·알림 정책
+SESSION_RETENTION_DAYS = max(1, int(os.environ.get("SESSION_RETENTION_DAYS", "30")))
+SESSION_RETENTION_SECONDS = SESSION_RETENTION_DAYS * 86400
+SESSION_WARNING_HOURS = tuple(
+    sorted(
+        {int(value) for value in os.environ.get("SESSION_WARNING_HOURS", "24,1").split(",") if value.strip()},
+        reverse=True,
+    )
+)
+DELETION_WARNING_DAYS = tuple(
+    sorted(
+        {int(value) for value in os.environ.get("DELETION_WARNING_DAYS", "7,1").split(",") if value.strip()},
+        reverse=True,
+    )
+)
+LIFECYCLE_CHECK_INTERVAL = max(30, int(os.environ.get("LIFECYCLE_CHECK_INTERVAL", "60")))
+PORTAL_URL = os.environ.get("PORTAL_URL", "https://dshs-server.vercel.app/dashboard")
+KST = timezone(timedelta(hours=9), name="KST")
 
 # ── Firebase ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +85,7 @@ db = firestore_async.client()
 COL_NODES = "nodes"
 COL_SESSIONS = "sessions"
 COL_USERS = "users"
+COL_ACTIVITY = "activity"
 
 # ── Metrics cache ─────────────────────────────────────────────────────────────
 # node_id → {cpu, ram_used_gb, ram_total_gb, storage_used_gb, storage_total_gb,
@@ -137,6 +169,276 @@ async def _ssh(host: str, command: str, ssh_user: str = SSH_USER) -> tuple[str, 
         return "", -1
 
 
+def _format_kst(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, KST).strftime("%Y년 %m월 %d일 %H:%M")
+
+
+def _session_recipients(session: dict) -> list[str]:
+    recipients = [session.get("owner", ""), *(session.get("team_members") or [])]
+    return sorted(
+        {
+            email.strip().lower()
+            for email in recipients
+            if isinstance(email, str) and "@" in email
+        }
+    )
+
+
+def _session_name(session: dict) -> str:
+    return session.get("project_name") or "이름 없는 세션"
+
+
+async def _log_activity(
+    owner: str,
+    type_: str,
+    title: str,
+    detail: str = "",
+    *,
+    members: Optional[list] = None,
+    node_id: Optional[str] = None,
+    project_name: Optional[str] = None,
+    byte_count: Optional[int] = None,
+    ts: Optional[float] = None,
+) -> None:
+    """사용 기록(활동 로그)을 activity 컬렉션에 적재한다. 실패해도 본 흐름을 막지 않는다."""
+    try:
+        doc = {
+            "owner": (owner or "").lower(),
+            "members": [m.lower() for m in (members or []) if isinstance(m, str)],
+            "type": type_,
+            "title": title,
+            "detail": detail,
+            "ts": ts if ts is not None else time.time(),
+        }
+        if node_id:
+            doc["node_id"] = node_id
+        if project_name:
+            doc["project_name"] = project_name
+        if byte_count is not None:
+            doc["bytes"] = int(byte_count)
+        await db.collection(COL_ACTIVITY).add(doc)
+    except Exception:
+        logger.warning("activity log failed", exc_info=True)
+
+
+async def _notify_once(
+    document,
+    session: dict,
+    event: str,
+    subject: str,
+    body: str,
+    mark_events: tuple[str, ...] = (),
+) -> bool:
+    """Send one lifecycle email and persist markers only after SMTP accepts it."""
+    field = f"email_{event}_sent_at"
+    if session.get(field) or not email_configured():
+        return False
+    sent = await send_email(
+        _session_recipients(session),
+        subject,
+        f"{body}\n\n대시보드: {PORTAL_URL}\n\n본 메일은 DSHS Server에서 자동 발송되었습니다.",
+    )
+    if sent:
+        now = time.time()
+        updates = {field: now}
+        updates.update({f"email_{name}_sent_at": now for name in mark_events})
+        await document.reference.update(updates)
+    return sent
+
+
+async def _send_expiry_warning(document, session: dict, now: float) -> None:
+    expires_at = session.get("expires_at")
+    if not isinstance(expires_at, (int, float)) or expires_at <= now:
+        return
+    remaining = expires_at - now
+    eligible = [hours for hours in SESSION_WARNING_HOURS if remaining <= hours * 3600]
+    pending = [
+        hours
+        for hours in eligible
+        if not session.get(f"email_expiry_{hours}h_sent_at")
+    ]
+    if not pending:
+        return
+    hours = min(pending)
+    skipped = tuple(f"expiry_{value}h" for value in eligible if value > hours)
+    await _notify_once(
+        document,
+        session,
+        f"expiry_{hours}h",
+        f"[DSHS Server] 세션 종료 {hours}시간 전 알림",
+        (
+            f"'{_session_name(session)}' 세션이 {_format_kst(expires_at)}에 자동 종료됩니다.\n"
+            "작업 내용을 저장하고 필요한 파일을 미리 내려받아 주세요.\n"
+            f"종료된 세션은 {SESSION_RETENTION_DAYS}일 동안 보관된 뒤 자동 삭제됩니다."
+        ),
+        skipped,
+    )
+
+
+async def _send_deletion_warning(document, session: dict, now: float) -> None:
+    delete_after = session.get("delete_after")
+    if not isinstance(delete_after, (int, float)) or delete_after <= now:
+        return
+    remaining = delete_after - now
+    eligible = [days for days in DELETION_WARNING_DAYS if remaining <= days * 86400]
+    pending = [
+        days
+        for days in eligible
+        if not session.get(f"email_deletion_{days}d_sent_at")
+    ]
+    if not pending:
+        return
+    days = min(pending)
+    skipped = tuple(f"deletion_{value}d" for value in eligible if value > days)
+    await _notify_once(
+        document,
+        session,
+        f"deletion_{days}d",
+        f"[DSHS Server] 저장된 세션 삭제 {days}일 전 알림",
+        (
+            f"'{_session_name(session)}' 세션의 컨테이너와 파일이 "
+            f"{_format_kst(delete_after)}에 영구 삭제됩니다.\n"
+            "보관이 필요한 파일은 삭제 전에 세션을 복원하거나 내려받아 주세요."
+        ),
+        skipped,
+    )
+
+
+async def _suspend_session(document, session: dict, node: dict, reason: str) -> dict:
+    """Stop a session, start its retention clock, and notify its users."""
+    now = time.time()
+    ssh_user = node.get("ssh_user", SSH_USER)
+    await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", ssh_user)
+    updates = {
+        "status": "suspended",
+        "suspended_at": now,
+        "delete_after": now + SESSION_RETENTION_SECONDS,
+        "suspension_reason": reason,
+    }
+    await document.reference.update(updates)
+    updated = {**session, **updates}
+    reason_text = {
+        "expired": "사용 시간이 만료되어 세션이 자동 종료되었습니다.",
+        "admin": "관리자가 세션을 종료했습니다.",
+        "user": "요청하신 세션이 종료되었습니다.",
+    }.get(reason, "세션이 종료되었습니다.")
+    await _notify_once(
+        document,
+        updated,
+        "suspended",
+        "[DSHS Server] 세션 종료 및 보관 안내",
+        (
+            f"{reason_text}\n"
+            f"세션: {_session_name(session)}\n"
+            f"영구 삭제 예정: {_format_kst(updates['delete_after'])}\n\n"
+            "삭제 예정일 전까지 대시보드에서 세션을 복원할 수 있습니다."
+        ),
+    )
+    await _log_activity(
+        session.get("owner", ""),
+        "session_suspend",
+        "세션이 보관되었습니다",
+        _session_name(session),
+        members=session.get("team_members"),
+        node_id=session.get("node_id"),
+        project_name=session.get("project_name"),
+    )
+    return updated
+
+
+async def _purge_suspended_session(document, session: dict) -> bool:
+    """Permanently remove one expired suspended session from its node and Firestore."""
+    node_id = session.get("node_id")
+    if not node_id:
+        return False
+    node = await _get_node(node_id)
+
+    # A stale Firestore record must never remove a container currently assigned elsewhere.
+    active_on_node = await (
+        db.collection(COL_SESSIONS)
+        .where("node_id", "==", node_id)
+        .where("status", "in", ["active", "starting"])
+        .get()
+    )
+    if active_on_node:
+        logger.warning("Skipping purge for %s: node %s is active", document.id, node_id)
+        return False
+
+    owner = session.get("owner", "")
+    ssh_user = node.get("ssh_user", SSH_USER)
+    share_dir = _share_dir(owner, ssh_user)
+    command = (
+        f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true\n"
+        f"rm -rf {shlex.quote(share_dir)}"
+    )
+    _, rc = await _ssh(node["ip"], command, ssh_user)
+    if rc != 0:
+        logger.warning("Failed to purge session %s from node %s", document.id, node_id)
+        return False
+
+    recipients = _session_recipients(session)
+    await document.reference.delete()
+    if email_configured():
+        await send_email(
+            recipients,
+            "[DSHS Server] 저장된 세션이 영구 삭제되었습니다",
+            (
+                f"'{_session_name(session)}' 세션의 컨테이너와 저장 파일이 보관 기간 만료로 "
+                "영구 삭제되었습니다.\n\n"
+                f"대시보드: {PORTAL_URL}\n\n"
+                "본 메일은 DSHS Server에서 자동 발송되었습니다."
+            ),
+        )
+    return True
+
+
+async def _process_suspended_sessions(now: float) -> None:
+    snap = await (
+        db.collection(COL_SESSIONS)
+        .where("status", "==", "suspended")
+        .get()
+    )
+    for document in snap:
+        try:
+            session = document.to_dict()
+            delete_after = session.get("delete_after")
+            if not isinstance(delete_after, (int, float)):
+                # Existing sessions get a full grace period from the first upgraded check.
+                delete_after = now + SESSION_RETENTION_SECONDS
+                await document.reference.update({"delete_after": delete_after})
+                session["delete_after"] = delete_after
+                await _notify_once(
+                    document,
+                    session,
+                    "suspended",
+                    "[DSHS Server] 저장된 세션 보관 기간 안내",
+                    (
+                        f"'{_session_name(session)}' 세션은 현재 종료된 상태로 보관 중입니다.\n"
+                        f"{_format_kst(delete_after)}에 컨테이너와 파일이 영구 삭제됩니다."
+                    ),
+                )
+
+            if now >= delete_after:
+                await _purge_suspended_session(document, session)
+                continue
+            await _send_deletion_warning(document, session, now)
+        except Exception:
+            logger.exception("Failed to process suspended session %s", document.id)
+
+
+async def _process_active_warnings(now: float) -> None:
+    snap = await (
+        db.collection(COL_SESSIONS)
+        .where("status", "in", ["active", "starting"])
+        .get()
+    )
+    for document in snap:
+        try:
+            await _send_expiry_warning(document, document.to_dict(), now)
+        except Exception:
+            logger.exception("Failed to send expiry warning for %s", document.id)
+
+
 # ── Background polling ────────────────────────────────────────────────────────
 
 
@@ -154,6 +456,7 @@ async def _collect_metrics(node_id: str, ip: str, ssh_user: str = SSH_USER) -> d
 
 
 async def _poll_nodes_loop():
+    last_lifecycle_check = 0.0
     while True:
         try:
             snap = await db.collection(COL_NODES).get()
@@ -164,9 +467,6 @@ async def _poll_nodes_loop():
                     *[_collect_metrics(n["id"], n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes],
                     return_exceptions=True,
                 )
-                # node_id → (ip, ssh_user) lookup
-                node_info = {n["id"]: (n["ip"], n.get("ssh_user", SSH_USER)) for n in nodes}
-
                 for node, result in zip(nodes, results):
                     if isinstance(result, Exception):
                         _metrics[node["id"]] = {"offline": True}
@@ -185,17 +485,22 @@ async def _poll_nodes_loop():
                     nid = s.get("node_id", "")
                     # Auto-expire
                     if s.get("expires_at") and now >= s["expires_at"]:
-                        node_ip, node_suser = node_info.get(nid, (None, SSH_USER))
-                        if node_ip and not _metrics.get(nid, {}).get("offline"):
-                            await _ssh(node_ip, f"docker stop {ACTIVE_CONTAINER}", node_suser)
-                        await doc.reference.update({"status": "suspended", "suspended_at": now})
+                        node = next((item for item in nodes if item["id"] == nid), None)
+                        if node:
+                            await _suspend_session(doc, s, node, "expired")
                         continue
                     # starting → active when docker running
                     if s.get("status") == "starting":
                         if _metrics.get(nid, {}).get("docker") == "running":
                             await doc.reference.update({"status": "active"})
+
+            now = time.time()
+            if now - last_lifecycle_check >= LIFECYCLE_CHECK_INTERVAL:
+                await _process_active_warnings(now)
+                await _process_suspended_sessions(now)
+                last_lifecycle_check = now
         except Exception:
-            pass
+            logger.exception("Background session lifecycle check failed")
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -332,12 +637,61 @@ async def _container_has_share_mount(host: str, ssh_user: str = SSH_USER) -> boo
     return rc == 0 and DESKTOP_SHARE in out
 
 
+async def _upload_target(email: str) -> tuple[dict, dict, str, str, str]:
+    """업로드 대상 세션과 노드 접속 정보를 찾는다."""
+    snap = await db.collection(COL_SESSIONS).where("owner", "==", email).get()
+    sessions = [doc.to_dict() for doc in snap]
+    target = next(
+        (s for s in sessions if s.get("status") in ("active", "starting")),
+        next((s for s in sessions if s.get("status") == "suspended"), None),
+    )
+    if not target:
+        raise HTTPException(
+            status_code=400, detail="먼저 PC 세션을 시작한 뒤 파일을 보낼 수 있습니다."
+        )
+
+    node = await _get_node(target["node_id"])
+    host = node["ip"]
+    ssh_user = node.get("ssh_user", SSH_USER)
+    return target, node, host, ssh_user, _share_dir(email, ssh_user)
+
+
+def _chunk_meta(
+    upload_id: str,
+    encoded_name: str,
+    chunk_index: int,
+    chunk_count: int,
+    file_size: int,
+) -> tuple[str, str]:
+    """조각 헤더를 검증하고 안전한 파일명과 임시 파일명을 반환한다."""
+    if not re.fullmatch(r"[a-f0-9]{24,64}", upload_id or ""):
+        raise HTTPException(status_code=400, detail="올바르지 않은 업로드 ID입니다.")
+    try:
+        filename = os.path.basename(unquote(encoded_name or "")) or "file"
+    except (TypeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="올바르지 않은 파일명입니다.")
+    if filename in (".", "..") or len(filename.encode("utf-8")) > 240:
+        raise HTTPException(status_code=400, detail="파일명이 너무 길거나 올바르지 않습니다.")
+    if chunk_count < 1 or chunk_count > 100_000 or not 0 <= chunk_index < chunk_count:
+        raise HTTPException(status_code=400, detail="올바르지 않은 파일 조각 번호입니다.")
+    if file_size < 0 or file_size > 10 * 1024**4:  # 최대 10TiB
+        raise HTTPException(status_code=400, detail="올바르지 않은 파일 크기입니다.")
+    expected_count = max(1, (file_size + UPLOAD_CHUNK_BYTES - 1) // UPLOAD_CHUNK_BYTES)
+    if chunk_count != expected_count:
+        raise HTTPException(status_code=400, detail="파일 조각 크기가 서버 설정과 다릅니다.")
+    return filename, f".upload-{upload_id}.part"
+
+
 # ── Routes: health ────────────────────────────────────────────────────────────
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "email_notifications": "configured" if email_configured() else "disabled",
+        "session_retention_days": SESSION_RETENTION_DAYS,
+    }
 
 
 # ── Routes: nodes ─────────────────────────────────────────────────────────────
@@ -422,6 +776,7 @@ class SessionBody(BaseModel):
     team_members: Optional[list[str]] = None
     resources: Optional[dict] = None
     duration_days: Optional[int] = 7
+    work_type: Optional[str] = None
     replace_session_id: Optional[str] = None
 
 
@@ -442,6 +797,7 @@ async def get_session(
             "id": sid,
             "project_name": s.get("project_name", ""),
             "saved_at": s.get("suspended_at") or s.get("created_at", 0),
+            "delete_after": s.get("delete_after"),
             "team_members": s.get("team_members", []),
             "resources": s.get("resources", {}),
         }
@@ -455,6 +811,15 @@ async def get_session(
     node = await _get_node(s["node_id"])
     dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
 
+    meta = {
+        "project_name": s.get("project_name", ""),
+        "work_type": s.get("work_type", ""),
+        "node_id": s["node_id"],
+        "node_name": node.get("name", s["node_id"]),
+        "node_gpu": node.get("gpu", ""),
+        "node_ip": node.get("ip", ""),
+    }
+
     if dock == "running":
         return {
             "status": "ready",
@@ -462,9 +827,15 @@ async def get_session(
             "url": node.get("kasm_url", "https://kasm.dshs-app.net"),
             "expires_at": s.get("expires_at"),
             "suspended_sessions": suspended_sessions,
+            **meta,
         }
 
-    return {"status": "starting", "session_id": session_id, "suspended_sessions": suspended_sessions}
+    return {
+        "status": "starting",
+        "session_id": session_id,
+        "suspended_sessions": suspended_sessions,
+        **meta,
+    }
 
 
 @app.get("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])
@@ -485,9 +856,18 @@ async def poll_session(
     node = await _get_node(s["node_id"])
     dock = await _docker_status(s["node_id"], node["ip"], node.get("ssh_user", SSH_USER))
 
+    meta = {
+        "project_name": s.get("project_name", ""),
+        "work_type": s.get("work_type", ""),
+        "node_id": s["node_id"],
+        "node_name": node.get("name", s["node_id"]),
+        "node_gpu": node.get("gpu", ""),
+        "node_ip": node.get("ip", ""),
+    }
+
     if dock == "running":
-        return {"status": "ready", "url": node.get("kasm_url", "https://kasm.dshs-app.net")}
-    return {"status": "starting"}
+        return {"status": "ready", "url": node.get("kasm_url", "https://kasm.dshs-app.net"), **meta}
+    return {"status": "starting", **meta}
 
 
 @app.post("/session", dependencies=[Depends(require_key), Depends(require_user)])
@@ -531,7 +911,33 @@ async def create_session(
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
 
-        await target.reference.update({"status": "starting", "created_at": time.time()})
+        resumed_at = time.time()
+        duration = max(1, int(s.get("duration_days") or 7))
+        reset_fields = {
+            "status": "starting",
+            "created_at": resumed_at,
+            "expires_at": resumed_at + duration * 86400,
+            "delete_after": None,
+            "suspended_at": None,
+            "suspension_reason": None,
+            "email_suspended_sent_at": None,
+        }
+        reset_fields.update(
+            {f"email_expiry_{hours}h_sent_at": None for hours in SESSION_WARNING_HOURS}
+        )
+        reset_fields.update(
+            {f"email_deletion_{days}d_sent_at": None for days in DELETION_WARNING_DAYS}
+        )
+        await target.reference.update(reset_fields)
+        await _log_activity(
+            me,
+            "session_resume",
+            "세션을 이어서 시작했습니다",
+            _session_name(s),
+            members=s.get("team_members"),
+            node_id=s.get("node_id"),
+            project_name=s.get("project_name"),
+        )
         return {"session_id": target.id, "status": "starting"}
 
     # ── New session ────────────────────────────────────────────────────────────
@@ -549,7 +955,14 @@ async def create_session(
             old_s = old_doc.to_dict()
             if old_s.get("owner") == me or is_admin:
                 node = await _get_node(old_s["node_id"])
-                await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
+                old_ssh_user = node.get("ssh_user", SSH_USER)
+                old_share_dir = _share_dir(old_s.get("owner", me), old_ssh_user)
+                await _ssh(
+                    node["ip"],
+                    f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true\n"
+                    f"rm -rf {shlex.quote(old_share_dir)}",
+                    old_ssh_user,
+                )
                 await old_doc.reference.delete()
 
     # Pick node
@@ -618,8 +1031,20 @@ async def create_session(
         "status": "starting",
         "created_at": time.time(),
         "expires_at": time.time() + duration * 86400,
+        "duration_days": duration,
+        "work_type": (body.work_type if body else None) or "",
         "resources": (body.resources if body else None) or {},
     })
+
+    await _log_activity(
+        me,
+        "session_start",
+        "세션을 시작했습니다",
+        f"{(body.project_name if body else '') or '세션'} · {node.get('name', node_id)}",
+        members=(body.team_members if body else None),
+        node_id=node_id,
+        project_name=(body.project_name if body else None),
+    )
 
     return {"session_id": new_id, "status": "starting"}
 
@@ -644,16 +1069,261 @@ async def delete_session(
     _suser = node.get("ssh_user", SSH_USER)
 
     if permanent:
-        await _ssh(node["ip"], f"docker rm -f {ACTIVE_CONTAINER}", _suser)
+        owner = s.get("owner", me)
+        share_dir = _share_dir(owner, _suser)
+        _, rc = await _ssh(
+            node["ip"],
+            f"docker rm -f {ACTIVE_CONTAINER} 2>/dev/null || true\n"
+            f"rm -rf {shlex.quote(share_dir)}",
+            _suser,
+        )
+        if rc != 0:
+            raise HTTPException(status_code=502, detail="노드의 세션 파일 삭제에 실패했습니다.")
+        recipients = _session_recipients(s)
         await doc.reference.delete()
+        await _log_activity(
+            s.get("owner", me),
+            "session_delete",
+            "세션을 영구 삭제했습니다",
+            _session_name(s),
+            members=s.get("team_members"),
+            node_id=s.get("node_id"),
+            project_name=s.get("project_name"),
+        )
+        if email_configured():
+            await send_email(
+                recipients,
+                "[DSHS Server] 세션이 영구 삭제되었습니다",
+                (
+                    f"요청하신 '{_session_name(s)}' 세션의 컨테이너와 파일이 영구 삭제되었습니다.\n\n"
+                    f"대시보드: {PORTAL_URL}"
+                ),
+            )
         return {"message": "세션을 완전히 삭제했습니다."}
 
-    await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", _suser)
-    await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
-    return {"status": "suspended"}
+    suspended = await _suspend_session(doc, s, node, "user")
+    return {"status": "suspended", "delete_after": suspended["delete_after"]}
+
+
+@app.get("/history", dependencies=[Depends(require_key), Depends(require_user)])
+async def get_history(
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    me = x_user_email.lower()
+    now = time.time()
+    month_start = (
+        datetime.now(KST)
+        .replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+
+    act_snap = await db.collection(COL_ACTIVITY).where("owner", "==", me).get()
+    events = sorted(
+        (d.to_dict() for d in act_snap),
+        key=lambda e: e.get("ts", 0),
+        reverse=True,
+    )
+
+    sessions_started = sum(
+        1
+        for e in events
+        if e.get("type") in ("session_start", "session_resume") and e.get("ts", 0) >= month_start
+    )
+    upload_bytes = sum(
+        int(e.get("bytes", 0))
+        for e in events
+        if e.get("type") == "file_upload" and e.get("ts", 0) >= month_start
+    )
+
+    # 이번 달에 걸친 세션 활성 구간 합산 (근사치)
+    sess_snap = await db.collection(COL_SESSIONS).where("owner", "==", me).get()
+    usage_seconds = 0
+    for d in sess_snap:
+        s = d.to_dict()
+        created = s.get("created_at")
+        if not isinstance(created, (int, float)):
+            continue
+        end = s.get("suspended_at")
+        if not isinstance(end, (int, float)):
+            end = now if s.get("status") in ("active", "starting") else created
+        start = max(created, month_start)
+        if end > start:
+            usage_seconds += int(end - start)
+
+    recent = [
+        {
+            "ts": e.get("ts", 0),
+            "type": e.get("type", ""),
+            "title": e.get("title", ""),
+            "detail": e.get("detail", ""),
+        }
+        for e in events[:40]
+    ]
+    return {
+        "summary": {
+            "usage_seconds": usage_seconds,
+            "sessions_started": sessions_started,
+            "upload_bytes": upload_bytes,
+        },
+        "events": recent,
+    }
 
 
 # ── Routes: file upload ───────────────────────────────────────────────────────
+
+
+@app.post("/upload/chunk")
+async def upload_file_chunk(
+    request: Request,
+    x_upload_token: str = Header(""),
+    x_upload_id: str = Header(""),
+    x_file_name: str = Header(""),
+    x_chunk_index: int = Header(-1),
+    x_chunk_count: int = Header(-1),
+    x_file_size: int = Header(-1),
+):
+    """대용량 파일 한 조각을 중앙 PC 디스크에 쌓지 않고 노드 임시 파일로 바로 쓴다."""
+    email = _verify_upload_token(x_upload_token)
+    filename, temp_name = _chunk_meta(
+        x_upload_id, x_file_name, x_chunk_index, x_chunk_count, x_file_size
+    )
+    _, _, host, ssh_user, share_dir = await _upload_target(email)
+    remote_temp = f"{share_dir}/{temp_name}"
+    expected = min(
+        UPLOAD_CHUNK_BYTES,
+        max(0, x_file_size - x_chunk_index * UPLOAD_CHUNK_BYTES),
+    )
+
+    # 완료/취소되지 않은 임시 파일도 24시간 뒤에는 자동 정리한다.
+    cleanup = (
+        f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)} && "
+        f"find {shlex.quote(share_dir)} -maxdepth 1 -type f "
+        f"-name '.upload-*.part' -mmin +1440 -delete"
+    )
+    await _ssh(host, cleanup, ssh_user)
+
+    received = 0
+    try:
+        async with asyncssh.connect(
+            host,
+            username=ssh_user,
+            password=SSH_PASSWORD,
+            known_hosts=None,
+            connect_timeout=10,
+        ) as conn:
+            async with conn.start_sftp_client() as sftp:
+                mode = "wb" if x_chunk_index == 0 else "r+b"
+                async with sftp.open(remote_temp, mode) as remote_file:
+                    offset = x_chunk_index * UPLOAD_CHUNK_BYTES
+                    buffer = bytearray()
+                    async for data in request.stream():
+                        if not data:
+                            continue
+                        received += len(data)
+                        if received > expected:
+                            raise HTTPException(status_code=400, detail="파일 조각이 예상보다 큽니다.")
+                        buffer.extend(data)
+                        if len(buffer) >= 1024 * 1024:
+                            payload = bytes(buffer)
+                            await remote_file.write(payload, offset)
+                            offset += len(payload)
+                            buffer.clear()
+                    if buffer:
+                        await remote_file.write(bytes(buffer), offset)
+    except HTTPException:
+        raise
+    except (OSError, asyncssh.Error) as exc:
+        raise HTTPException(status_code=502, detail=f"노드 전송 실패: {exc}")
+
+    if received != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"파일 조각 크기가 올바르지 않습니다. ({received}/{expected} bytes)",
+        )
+    return {
+        "received": received,
+        "chunk": x_chunk_index + 1,
+        "chunks": x_chunk_count,
+        "filename": filename,
+    }
+
+
+@app.post("/upload/complete")
+async def complete_chunked_upload(
+    x_upload_token: str = Header(""),
+    x_upload_id: str = Header(""),
+    x_file_name: str = Header(""),
+    x_chunk_count: int = Header(-1),
+    x_file_size: int = Header(-1),
+):
+    """모든 조각이 도착한 임시 파일을 원래 이름으로 원자적으로 공개한다."""
+    email = _verify_upload_token(x_upload_token)
+    filename, temp_name = _chunk_meta(
+        x_upload_id, x_file_name, max(0, x_chunk_count - 1), x_chunk_count, x_file_size
+    )
+    target, node, host, ssh_user, share_dir = await _upload_target(email)
+    remote_temp = f"{share_dir}/{temp_name}"
+    remote = f"{share_dir}/{filename}"
+
+    finalize = (
+        f"test \"$(stat -c %s {shlex.quote(remote_temp)} 2>/dev/null)\" = "
+        f"{shlex.quote(str(x_file_size))} && "
+        f"mv -f {shlex.quote(remote_temp)} {shlex.quote(remote)} && "
+        f"chmod 666 {shlex.quote(remote)}"
+    )
+    output, rc = await _ssh(host, finalize, ssh_user)
+    if rc != 0:
+        raise HTTPException(
+            status_code=409,
+            detail="일부 파일 조각이 빠졌거나 크기가 맞지 않습니다. 다시 시도해주세요.",
+        )
+
+    has_mount = await _container_has_share_mount(host, ssh_user)
+    if not has_mount:
+        copy_cmd = (
+            f"docker exec -u root {ACTIVE_CONTAINER} mkdir -p {shlex.quote(DESKTOP_SHARE)} && "
+            f"docker cp {shlex.quote(remote)} "
+            f"{ACTIVE_CONTAINER}:{shlex.quote(DESKTOP_SHARE + '/')} && "
+            f"docker exec -u root {ACTIVE_CONTAINER} "
+            f"chown -R 1000:1000 {shlex.quote(DESKTOP_SHARE)}"
+        )
+        copy_output, copy_rc = await _ssh(host, copy_cmd, ssh_user)
+        if copy_rc != 0:
+            raise HTTPException(status_code=502, detail=f"컨테이너 복사 실패: {copy_output}")
+        # 구형 컨테이너는 bind-mount가 없으므로 docker cp 성공 후 호스트 사본을 제거한다.
+        await _ssh(host, f"rm -f {shlex.quote(remote)}", ssh_user)
+
+    await _log_activity(
+        email,
+        "file_upload",
+        "파일 전송 완료",
+        filename,
+        node_id=target.get("node_id"),
+        byte_count=x_file_size if x_file_size and x_file_size > 0 else None,
+    )
+
+    return {
+        "uploaded": [filename],
+        "count": 1,
+        "node": node.get("name", target["node_id"]),
+        "live": has_mount or target.get("status") in ("active", "starting"),
+    }
+
+
+@app.delete("/upload/chunk")
+async def cancel_chunked_upload(
+    x_upload_token: str = Header(""),
+    x_upload_id: str = Header(""),
+):
+    """사용자가 취소한 대용량 업로드의 노드 임시 파일을 즉시 지운다."""
+    email = _verify_upload_token(x_upload_token)
+    if not re.fullmatch(r"[a-f0-9]{24,64}", x_upload_id or ""):
+        raise HTTPException(status_code=400, detail="올바르지 않은 업로드 ID입니다.")
+    _, _, host, ssh_user, share_dir = await _upload_target(email)
+    remote_temp = f"{share_dir}/.upload-{x_upload_id}.part"
+    await _ssh(host, f"rm -f {shlex.quote(remote_temp)}", ssh_user)
+    return {"cancelled": True}
 
 
 @app.post("/upload")
@@ -859,6 +1529,38 @@ _CLEANUP_CMD = (
 )
 
 
+@app.get("/admin/sessions", dependencies=[Depends(require_key)])
+async def admin_sessions():
+    snap = await db.collection(COL_SESSIONS).get()
+    node_names: dict[str, str] = {}
+    result = []
+    for doc in snap:
+        s = doc.to_dict()
+        nid = s.get("node_id")
+        name = nid
+        if nid:
+            if nid not in node_names:
+                try:
+                    ndoc = await db.collection(COL_NODES).document(nid).get()
+                    node_names[nid] = (ndoc.to_dict() or {}).get("name", nid) if ndoc.exists else nid
+                except Exception:
+                    node_names[nid] = nid
+            name = node_names[nid]
+        result.append({
+            "id": doc.id,
+            "owner": s.get("owner"),
+            "project_name": s.get("project_name"),
+            "node_id": nid,
+            "node_name": name,
+            "status": s.get("status"),
+            "expires_at": s.get("expires_at"),
+            "delete_after": s.get("delete_after"),
+        })
+    order = {"active": 0, "starting": 1, "suspended": 2}
+    result.sort(key=lambda r: order.get(r.get("status"), 3))
+    return {"sessions": result}
+
+
 @app.get("/admin/status", dependencies=[Depends(require_key)])
 async def admin_status():
     snap = await (
@@ -894,8 +1596,7 @@ async def admin_terminate(node_id: Optional[str] = Query(None)):
         if node_id and s.get("node_id") != node_id:
             continue
         node = await _get_node(s["node_id"])
-        await _ssh(node["ip"], f"docker stop {ACTIVE_CONTAINER}", node.get("ssh_user", SSH_USER))
-        await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
+        await _suspend_session(doc, s, node, "admin")
         terminated.append(doc.id)
     return {"terminated": terminated, "count": len(terminated)}
 
