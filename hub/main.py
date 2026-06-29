@@ -66,6 +66,37 @@ COL_USERS = "users"
 #             gpu, top, docker, offline, last_seen}
 _metrics: dict[str, dict] = {}
 _last_polled: dict[str, float] = {}  # node_id → last SSH poll timestamp
+_nodes_cache: list[dict] = []  # populated from Firestore; cleared on admin write to force reload
+NODES_CACHE_FILE = os.path.expanduser("~/hub/nodes_cache.json")
+
+
+def _save_nodes_to_file() -> None:
+    try:
+        with open(NODES_CACHE_FILE, "w") as f:
+            json.dump(_nodes_cache, f)
+    except Exception:
+        pass
+
+
+def _load_nodes_from_file() -> None:
+    try:
+        if os.path.exists(NODES_CACHE_FILE):
+            with open(NODES_CACHE_FILE) as f:
+                data = json.load(f)
+            _nodes_cache[:] = data
+    except Exception:
+        pass
+
+
+async def _get_nodes() -> list[dict]:
+    if not _nodes_cache:
+        try:
+            snap = await db.collection(COL_NODES).get()
+            _nodes_cache[:] = [{"id": d.id, **d.to_dict()} for d in snap]
+            _save_nodes_to_file()
+        except Exception:
+            _load_nodes_from_file()
+    return list(_nodes_cache)
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
 
@@ -164,17 +195,20 @@ async def _collect_metrics(node_id: str, ip: str, ssh_user: str = SSH_USER) -> d
 async def _poll_nodes_loop():
     while True:
         try:
-            snap = await db.collection(COL_NODES).get()
-            nodes = [{"id": d.id, **d.to_dict()} for d in snap]
+            nodes = await _get_nodes()
 
             if nodes:
-                # 어느 노드에 활성 세션이 있는지 파악
-                active_snap = await (
-                    db.collection(COL_SESSIONS)
-                    .where("status", "in", ["active", "starting"])
-                    .get()
-                )
-                active_node_ids = {s.to_dict().get("node_id") for s in active_snap}
+                # Single session query reused for both SSH polling decision and sync
+                try:
+                    active_snap = await (
+                        db.collection(COL_SESSIONS)
+                        .where("status", "in", ["active", "starting"])
+                        .get()
+                    )
+                    active_docs = list(active_snap)
+                except Exception:
+                    active_docs = []
+                active_node_ids = {s.to_dict().get("node_id") for s in active_docs}
 
                 now = time.time()
                 # 세션 있으면 항상 폴링, 없으면 IDLE_POLL_INTERVAL 경과 시에만
@@ -198,14 +232,9 @@ async def _poll_nodes_loop():
                     else:
                         _metrics[node["id"]] = result
 
-                # Sync session status: starting → active, auto-expire
+                # Sync session status: starting → active, auto-expire (reuse active_docs)
                 now = time.time()
-                sessions_snap = await (
-                    db.collection(COL_SESSIONS)
-                    .where("status", "in", ["active", "starting"])
-                    .get()
-                )
-                for doc in sessions_snap:
+                for doc in active_docs:
                     s = doc.to_dict()
                     nid = s.get("node_id", "")
                     # Auto-expire
@@ -248,8 +277,8 @@ async def _write_log():
     now = datetime.now()
     log_path = os.path.join(LOG_DIR, now.strftime("%Y-%m-%d") + ".log")
 
-    nodes_snap = await db.collection(COL_NODES).get()
-    nodes = {d.id: d.to_dict() for d in nodes_snap}
+    nodes_list = await _get_nodes()
+    nodes = {n["id"]: n for n in nodes_list}
 
     sessions_snap = await db.collection(COL_SESSIONS).get()
     all_sessions = [{"id": d.id, **d.to_dict()} for d in sessions_snap]
@@ -372,6 +401,9 @@ async def require_user(x_user_email: str = Header("")):
 
 
 async def _get_node(node_id: str) -> dict:
+    for n in _nodes_cache:
+        if n["id"] == node_id:
+            return n
     doc = await db.collection(COL_NODES).document(node_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
@@ -403,7 +435,7 @@ def _container_name(session_id: str) -> str:
     return f"kasm_{session_id}"
 
 def _session_url(session_id: str, kasm_url: str) -> str:
-    return f"{kasm_url.rstrip('/')}/{session_id}/"
+    return f"{kasm_url.rstrip('/')}/{session_id}/?path={session_id}/websockify"
 
 async def _allocate_port(node_id: str, node_ip: str, ssh_user: str) -> int:
     snap = await (
@@ -546,17 +578,19 @@ async def list_nodes(
     storage_gb: Optional[int] = None,
     gpu: Optional[str] = None,
 ):
-    nodes_snap = await db.collection(COL_NODES).get()
-    sessions_snap = await (
-        db.collection(COL_SESSIONS)
-        .where("status", "in", ["active", "starting", "suspended"])
-        .get()
-    )
-    sessions = [s.to_dict() for s in sessions_snap]
+    nodes = await _get_nodes()
+    try:
+        sessions_snap = await (
+            db.collection(COL_SESSIONS)
+            .where("status", "in", ["active", "starting", "suspended"])
+            .get()
+        )
+        sessions = [s.to_dict() for s in sessions_snap]
+    except Exception:
+        sessions = []
 
     result = []
-    for doc in nodes_snap:
-        n = doc.to_dict()
+    for n in nodes:
         if cpu_cores is not None and n.get("cpu_cores", 0) < cpu_cores:
             continue
         if ram_gb is not None and n.get("ram_gb", 0) < ram_gb:
@@ -566,10 +600,10 @@ async def list_nodes(
         if gpu is not None and n.get("gpu_type", "none") != gpu:
             continue
 
-        state = _node_session_state(doc.id, sessions)
+        state = _node_session_state(n["id"], sessions)
         result.append({
-            "id": doc.id,
-            "name": n.get("name", doc.id),
+            "id": n["id"],
+            "name": n.get("name", n["id"]),
             "cpu": n.get("cpu", ""),
             "cpu_cores": n.get("cpu_cores", 0),
             "gpu": n.get("gpu", ""),
@@ -585,25 +619,24 @@ async def list_nodes(
 @app.get("/node_specs", dependencies=[Depends(require_key)])
 async def node_specs():
     """Legacy single-node spec endpoint."""
-    snap = await db.collection(COL_NODES).get()
-    docs = list(snap)
-    if not docs:
+    nodes = await _get_nodes()
+    if not nodes:
         return {
             "id": "server-01", "name": "1호기",
             "cpu": "Intel Core i7", "gpu": "NVIDIA GTX 1660",
             "ram_gb": 32, "storage_gb": 500, "available": True, "session_state": "none",
         }
-    n = docs[0].to_dict()
+    n = nodes[0]
     sessions_snap = await (
         db.collection(COL_SESSIONS)
-        .where("node_id", "==", docs[0].id)
+        .where("node_id", "==", n["id"])
         .where("status", "in", ["active", "starting", "suspended"])
         .get()
     )
     sessions = [s.to_dict() for s in sessions_snap]
-    state = _node_session_state(docs[0].id, sessions)
+    state = _node_session_state(n["id"], sessions)
     return {
-        "id": docs[0].id, **n,
+        "id": n["id"], **{k: v for k, v in n.items() if k != "id"},
         "available": state != "active",
         "session_state": state,
     }
@@ -653,7 +686,7 @@ async def get_session(
     dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
 
     if dock == "running":
-        url = s.get("url") or _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
+        url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
         return {
             "status": "ready",
             "session_id": session_id,
@@ -702,7 +735,7 @@ async def poll_session(
     dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
 
     if dock == "running":
-        url = s.get("url") or _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
+        url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
         return {"status": "ready", "url": url}
     if dock in ("exited", "dead"):
         return {"status": "error", "message": "컨테이너가 예기치 않게 종료되었습니다."}
@@ -771,7 +804,7 @@ async def create_session(
     # Pick node — least-loaded with remaining port capacity
     node_id = body.node_id if body else None
     if not node_id:
-        nodes_snap = await db.collection(COL_NODES).get()
+        all_nodes = await _get_nodes()
         sessions_snap = await (
             db.collection(COL_SESSIONS)
             .where("status", "in", ["active", "starting", "suspended"])
@@ -784,11 +817,11 @@ async def create_session(
 
         best_node: Optional[str] = None
         best_count = PORT_MAX - PORT_BASE + 1  # max capacity
-        for doc in nodes_snap:
-            count = session_counts.get(doc.id, 0)
+        for nn in all_nodes:
+            count = session_counts.get(nn["id"], 0)
             if count < best_count:
                 best_count = count
-                best_node = doc.id
+                best_node = nn["id"]
         if not best_node:
             raise HTTPException(status_code=503, detail="사용 가능한 PC가 없습니다.")
         node_id = best_node
@@ -965,18 +998,20 @@ async def upload_files(
 
 @app.get("/admin/nodes", dependencies=[Depends(require_key)])
 async def admin_nodes():
-    nodes_snap = await db.collection(COL_NODES).get()
-    active_snap = await (
-        db.collection(COL_SESSIONS)
-        .where("status", "in", ["active", "starting"])
-        .get()
-    )
-    active_by_node = {s.to_dict().get("node_id"): s.to_dict() for s in active_snap}
+    nodes = await _get_nodes()
+    try:
+        active_snap = await (
+            db.collection(COL_SESSIONS)
+            .where("status", "in", ["active", "starting"])
+            .get()
+        )
+        active_by_node = {s.to_dict().get("node_id"): s.to_dict() for s in active_snap}
+    except Exception:
+        active_by_node = {}
 
     result = []
-    for doc in nodes_snap:
-        n = doc.to_dict()
-        m = _metrics.get(doc.id, {})
+    for n in nodes:
+        m = _metrics.get(n["id"], {})
 
         if not m or m.get("offline"):
             status = "offline"
@@ -986,8 +1021,8 @@ async def admin_nodes():
             status = "idle"
 
         entry: dict = {
-            "id": doc.id,
-            "name": n.get("name", doc.id),
+            "id": n["id"],
+            "name": n.get("name", n["id"]),
             "status": status,
             "cpu_usage": m.get("cpu", 0),
             "gpu_usage": m.get("gpu", 0),
@@ -998,8 +1033,8 @@ async def admin_nodes():
             "top_process": m.get("top"),
         }
 
-        if doc.id in active_by_node:
-            active = active_by_node[doc.id]
+        if n["id"] in active_by_node:
+            active = active_by_node[n["id"]]
             entry["project_name"] = active.get("project_name", "")
             entry["owner"] = active.get("owner", "")
 
@@ -1067,12 +1102,21 @@ class NodeBody(BaseModel):
 async def register_node(node_id: str = Query(...), body: NodeBody = Body(...)):
     data = body.model_dump()
     await db.collection(COL_NODES).document(node_id).set(data)
+    entry = {"id": node_id, **data}
+    existing = next((i for i, n in enumerate(_nodes_cache) if n["id"] == node_id), None)
+    if existing is not None:
+        _nodes_cache[existing] = entry
+    else:
+        _nodes_cache.append(entry)
+    _save_nodes_to_file()
     return {"id": node_id, **data}
 
 
 @app.delete("/admin/nodes/{node_id}", dependencies=[Depends(require_key)])
 async def remove_node(node_id: str):
     await db.collection(COL_NODES).document(node_id).delete()
+    _nodes_cache[:] = [n for n in _nodes_cache if n["id"] != node_id]
+    _save_nodes_to_file()
     return {"id": node_id, "deleted": True}
 
 
@@ -1129,14 +1173,13 @@ async def admin_terminate(node_id: Optional[str] = Query(None)):
 
 @app.post("/admin/cleanup", dependencies=[Depends(require_key)])
 async def admin_cleanup(node_id: Optional[str] = Query(None)):
-    nodes_snap = await db.collection(COL_NODES).get()
+    nodes = await _get_nodes()
     results = {}
-    for doc in nodes_snap:
-        if node_id and doc.id != node_id:
+    for n in nodes:
+        if node_id and n["id"] != node_id:
             continue
-        n = doc.to_dict()
         stdout, rc = await _ssh(n["ip"], _CLEANUP_CMD, n.get("ssh_user", SSH_USER))
-        results[doc.id] = {"removed": stdout.strip(), "ok": rc == 0}
+        results[n["id"]] = {"removed": stdout.strip(), "ok": rc == 0}
     return {"nodes": results}
 
 
