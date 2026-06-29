@@ -62,7 +62,11 @@ export default function RequestSheet({
   const meets = (node: NodeInfo) =>
     (node.cpu_cores == null || node.cpu_cores >= cpu) &&
     node.ram_gb >= ram &&
-    node.storage_gb >= storage;
+    node.storage_gb >= storage &&
+    (node.resource_used == null || node.cpu_cores == null || node.cpu_cores === 0 ||
+      (node.resource_used.cpu_cores + cpu) / node.cpu_cores <= 0.9) &&
+    (node.resource_used == null || node.ram_gb === 0 ||
+      (node.resource_used.ram_gb + ram) / node.ram_gb <= 0.9);
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId);
   const selectedOk = selectedNode ? meets(selectedNode) && nodeState(selectedNode) !== "active" : false;
@@ -256,7 +260,11 @@ const SelectMachine = memo(function SelectMachine({
   const meets = (node: NodeInfo) =>
     (node.cpu_cores == null || node.cpu_cores >= cpu) &&
     node.ram_gb >= ram &&
-    node.storage_gb >= storage;
+    node.storage_gb >= storage &&
+    (node.resource_used == null || node.cpu_cores == null || node.cpu_cores === 0 ||
+      (node.resource_used.cpu_cores + cpu) / node.cpu_cores <= 0.9) &&
+    (node.resource_used == null || node.ram_gb === 0 ||
+      (node.resource_used.ram_gb + ram) / node.ram_gb <= 0.9);
 
   return (
     <aside className={s.selectMachine}>
@@ -268,6 +276,16 @@ const SelectMachine = memo(function SelectMachine({
       {nodes.map((node, index) => {
         const st = nodeState(node);
         const ok = meets(node) && st !== "active";
+        const sc = node.session_count ?? 0;
+        const cpuPct = node.load?.cpu_pct ?? null;
+        const userLabel =
+          st === "active" ? "2명 사용 중 (만석)" :
+          sc === 1 ? "1명 사용 중" :
+          "비어 있음";
+        const stateLabel =
+          st === "active" ? "사용 중 (2/2)" :
+          meets(node) ? "선택 가능" :
+          "사양 부족";
         return (
           <button
             key={node.id}
@@ -283,11 +301,34 @@ const SelectMachine = memo(function SelectMachine({
                 <br />
                 {node.ram_gb}GB · {node.storage_gb}GB
               </small>
+              {cpuPct !== null && (
+                <NodeLoadBar pct={cpuPct} label={userLabel} />
+              )}
+              {cpuPct === null && sc > 0 && (
+                <small style={{ color: "var(--c-text-2, #888)", fontSize: "11px" }}>{userLabel}</small>
+              )}
             </div>
-            <em>{st === "active" ? "사용 중" : meets(node) ? "선택 가능" : "사양 부족"}</em>
+            <em>{stateLabel}</em>
           </button>
         );
       })}
     </aside>
   );
 });
+
+function NodeLoadBar({ pct, label }: { pct: number; label: string }) {
+  const color = pct >= 80 ? "#c0392b" : pct >= 50 ? "#e67e22" : "#27ae60";
+  return (
+    <div style={{ marginTop: "4px" }}>
+      <div style={{
+        height: "3px", borderRadius: "2px", background: "rgba(0,0,0,0.08)",
+        overflow: "hidden", width: "100%",
+      }}>
+        <div style={{ height: "100%", width: `${Math.min(pct, 100)}%`, background: color, transition: "width 0.4s" }} />
+      </div>
+      <span style={{ fontSize: "11px", color: "var(--c-text-2, #888)" }}>
+        CPU {Math.round(pct)}% · {label}
+      </span>
+    </div>
+  );
+}

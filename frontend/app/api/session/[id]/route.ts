@@ -73,3 +73,31 @@ export async function DELETE(
     );
   }
 }
+
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+  const headers = await userHeaders();
+  if (!headers) {
+    return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
+  }
+  try {
+    const body = await request.json();
+    const res = await fetch(`${BACKEND_URL}/session/${id}`, {
+      method: "PATCH",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = typeof data.detail === "string" ? data.detail : null;
+      return NextResponse.json({ error: detail || "연장 실패" }, { status: res.status });
+    }
+    return NextResponse.json(data);
+  } catch (e) {
+    console.error("session patch error:", e);
+    return NextResponse.json({ error: "백엔드 서버에 연결할 수 없습니다." }, { status: 503 });
+  }
+}

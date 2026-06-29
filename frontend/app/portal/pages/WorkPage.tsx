@@ -322,9 +322,9 @@ function ErrorAssignment({ ctrl }: { ctrl: SessionController }) {
 
 function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
   const free = nodes.filter((n) => nodeState(n) === "available").length;
-  const stateLabel = (st: "available" | "suspended" | "active") =>
+  const stateLabel = (st: "available" | "partial" | "suspended" | "active") =>
     st === "active" ? "사용 중" : "가능";
-  const stateAttr = (st: "available" | "suspended" | "active") =>
+  const stateAttr = (st: "available" | "partial" | "suspended" | "active") =>
     st === "active" ? "busy" : "available";
 
   return (
