@@ -51,6 +51,12 @@ DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/받은파일")
 # 업로드 토큰 서명 키 — Vercel과 공유. 별도 설정 없으면 API_KEY 재사용.
 UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET", API_KEY)
 
+GMAIL_CREDENTIALS = os.environ.get("GMAIL_CREDENTIALS", "")
+GMAIL_TOKEN = os.environ.get("GMAIL_TOKEN", "")
+GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "")
+EMAIL_CHECK_INTERVAL = int(os.environ.get("EMAIL_CHECK_INTERVAL", "3600"))
+WARNING_SECONDS = 7 * 86400
+
 # ── Firebase ──────────────────────────────────────────────────────────────────
 
 _cred = credentials.Certificate(FIREBASE_CRED)
@@ -558,6 +564,57 @@ async def _container_has_share_mount(host: str, container: str, ssh_user: str = 
     tmpl = "{{range .Mounts}}{{.Destination}}\n{{end}}"
     out, rc = await _ssh(host, f"docker inspect -f '{tmpl}' {container}", ssh_user)
     return rc == 0 and DESKTOP_SHARE in out
+
+
+# ── Email ────────────────────────────────────────────────────────────────────
+
+
+def _build_gmail_service():
+    """OAuth2 token.json으로 Gmail API 서비스 객체 생성. 미설정/만료 시 None 반환."""
+    if not GMAIL_TOKEN or not os.path.exists(GMAIL_TOKEN):
+        return None
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+
+        creds = Credentials.from_authorized_user_file(
+            GMAIL_TOKEN,
+            ["https://www.googleapis.com/auth/gmail.send"],
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(GMAIL_TOKEN, "w") as f:
+                f.write(creds.to_json())
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print(f"[gmail] 서비스 초기화 실패: {e}")
+        return None
+
+
+async def _send_email(to: str, subject: str, body: str) -> None:
+    """Gmail API로 이메일 발송. 실패해도 세션 로직에 영향 없음."""
+    if not GMAIL_SENDER or not to:
+        return
+    try:
+        import email.mime.text as _mime
+        service = _build_gmail_service()
+        if not service:
+            return
+        msg = _mime.MIMEText(body, "plain", "utf-8")
+        msg["To"] = to
+        msg["From"] = GMAIL_SENDER
+        msg["Subject"] = subject
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: service.users().messages().send(
+                userId="me", body={"raw": raw}
+            ).execute(),
+        )
+    except Exception as e:
+        print(f"[email] 발송 실패 ({to}): {e}")
 
 
 # ── Routes: health ────────────────────────────────────────────────────────────
