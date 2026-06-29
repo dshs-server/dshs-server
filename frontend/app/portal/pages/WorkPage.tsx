@@ -214,10 +214,14 @@ function ReadyAssignment({
         >
           데스크톱 열기 <span>↗</span>
         </a>
-        <UploadButton availableStorageGb={availableStorageGb} />
+        <span />
         <button className={s.powerButton} aria-label="작업 종료" title="작업 종료" onClick={onTerminate}>
           <PowerIcon />
         </button>
+      </div>
+
+      <div className={s.uploadRow}>
+        <UploadButton availableStorageGb={availableStorageGb} />
       </div>
     </div>
   );

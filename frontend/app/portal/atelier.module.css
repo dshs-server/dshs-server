@@ -1046,3 +1046,28 @@
   .testDock .testStateButtons { flex-wrap: nowrap; }
   .timeReadout { width: 100%; text-align: left; }
 }
+
+/* ── 파일 전송 패널: 공용 UploadButton(globals .btn/.glass 사용)을 ivory 토큰으로 재색 ── */
+.uploadRow { margin-top: 14px; }
+.uploadRow {
+  --text: #17191c;
+  --text-dim: rgba(23, 25, 28, .68);
+  --text-faint: rgba(23, 25, 28, .45);
+  --accent: #17191c;
+  --accent-strong: #2b2f36;
+  --accent-glow: rgba(23, 25, 28, .18);
+  --glass-bg: rgba(255, 255, 255, .62);
+  --glass-bg-strong: rgba(255, 255, 255, .82);
+  --glass-border: rgba(25, 31, 39, .14);
+  --glass-border-strong: rgba(25, 31, 39, .2);
+  --glass-shadow: 0 12px 40px rgba(27, 32, 39, .1);
+}
+.uploadRow :global(.btn) { font-size: 15px; }
+.uploadRow :global(.btn-ghost) {
+  background: rgba(255, 255, 255, .72);
+  border-color: rgba(25, 31, 39, .14);
+  color: #17191c;
+}
+.uploadRow :global(.btn-ghost:hover:not(:disabled)) { background: #ffffff; }
+.uploadRow :global(.glass) { color: #17191c; }
+.uploadRow :global(.glass::after) { display: none; }
