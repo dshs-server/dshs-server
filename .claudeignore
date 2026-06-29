@@ -1,0 +1,24 @@
+# Node.js
+node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+hub/tests/__pycache__/
+
+# Git internals
+.git/
+
+# Build / deploy artifacts
+.vercel/
+frontend/.vercel/
+
+# Docker build context
+docker/
+
+# Docs (자동 생성 문서)
+docs/superpowers/
