@@ -366,6 +366,47 @@ async def _log_loop():
         await asyncio.sleep(LOG_INTERVAL)
 
 
+# ── Email notification loop ───────────────────────────────────────────────────
+
+
+async def _check_and_send_warnings() -> None:
+    """active/starting 세션 중 7일 내 만료 예정이고 경고 미발송인 세션에 이메일 발송."""
+    now = time.time()
+    snap = await (
+        db.collection(COL_SESSIONS)
+        .where("status", "in", ["active", "starting"])
+        .get()
+    )
+    for doc in snap:
+        s = doc.to_dict()
+        expires_at = s.get("expires_at")
+        if not expires_at or s.get("warning_email_sent"):
+            continue
+        if expires_at - now <= WARNING_SECONDS:
+            owner = s.get("owner", "")
+            expire_str = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
+            project = s.get("project_name") or doc.id
+            await _send_email(
+                owner,
+                "[PC대여] 세션이 7일 후 자동 일시중지됩니다",
+                f"안녕하세요.\n\n"
+                f"'{project}' 세션이 {expire_str}에 자동으로 일시중지될 예정입니다.\n\n"
+                f"계속 사용하시려면 포털(https://dshs-app.net)에서 이어서 사용을 눌러주세요.\n\n"
+                f"- dshs 전산실",
+            )
+            await doc.reference.update({"warning_email_sent": True})
+
+
+async def _email_notification_loop():
+    await asyncio.sleep(60)  # 서버 시작 후 1분 뒤 첫 실행
+    while True:
+        try:
+            await _check_and_send_warnings()
+        except Exception as e:
+            print(f"[email-loop] 오류: {e}")
+        await asyncio.sleep(EMAIL_CHECK_INTERVAL)
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 
@@ -373,8 +414,9 @@ async def _log_loop():
 async def lifespan(app: FastAPI):
     poll_task = asyncio.create_task(_poll_nodes_loop())
     log_task = asyncio.create_task(_log_loop())
+    email_task = asyncio.create_task(_email_notification_loop())
     yield
-    for t in (poll_task, log_task):
+    for t in (poll_task, log_task, email_task):
         t.cancel()
         try:
             await t
