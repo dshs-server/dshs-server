@@ -977,7 +977,7 @@ async def get_session(
         orig = s.get("original_created_at") or s.get("created_at", time.time())
         expires = s.get("expires_at", time.time())
         extend_blocked = (not s.get("extend_unlocked", False)) and \
-            ((expires - orig) / 86400 >= 40)
+            ((expires + 86400 - orig) / 86400 > 40)
         return {
             "status": "ready",
             "session_id": session_id,
@@ -1315,7 +1315,17 @@ async def patch_session(
 ):
     s = _sc_get(session_id)
     if s is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+        # fallback to Firestore for suspended sessions evicted from memory
+        try:
+            doc = await db.collection(COL_SESSIONS).document(session_id).get()
+            if doc.exists:
+                s = doc.to_dict()
+            else:
+                raise HTTPException(status_code=404, detail="Session not found")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=404, detail="Session not found")
 
     me = x_user_email.lower()
     is_admin = x_user_admin == "1"
