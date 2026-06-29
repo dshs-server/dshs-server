@@ -113,6 +113,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
       {ctrl.showNewSessionModal && (
         <RequestSheet
           nodes={nodes}
+          isAdmin={isAdmin}
           onClose={() => {
             ctrl.setShowNewSessionModal(false);
             ctrl.setReplaceSessionId(null);

@@ -1216,3 +1216,21 @@
 @media (max-width: 760px) {
   .adminTabs button { height: 58px; min-height: 58px; padding-inline: 12px; }
 }
+
+/* Duration picker — RequestSheet / DurationSheet 공용 */
+.durationGrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.durationBtn { appearance: none; padding: 6px 2px; border: 1px solid var(--hair); border-radius: 4px; background: transparent; color: var(--dim); font-size: 9px; text-align: center; cursor: pointer; transition: .12s; }
+.durationBtn:hover { border-color: var(--signal); color: var(--paper); }
+.durationBtn[data-on="true"] { border-color: var(--signal); background: rgba(47,120,255,.15); color: var(--paper); }
+.durationBtn[data-special="true"] { color: var(--signal); }
+.durationBtn[data-infinite="true"] { grid-column: span 2; color: #a78bfa; border-color: rgba(167,139,250,.4); }
+.durationAdminNotice { margin: 8px 0 0; padding: 10px 12px; border: 1px solid rgba(167,139,250,.35); border-radius: 6px; background: rgba(167,139,250,.06); color: #a78bfa; font-size: 9px; line-height: 1.6; }
+.durationOverNotice { margin: 8px 0 0; padding: 10px 12px; border: 1px solid #ead39a; border-radius: 6px; background: rgba(252,238,199,.12); color: #d8b365; font-size: 9px; line-height: 1.6; }
+/* DurationSheet (이어하기 기간 선택) */
+.durationSheet { width: min(480px, 94vw); }
+.durationSheet .formMain { padding: 24px; border-right: 0; }
+
+/* 연장 버튼 */
+.extendRow { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; padding: 10px 0 0; border-top: 1px solid var(--hair-dark); }
+.extendRow > span { flex: 1; color: var(--faint); font-size: 9px; }
+.extendBanner { margin: 10px 0 0; padding: 10px 14px; border: 1px solid #e8aeb8; border-radius: 8px; background: rgba(251,210,217,.12); color: #963e4c; font-size: 9px; line-height: 1.6; display: flex; align-items: center; justify-content: space-between; gap: 10px; }

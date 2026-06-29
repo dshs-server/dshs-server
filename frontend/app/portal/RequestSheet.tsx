@@ -15,14 +15,20 @@ const WORK_TYPES: { key: string; label: string; sub: string }[] = [
 const CPU_OPTS = [2, 4, 8, 16, 32];
 const RAM_OPTS = [4, 8, 16, 32, 64];
 const STORAGE_OPTS = [50, 100, 250, 500];
-const DURATION_OPTS = [1, 7, 14, 30];
+
+const ADMIN_EMAIL = "ts250024@ts.hs.kr";
+
+// 1~28 + 특수값: -1 = 28+, 0 = 무한
+const DURATION_DAYS: number[] = Array.from({ length: 28 }, (_, i) => i + 1);
 
 export default function RequestSheet({
   nodes,
+  isAdmin = false,
   onClose,
   onSubmit,
 }: {
   nodes: NodeInfo[];
+  isAdmin?: boolean;
   onClose: () => void;
   onSubmit: (form: NewSessionForm) => void;
 }) {
@@ -34,11 +40,11 @@ export default function RequestSheet({
   const [cpu, setCpu] = useState(8);
   const [ram, setRam] = useState(16);
   const [storage, setStorage] = useState(100);
-  const [duration, setDuration] = useState(7);
+  const [duration, setDuration] = useState(7); // -1 = 28+, 0 = 무한
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (selectedNodeId !== null) return; // 이미 선택된 경우 유지
+    if (selectedNodeId !== null) return;
     const selectable = nodes.filter((n) => nodeState(n) !== "active");
     if (selectable.length === 1) setSelectedNodeId(selectable[0].id);
   }, [nodes, selectedNodeId]);
@@ -70,8 +76,11 @@ export default function RequestSheet({
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId);
   const selectedOk = selectedNode ? meets(selectedNode) && nodeState(selectedNode) !== "active" : false;
-  const canStart = !!projectName.trim() && !!selectedNodeId && selectedOk;
+  const isOverLimit = duration === -1;
+  const canStart = !!projectName.trim() && !!selectedNodeId && selectedOk && !isOverLimit;
   const selectedNo = selectedNode ? nodes.findIndex((n) => n.id === selectedNode.id) + 1 : null;
+
+  const durationLabel = duration === 0 ? "무한" : duration === -1 ? "28+" : `${duration}일`;
 
   function submit() {
     if (!canStart) return;
@@ -113,16 +122,11 @@ export default function RequestSheet({
               <div className={s.inlineInput}>
                 <input
                   value={memberInput}
-                  onChange={(e) => {
-                    setMemberInput(e.target.value);
-                    setMemberError(null);
-                  }}
+                  onChange={(e) => { setMemberInput(e.target.value); setMemberError(null); }}
                   onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addMember())}
                   placeholder="@ts.hs.kr 계정"
                 />
-                <button type="button" onClick={addMember}>
-                  추가
-                </button>
+                <button type="button" onClick={addMember}>추가</button>
               </div>
             </Field>
             {memberError && (
@@ -137,9 +141,7 @@ export default function RequestSheet({
                       type="button"
                       onClick={() => setMembers((x) => x.filter((y) => y !== m))}
                       style={{ border: 0, background: "none", cursor: "pointer", padding: "0 0 0 6px" }}
-                    >
-                      ✕
-                    </button>
+                    >✕</button>
                   </span>
                 ))}
               </div>
@@ -150,16 +152,8 @@ export default function RequestSheet({
               <div className={s.workTypes}>
                 {WORK_TYPES.map((t) => (
                   <label key={t.key}>
-                    <input
-                      type="radio"
-                      name="type"
-                      checked={workType === t.key}
-                      onChange={() => setWorkType(t.key)}
-                    />
-                    <span>
-                      {t.label}
-                      <small>{t.sub}</small>
-                    </span>
+                    <input type="radio" name="type" checked={workType === t.key} onChange={() => setWorkType(t.key)} />
+                    <span>{t.label}<small>{t.sub}</small></span>
                   </label>
                 ))}
               </div>
@@ -168,45 +162,27 @@ export default function RequestSheet({
             <div className={s.specFields}>
               <Field label="CPU">
                 <select value={cpu} onChange={(e) => setCpu(Number(e.target.value))}>
-                  {CPU_OPTS.map((v) => (
-                    <option key={v} value={v}>
-                      {v}
-                    </option>
-                  ))}
+                  {CPU_OPTS.map((v) => <option key={v} value={v}>{v}</option>)}
                 </select>
                 <small>코어 이상</small>
               </Field>
               <Field label="메모리">
                 <select value={ram} onChange={(e) => setRam(Number(e.target.value))}>
-                  {RAM_OPTS.map((v) => (
-                    <option key={v} value={v}>
-                      {v}
-                    </option>
-                  ))}
+                  {RAM_OPTS.map((v) => <option key={v} value={v}>{v}</option>)}
                 </select>
                 <small>GB 이상</small>
               </Field>
               <Field label="저장 공간">
                 <select value={storage} onChange={(e) => setStorage(Number(e.target.value))}>
-                  {STORAGE_OPTS.map((v) => (
-                    <option key={v} value={v}>
-                      {v}
-                    </option>
-                  ))}
+                  {STORAGE_OPTS.map((v) => <option key={v} value={v}>{v}</option>)}
                 </select>
                 <small>GB</small>
               </Field>
-              <Field label="유지 기간">
-                <select value={duration} onChange={(e) => setDuration(Number(e.target.value))}>
-                  {DURATION_OPTS.map((v) => (
-                    <option key={v} value={v}>
-                      {v}
-                    </option>
-                  ))}
-                </select>
-                <small>일</small>
-              </Field>
             </div>
+
+            <Field label="유지 기간">
+              <DurationPicker value={duration} onChange={setDuration} isAdmin={isAdmin} />
+            </Field>
           </div>
 
           <SelectMachine
@@ -223,18 +199,73 @@ export default function RequestSheet({
           <div>
             <span>선택</span>
             <strong>
-              {selectedNo ? `${selectedNo}호기` : "장비 미선택"} · {workTypeLabel(workType)} · {duration}일
+              {selectedNo ? `${selectedNo}호기` : "장비 미선택"} · {workTypeLabel(workType)} · {durationLabel}
             </strong>
           </div>
-          <button className={s.lineButton} onClick={onClose}>
-            취소
-          </button>
-          <button className={s.solidButton} disabled={!canStart} onClick={submit}>
-            배정 요청
-          </button>
+          <button className={s.lineButton} onClick={onClose}>취소</button>
+          <button className={s.solidButton} disabled={!canStart} onClick={submit}>배정 요청</button>
         </footer>
       </section>
     </Overlay>
+  );
+}
+
+export function DurationPicker({
+  value,
+  onChange,
+  isAdmin = false,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  isAdmin?: boolean;
+}) {
+  return (
+    <>
+      <div className={s.durationGrid}>
+        {DURATION_DAYS.map((d) => (
+          <button
+            key={d}
+            type="button"
+            className={s.durationBtn}
+            data-on={value === d}
+            onClick={() => onChange(d)}
+          >
+            {d}
+          </button>
+        ))}
+        <button
+          type="button"
+          className={s.durationBtn}
+          data-on={value === -1}
+          data-special="true"
+          onClick={() => onChange(-1)}
+        >
+          28+
+        </button>
+        {isAdmin && (
+          <button
+            type="button"
+            className={s.durationBtn}
+            data-on={value === 0}
+            data-infinite="true"
+            onClick={() => onChange(0)}
+          >
+            ∞ 무한
+          </button>
+        )}
+      </div>
+      {value === -1 && (
+        <p className={s.durationOverNotice}>
+          28일 초과 이용은 관리자 승인이 필요합니다.
+          관리자({ADMIN_EMAIL})에게 직접 문의해 주세요.
+        </p>
+      )}
+      {value === 0 && isAdmin && (
+        <p className={s.durationAdminNotice}>
+          무한 기간: 999일로 설정됩니다. (관리자 전용)
+        </p>
+      )}
+    </>
   );
 }
 
@@ -243,12 +274,7 @@ function workTypeLabel(key: string) {
 }
 
 const SelectMachine = memo(function SelectMachine({
-  nodes,
-  cpu,
-  ram,
-  storage,
-  selectedNodeId,
-  onSelect,
+  nodes, cpu, ram, storage, selectedNodeId, onSelect,
 }: {
   nodes: NodeInfo[];
   cpu: number;
@@ -280,12 +306,10 @@ const SelectMachine = memo(function SelectMachine({
         const cpuPct = node.load?.cpu_pct ?? null;
         const userLabel =
           st === "active" ? "2명 사용 중 (만석)" :
-          sc === 1 ? "1명 사용 중" :
-          "비어 있음";
+          sc === 1 ? "1명 사용 중" : "비어 있음";
         const stateLabel =
           st === "active" ? "사용 중 (2/2)" :
-          meets(node) ? "선택 가능" :
-          "사양 부족";
+          meets(node) ? "선택 가능" : "사양 부족";
         return (
           <button
             key={node.id}
@@ -297,13 +321,10 @@ const SelectMachine = memo(function SelectMachine({
             <div>
               <strong>{node.name || node.id}</strong>
               <small>
-                {node.gpu}
-                <br />
+                {node.gpu}<br />
                 {node.ram_gb}GB · {node.storage_gb}GB
               </small>
-              {cpuPct !== null && (
-                <NodeLoadBar pct={cpuPct} label={userLabel} />
-              )}
+              {cpuPct !== null && <NodeLoadBar pct={cpuPct} label={userLabel} />}
               {cpuPct === null && sc > 0 && (
                 <small style={{ color: "var(--c-text-2, #888)", fontSize: "11px" }}>{userLabel}</small>
               )}
@@ -320,15 +341,10 @@ function NodeLoadBar({ pct, label }: { pct: number; label: string }) {
   const color = pct >= 80 ? "#c0392b" : pct >= 50 ? "#e67e22" : "#27ae60";
   return (
     <div style={{ marginTop: "4px" }}>
-      <div style={{
-        height: "3px", borderRadius: "2px", background: "rgba(0,0,0,0.08)",
-        overflow: "hidden", width: "100%",
-      }}>
+      <div style={{ height: "3px", borderRadius: "2px", background: "rgba(0,0,0,0.08)", overflow: "hidden", width: "100%" }}>
         <div style={{ height: "100%", width: `${Math.min(pct, 100)}%`, background: color, transition: "width 0.4s" }} />
       </div>
-      <span style={{ fontSize: "11px", color: "var(--c-text-2, #888)" }}>
-        CPU {Math.round(pct)}% · {label}
-      </span>
+      <span style={{ fontSize: "11px", color: "var(--c-text-2, #888)" }}>CPU {Math.round(pct)}% · {label}</span>
     </div>
   );
 }
