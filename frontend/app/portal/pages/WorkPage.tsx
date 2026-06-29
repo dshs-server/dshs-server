@@ -111,7 +111,7 @@ function ReadyAssignment({
   nodes: NodeInfo[];
   onTerminate: () => void;
 }) {
-  const { activeMeta, remaining, expiresAt, stats, url } = ctrl;
+  const { activeMeta, remaining, expiresAt, stats, url, extendBlocked } = ctrl;
   const timeLevel =
     remaining == null ? "normal" : remaining <= 300 ? "critical" : remaining <= 1800 ? "warning" : "normal";
   const idx = nodes.findIndex((n) => n.id === activeMeta.node_id);
@@ -119,6 +119,9 @@ function ReadyAssignment({
   const expiryStr = expiresAt
     ? new Date(expiresAt * 1000).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) + " 종료"
     : "";
+
+  const canExtend = remaining != null && remaining <= 2 * 86400 && !extendBlocked;
+  const showExtendRow = (remaining != null && remaining <= 2 * 86400) || extendBlocked;
 
   return (
     <div className={s.readyAssignment}>
@@ -183,6 +186,24 @@ function ReadyAssignment({
           <PowerIcon />
         </button>
       </div>
+
+      {showExtendRow && !extendBlocked && (
+        <div className={s.extendRow}>
+          <span>세션 종료 2일 이내 · 3일 연장 가능</span>
+          <button className={s.lineButton} onClick={ctrl.handleExtend} disabled={!canExtend}>
+            + 3일 연장
+          </button>
+        </div>
+      )}
+
+      {extendBlocked && (
+        <div className={s.extendBanner}>
+          <span>이 세션은 총 이용 기간 40일을 초과해 연장이 제한됩니다.</span>
+          <a href={`mailto:ts250024@ts.hs.kr?subject=[PC대여] 세션 연장 허가 요청`} className={s.lineButton}>
+            관리자에게 연락하기
+          </a>
+        </div>
+      )}
 
       <div className={s.uploadRow}>
         <UploadButton />
