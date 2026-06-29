@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shlex
@@ -18,6 +19,12 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("hub")
 
 import asyncssh
 import firebase_admin
@@ -74,6 +81,78 @@ _metrics: dict[str, dict] = {}
 _last_polled: dict[str, float] = {}  # node_id → last SSH poll timestamp
 _nodes_cache: list[dict] = []  # populated from Firestore; cleared on admin write to force reload
 NODES_CACHE_FILE = os.path.expanduser("~/hub/nodes_cache.json")
+
+
+# ── Sessions in-memory cache ──────────────────────────────────────────────────
+# Source of truth for reads. Writes go to Firestore (backup) AND here.
+# Loaded from Firestore once at startup; falls back to local JSON file if quota exceeded.
+_sessions_cache: dict[str, dict] = {}
+SESSIONS_CACHE_FILE = os.path.expanduser("~/hub/sessions_cache.json")
+
+
+def _sc_get(session_id: str) -> dict | None:
+    return _sessions_cache.get(session_id)
+
+
+def _sc_list(
+    *,
+    owner: str | None = None,
+    status: str | list[str] | None = None,
+) -> list[tuple[str, dict]]:
+    result = []
+    statuses = ([status] if isinstance(status, str) else status) if status else None
+    for sid, s in _sessions_cache.items():
+        if owner and s.get("owner") != owner:
+            continue
+        if statuses and s.get("status") not in statuses:
+            continue
+        result.append((sid, s))
+    return result
+
+
+def _persist_sessions_cache() -> None:
+    try:
+        with open(SESSIONS_CACHE_FILE, "w") as f:
+            json.dump(_sessions_cache, f)
+    except Exception:
+        pass
+
+
+def _sc_set(session_id: str, data: dict) -> None:
+    _sessions_cache[session_id] = dict(data)
+    _persist_sessions_cache()
+
+
+def _sc_update(session_id: str, updates: dict) -> None:
+    if session_id in _sessions_cache:
+        _sessions_cache[session_id].update(updates)
+        _persist_sessions_cache()
+
+
+def _sc_del(session_id: str) -> None:
+    _sessions_cache.pop(session_id, None)
+    _persist_sessions_cache()
+
+
+async def _init_sessions_cache() -> None:
+    try:
+        snap = await db.collection(COL_SESSIONS).get()
+        for doc in snap:
+            _sessions_cache[doc.id] = doc.to_dict()
+        logger.info("Sessions cache loaded from Firestore: %d sessions", len(_sessions_cache))
+        _persist_sessions_cache()
+    except Exception as e:
+        logger.warning("Sessions cache Firestore load failed (%s) — trying local file", e)
+        try:
+            if os.path.exists(SESSIONS_CACHE_FILE):
+                with open(SESSIONS_CACHE_FILE) as f:
+                    data = json.load(f)
+                _sessions_cache.update(data)
+                logger.info("Sessions cache loaded from local file: %d sessions", len(_sessions_cache))
+            else:
+                logger.warning("Sessions cache local file not found — starting empty")
+        except Exception as e2:
+            logger.error("Sessions cache local file load failed: %s — starting empty", e2)
 
 
 def _save_nodes_to_file() -> None:
@@ -204,17 +283,7 @@ async def _poll_nodes_loop():
             nodes = await _get_nodes()
 
             if nodes:
-                # Single session query reused for both SSH polling decision and sync
-                try:
-                    active_snap = await (
-                        db.collection(COL_SESSIONS)
-                        .where("status", "in", ["active", "starting"])
-                        .get()
-                    )
-                    active_docs = list(active_snap)
-                except Exception:
-                    active_docs = []
-                active_node_ids = {s.to_dict().get("node_id") for s in active_docs}
+                active_node_ids = {s.get("node_id") for _, s in _sc_list(status=["active", "starting"])}
 
                 now = time.time()
                 # 세션 있으면 항상 폴링, 없으면 IDLE_POLL_INTERVAL 경과 시에만
@@ -292,31 +361,31 @@ async def _write_log():
     nodes_list = await _get_nodes()
     nodes = {n["id"]: n for n in nodes_list}
 
-    sessions_snap = await db.collection(COL_SESSIONS).get()
-    all_sessions = [{"id": d.id, **d.to_dict()} for d in sessions_snap]
-    active_sessions = [s for s in all_sessions if s.get("status") in ("active", "starting")]
-    suspended_sessions = [s for s in all_sessions if s.get("status") == "suspended"]
+    # 세션 정보 — 인메모리 캐시에서 읽음 (Firestore 호출 없음)
+    active_sessions = [{"id": sid, **s} for sid, s in _sc_list(status=["active", "starting"])]
+    suspended_sessions = [{"id": sid, **s} for sid, s in _sc_list(status="suspended")]
 
     # 활성 세션별 컨테이너 top3 (병렬)
-    top3_results = await asyncio.gather(
-        *[
-            _get_container_top3(
-                nodes[s["node_id"]]["ip"],
-                nodes[s["node_id"]].get("ssh_user", SSH_USER),
-                _container_name(s["id"]),
-            )
-            for s in active_sessions
-            if s.get("node_id") in nodes
-        ],
-        return_exceptions=True,
-    )
     session_top3: dict[str, list[str]] = {}
-    idx = 0
-    for s in active_sessions:
-        if s.get("node_id") in nodes:
-            r = top3_results[idx]
-            session_top3[s["id"]] = r if isinstance(r, list) else []
-            idx += 1
+    if active_sessions:
+        top3_results = await asyncio.gather(
+            *[
+                _get_container_top3(
+                    nodes[s["node_id"]]["ip"],
+                    nodes[s["node_id"]].get("ssh_user", SSH_USER),
+                    _container_name(s["id"]),
+                )
+                for s in active_sessions
+                if s.get("node_id") in nodes
+            ],
+            return_exceptions=True,
+        )
+        idx = 0
+        for s in active_sessions:
+            if s.get("node_id") in nodes:
+                r = top3_results[idx]
+                session_top3[s["id"]] = r if isinstance(r, list) else []
+                idx += 1
 
     lines = [f"=== {now.strftime('%Y-%m-%d %H:%M:%S')} ===", ""]
 
@@ -367,8 +436,8 @@ async def _log_loop():
     while True:
         try:
             await _write_log()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("_write_log 실패: %s", e)
         await asyncio.sleep(LOG_INTERVAL)
 
 
@@ -378,20 +447,14 @@ async def _log_loop():
 async def _check_and_send_warnings() -> None:
     """active/starting 세션 중 7일 내 만료 예정이고 경고 미발송인 세션에 이메일 발송."""
     now = time.time()
-    snap = await (
-        db.collection(COL_SESSIONS)
-        .where("status", "in", ["active", "starting"])
-        .get()
-    )
-    for doc in snap:
-        s = doc.to_dict()
+    for sid, s in _sc_list(status=["active", "starting"]):
         expires_at = s.get("expires_at")
         if not expires_at or s.get("warning_email_sent"):
             continue
         if expires_at - now <= WARNING_SECONDS:
             owner = s.get("owner", "")
             expire_str = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
-            project = s.get("project_name") or doc.id
+            project = s.get("project_name") or sid
             await _send_email(
                 owner,
                 "[PC대여] 세션이 7일 후 자동 일시중지됩니다",
@@ -400,7 +463,8 @@ async def _check_and_send_warnings() -> None:
                 f"계속 사용하시려면 포털(https://dshs-app.net)에서 이어서 사용을 눌러주세요.\n\n"
                 f"- dshs 전산실",
             )
-            await doc.reference.update({"warning_email_sent": True})
+            _sc_update(sid, {"warning_email_sent": True})
+            await db.collection(COL_SESSIONS).document(sid).update({"warning_email_sent": True})
 
 
 async def _email_notification_loop():
@@ -418,6 +482,7 @@ async def _email_notification_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await _init_sessions_cache()
     poll_task = asyncio.create_task(_poll_nodes_loop())
     log_task = asyncio.create_task(_log_loop())
     email_task = asyncio.create_task(_email_notification_loop())
@@ -469,14 +534,8 @@ async def _get_user_max_sessions(email: str) -> int:
     return doc.to_dict().get("max_sessions", 1) if doc.exists else 1
 
 
-async def _count_active_sessions(email: str) -> int:
-    docs = await (
-        db.collection(COL_SESSIONS)
-        .where("owner", "==", email)
-        .where("status", "in", ["active", "starting"])
-        .get()
-    )
-    return len(docs)
+def _count_active_sessions(email: str) -> int:
+    return len(_sc_list(owner=email, status=["active", "starting"]))
 
 
 async def _docker_status(ip: str, ssh_user: str, container: str) -> str:
@@ -492,13 +551,7 @@ def _session_url(session_id: str, kasm_url: str) -> str:
     return f"{kasm_url.rstrip('/')}/{session_id}/?path={session_id}/websockify"
 
 async def _allocate_port(node_id: str, node_ip: str, ssh_user: str) -> int:
-    snap = await (
-        db.collection(COL_SESSIONS)
-        .where("node_id", "==", node_id)
-        .where("status", "in", ["active", "starting", "suspended"])
-        .get()
-    )
-    used = {s.to_dict().get("port") for s in snap if s.to_dict().get("port")}
+    used = {s.get("port") for _, s in _sc_list(status=["active", "starting", "suspended"]) if s.get("node_id") == node_id and s.get("port")}
     # 실제 docker 포트도 확인 (Firestore에 없는 orphaned 컨테이너 대비)
     stdout, _ = await _ssh(
         node_ip,
@@ -529,17 +582,11 @@ _NGINX_LOCATION = """\
     }}"""
 
 async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str):
-    snap = await (
-        db.collection(COL_SESSIONS)
-        .where("node_id", "==", node_id)
-        .where("status", "in", ["active", "starting", "suspended"])
-        .get()
-    )
     domain = kasm_url.removeprefix("https://").rstrip("/")
     locations = [
-        _NGINX_LOCATION.format(session_id=doc.id, port=s["port"])
-        for doc in snap
-        if (s := doc.to_dict()).get("port")
+        _NGINX_LOCATION.format(session_id=sid, port=s["port"])
+        for sid, s in _sc_list(status=["active", "starting", "suspended"])
+        if s.get("node_id") == node_id and s.get("port")
     ]
     inner = "\n".join(locations) if locations else "    # no sessions"
     config = f"server {{\n    listen 80;\n    server_name {domain};\n{inner}\n}}"
@@ -684,15 +731,7 @@ async def list_nodes(
     gpu: Optional[str] = None,
 ):
     nodes = await _get_nodes()
-    try:
-        sessions_snap = await (
-            db.collection(COL_SESSIONS)
-            .where("status", "in", ["active", "starting", "suspended"])
-            .get()
-        )
-        sessions = [s.to_dict() for s in sessions_snap]
-    except Exception:
-        sessions = []
+    sessions = [s for _, s in _sc_list(status=["active", "starting", "suspended"])]
 
     result = []
     for n in nodes:
@@ -732,13 +771,7 @@ async def node_specs():
             "ram_gb": 32, "storage_gb": 500, "available": True, "session_state": "none",
         }
     n = nodes[0]
-    sessions_snap = await (
-        db.collection(COL_SESSIONS)
-        .where("node_id", "==", n["id"])
-        .where("status", "in", ["active", "starting", "suspended"])
-        .get()
-    )
-    sessions = [s.to_dict() for s in sessions_snap]
+    sessions = [s for _, s in _sc_list(status=["active", "starting", "suspended"])]
     state = _node_session_state(n["id"], sessions)
     return {
         "id": n["id"], **{k: v for k, v in n.items() if k != "id"},
@@ -765,11 +798,8 @@ async def get_session(
     x_user_admin: str = Header("0"),
 ):
     me = x_user_email.lower()
-    snap = await db.collection(COL_SESSIONS).where("owner", "==", me).get()
-    all_sessions = [(doc.id, doc.to_dict()) for doc in snap]
-
-    active = [(sid, s) for sid, s in all_sessions if s.get("status") in ("active", "starting")]
-    suspended = [(sid, s) for sid, s in all_sessions if s.get("status") == "suspended"]
+    active = _sc_list(owner=me, status=["active", "starting"])
+    suspended = _sc_list(owner=me, status="suspended")
 
     suspended_sessions = [
         {
@@ -802,11 +832,13 @@ async def get_session(
 
     if dock in ("none", "dead"):
         # 컨테이너가 없거나 완전히 죽음 — stale 세션 정리
+        _sc_del(session_id)
         await db.collection(COL_SESSIONS).document(session_id).delete()
         return {"status": "none", "suspended_sessions": suspended_sessions}
 
     if dock == "exited":
         # 컨테이너가 중지됨 — suspended로 전환
+        _sc_update(session_id, {"status": "suspended", "suspended_at": time.time()})
         await db.collection(COL_SESSIONS).document(session_id).update({
             "status": "suspended",
             "suspended_at": time.time(),
@@ -826,11 +858,10 @@ async def poll_session(
     x_user_email: str = Header(""),
     x_user_admin: str = Header("0"),
 ):
-    doc = await db.collection(COL_SESSIONS).document(session_id).get()
-    if not doc.exists:
+    s = _sc_get(session_id)
+    if s is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    s = doc.to_dict()
     me = x_user_email.lower()
     if x_user_admin != "1" and s.get("owner") != me:
         raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
@@ -859,65 +890,58 @@ async def create_session(
     is_admin = x_user_admin == "1"
 
     if resume:
-        query = (
-            db.collection(COL_SESSIONS)
-            .where("owner", "==", me)
-            .where("status", "==", "suspended")
-        )
-        docs = await query.get()
-        if not docs:
+        suspended_docs = _sc_list(owner=me, status="suspended")
+        if not suspended_docs:
             raise HTTPException(status_code=404, detail="저장된 세션이 없습니다.")
 
-        target = next((d for d in docs if d.id == session_id), docs[0]) if session_id else docs[0]
-        s = target.to_dict()
+        target_sid, s = (
+            next((pair for pair in suspended_docs if pair[0] == session_id), suspended_docs[0])
+            if session_id else suspended_docs[0]
+        )
         node = await _get_node(s["node_id"])
         _suser = node.get("ssh_user", SSH_USER)
 
-        container = _container_name(target.id)
+        container = _container_name(target_sid)
         stdout, rc = await _ssh(node["ip"], f"docker start {container}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
 
-        await target.reference.update({"status": "starting", "created_at": time.time()})
+        updates = {"status": "starting", "created_at": time.time()}
+        _sc_update(target_sid, updates)
+        await db.collection(COL_SESSIONS).document(target_sid).update(updates)
         if s.get("port"):
             await _nginx_update(s["node_id"], node["ip"], _suser, node.get("kasm_url", ""))
-        return {"session_id": target.id, "status": "starting"}
+        return {"session_id": target_sid, "status": "starting"}
 
     # ── New session ────────────────────────────────────────────────────────────
 
     if not is_admin:
-        active_count = await _count_active_sessions(me)
+        active_count = _count_active_sessions(me)
         max_s = await _get_user_max_sessions(me)
         if active_count >= max_s:
             raise HTTPException(status_code=429, detail="이미 활성 PC가 있습니다.")
 
     # Delete suspended session being replaced
     if body and body.replace_session_id:
-        old_doc = await db.collection(COL_SESSIONS).document(body.replace_session_id).get()
-        if old_doc.exists:
-            old_s = old_doc.to_dict()
-            if old_s.get("owner") == me or is_admin:
-                old_node = await _get_node(old_s["node_id"])
-                old_container = _container_name(body.replace_session_id)
-                await _ssh(
-                    old_node["ip"],
-                    f"docker rm -f {old_container} 2>/dev/null || true",
-                    old_node.get("ssh_user", SSH_USER),
-                )
-                await old_doc.reference.delete()
+        old_s = _sc_get(body.replace_session_id)
+        if old_s and (old_s.get("owner") == me or is_admin):
+            old_node = await _get_node(old_s["node_id"])
+            old_container = _container_name(body.replace_session_id)
+            await _ssh(
+                old_node["ip"],
+                f"docker rm -f {old_container} 2>/dev/null || true",
+                old_node.get("ssh_user", SSH_USER),
+            )
+            _sc_del(body.replace_session_id)
+            await db.collection(COL_SESSIONS).document(body.replace_session_id).delete()
 
     # Pick node — least-loaded with remaining port capacity
     node_id = body.node_id if body else None
     if not node_id:
         all_nodes = await _get_nodes()
-        sessions_snap = await (
-            db.collection(COL_SESSIONS)
-            .where("status", "in", ["active", "starting", "suspended"])
-            .get()
-        )
         session_counts: dict[str, int] = {}
-        for sn in sessions_snap:
-            nid2 = sn.to_dict().get("node_id", "")
+        for _, sd2 in _sc_list(status=["active", "starting", "suspended"]):
+            nid2 = sd2.get("node_id", "")
             session_counts[nid2] = session_counts.get(nid2, 0) + 1
 
         best_node: Optional[str] = None
@@ -966,7 +990,7 @@ async def create_session(
             raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
 
     duration = (body.duration_days if body else None) or 7
-    await db.collection(COL_SESSIONS).document(new_id).set({
+    session_data = {
         "node_id": node_id,
         "owner": me,
         "team_members": (body.team_members if body else None) or [],
@@ -977,7 +1001,9 @@ async def create_session(
         "resources": (body.resources if body else None) or {},
         "port": port,
         "url": _session_url(new_id, kasm_url),
-    })
+    }
+    _sc_set(new_id, session_data)
+    await db.collection(COL_SESSIONS).document(new_id).set(session_data)
 
     await _nginx_update(node_id, node["ip"], _suser, kasm_url)
     return {"session_id": new_id, "status": "starting"}
@@ -990,11 +1016,10 @@ async def delete_session(
     x_user_email: str = Header(""),
     x_user_admin: str = Header("0"),
 ):
-    doc = await db.collection(COL_SESSIONS).document(session_id).get()
-    if not doc.exists:
+    s = _sc_get(session_id)
+    if s is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    s = doc.to_dict()
     me = x_user_email.lower()
     if x_user_admin != "1" and s.get("owner") != me:
         raise HTTPException(status_code=403, detail="본인 세션만 종료할 수 있습니다.")
@@ -1006,7 +1031,8 @@ async def delete_session(
 
     if permanent:
         await _ssh(node["ip"], f"docker rm -f {container}", _suser)
-        await doc.reference.delete()
+        _sc_del(session_id)
+        await db.collection(COL_SESSIONS).document(session_id).delete()
         await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
         await _send_email(
             s.get("owner", ""),
@@ -1016,7 +1042,8 @@ async def delete_session(
         return {"message": "세션을 완전히 삭제했습니다."}
 
     await _ssh(node["ip"], f"docker stop {container}", _suser)
-    await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
+    _sc_update(session_id, {"status": "suspended", "suspended_at": time.time()})
+    await db.collection(COL_SESSIONS).document(session_id).update({"status": "suspended", "suspended_at": time.time()})
     await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
     await _send_email(
         s.get("owner", ""),
@@ -1040,12 +1067,9 @@ async def upload_files(
     email = _verify_upload_token(x_upload_token)
 
     # 본인의 세션 노드 찾기 (활성/시작중 우선, 없으면 저장된 세션)
-    snap = await db.collection(COL_SESSIONS).where("owner", "==", email).get()
-    session_pairs = [(doc.id, doc.to_dict()) for doc in snap]
-    target_pair = next(
-        ((sid, s) for sid, s in session_pairs if s.get("status") in ("active", "starting")),
-        next(((sid, s) for sid, s in session_pairs if s.get("status") == "suspended"), None),
-    )
+    active_pairs = _sc_list(owner=email, status=["active", "starting"])
+    suspended_pairs = _sc_list(owner=email, status="suspended")
+    target_pair = (active_pairs or suspended_pairs or [None])[0]
     if not target_pair:
         raise HTTPException(
             status_code=400, detail="먼저 PC 세션을 시작한 뒤 파일을 보낼 수 있습니다."
@@ -1115,15 +1139,7 @@ async def upload_files(
 @app.get("/admin/nodes", dependencies=[Depends(require_key)])
 async def admin_nodes():
     nodes = await _get_nodes()
-    try:
-        active_snap = await (
-            db.collection(COL_SESSIONS)
-            .where("status", "in", ["active", "starting"])
-            .get()
-        )
-        active_by_node = {s.to_dict().get("node_id"): s.to_dict() for s in active_snap}
-    except Exception:
-        active_by_node = {}
+    active_by_node = {s.get("node_id"): s for _, s in _sc_list(status=["active", "starting"])}
 
     result = []
     for n in nodes:
@@ -1165,14 +1181,9 @@ async def admin_nodes():
 @app.get("/admin/users", dependencies=[Depends(require_key)])
 async def list_users():
     users_snap = await db.collection(COL_USERS).get()
-    active_snap = await (
-        db.collection(COL_SESSIONS)
-        .where("status", "in", ["active", "starting"])
-        .get()
-    )
     active_counts: dict[str, int] = {}
-    for s in active_snap:
-        owner = s.to_dict().get("owner", "")
+    for _, s in _sc_list(status=["active", "starting"]):
+        owner = s.get("owner", "")
         active_counts[owner] = active_counts.get(owner, 0) + 1
 
     return {
@@ -1248,12 +1259,7 @@ _CLEANUP_CMD = (
 
 @app.get("/admin/status", dependencies=[Depends(require_key)])
 async def admin_status():
-    snap = await (
-        db.collection(COL_SESSIONS)
-        .where("status", "in", ["active", "starting"])
-        .get()
-    )
-    sessions = [{"id": doc.id, **doc.to_dict()} for doc in snap]
+    sessions = [{"id": sid, **s} for sid, s in _sc_list(status=["active", "starting"])]
     active = None
     if sessions:
         s = sessions[0]
@@ -1270,20 +1276,15 @@ async def admin_status():
 
 @app.post("/admin/terminate", dependencies=[Depends(require_key)])
 async def admin_terminate(node_id: Optional[str] = Query(None)):
-    snap = await (
-        db.collection(COL_SESSIONS)
-        .where("status", "in", ["active", "starting"])
-        .get()
-    )
     terminated = []
-    for doc in snap:
-        s = doc.to_dict()
+    for sid, s in _sc_list(status=["active", "starting"]):
         if node_id and s.get("node_id") != node_id:
             continue
         node = await _get_node(s["node_id"])
-        await _ssh(node["ip"], f"docker stop {_container_name(doc.id)}", node.get("ssh_user", SSH_USER))
-        await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
-        terminated.append(doc.id)
+        await _ssh(node["ip"], f"docker stop {_container_name(sid)}", node.get("ssh_user", SSH_USER))
+        _sc_update(sid, {"status": "suspended", "suspended_at": time.time()})
+        await db.collection(COL_SESSIONS).document(sid).update({"status": "suspended", "suspended_at": time.time()})
+        terminated.append(sid)
     return {"terminated": terminated, "count": len(terminated)}
 
 
