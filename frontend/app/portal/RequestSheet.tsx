@@ -45,7 +45,7 @@ export default function RequestSheet({
 
   useEffect(() => {
     if (selectedNodeId !== null) return;
-    const selectable = nodes.filter((n) => nodeState(n) !== "active");
+    const selectable = nodes.filter((n) => nodeState(n) !== "active" && nodeState(n) !== "offline");
     if (selectable.length === 1) setSelectedNodeId(selectable[0].id);
   }, [nodes, selectedNodeId]);
 
@@ -71,7 +71,7 @@ export default function RequestSheet({
     node.storage_gb >= storage;
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId);
-  const selectedOk = selectedNode ? meets(selectedNode) && nodeState(selectedNode) !== "active" : false;
+  const selectedOk = selectedNode ? meets(selectedNode) && nodeState(selectedNode) !== "active" && nodeState(selectedNode) !== "offline" : false;
   const isOverLimit = duration === -1;
   const canStart = !!projectName.trim() && !!selectedNodeId && selectedOk && !isOverLimit;
   const selectedNo = selectedNode ? nodes.findIndex((n) => n.id === selectedNode.id) + 1 : null;
@@ -293,13 +293,15 @@ const SelectMachine = memo(function SelectMachine({
       {nodes.length === 0 && <p>연결된 PC가 없습니다.</p>}
       {nodes.map((node, index) => {
         const st = nodeState(node);
-        const ok = meets(node) && st !== "active";
+        const ok = meets(node) && st !== "active" && st !== "offline";
         const sc = node.session_count ?? 0;
         const cpuPct = node.load?.cpu_pct ?? null;
         const userLabel =
+          st === "offline" ? "오프라인" :
           st === "active" ? "2명 사용 중 (만석)" :
           sc === 1 ? "1명 사용 중" : "비어 있음";
         const stateLabel =
+          st === "offline" ? "오프라인" :
           st === "active" ? "사용 중 (2/2)" :
           meets(node) ? "선택 가능" : "사양 부족";
         return (

@@ -362,8 +362,8 @@ export default function AdminArea() {
                       <dd>{(n.gpu_usage ?? 0).toFixed(0)}%</dd>
                     </div>
                     <div>
-                      <dt>저장</dt>
-                      <dd>{n.storage_total_gb ? `${(n.storage_used_gb ?? 0).toFixed(0)}/${n.storage_total_gb}G` : "—"}</dd>
+                      <dt>SSD</dt>
+                      <dd>{n.storage_total_gb ? `${(n.storage_used_gb ?? 0).toFixed(0)}/${Math.round(n.storage_total_gb)}G` : "—"}</dd>
                     </div>
                     <div>
                       <dt>가동</dt>

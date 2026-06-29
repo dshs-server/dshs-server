@@ -11,6 +11,7 @@ export interface NodeInfo {
   ram_gb: number;
   storage_gb: number;
   available: boolean;
+  offline?: boolean;
   session_state?: "none" | "partial" | "full" | "suspended";
   session_count?: number;
   resource_used?: { cpu_cores: number; ram_gb: number };
@@ -57,7 +58,8 @@ export function useNodes(pollMs = 8000) {
   return { nodes, loading };
 }
 
-export function nodeState(n: NodeInfo): "available" | "partial" | "suspended" | "active" {
+export function nodeState(n: NodeInfo): "available" | "partial" | "suspended" | "active" | "offline" {
+  if (n.offline) return "offline";
   if (n.session_state === "full") return "active";
   if (n.session_state === "partial") return "partial";
   if (n.session_state === "suspended") return "suspended";

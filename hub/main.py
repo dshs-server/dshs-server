@@ -967,6 +967,7 @@ async def list_nodes(
             "ram_gb": n.get("ram_gb", 0),
             "storage_gb": n.get("storage_gb", 0),
             "available": state not in ("full",),
+            "offline": m.get("offline", not bool(m)),
             "session_state": state,
             "session_count": sc,
             "resource_used": res_used,

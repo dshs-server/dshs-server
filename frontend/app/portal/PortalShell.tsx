@@ -142,6 +142,6 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
 }
 
 function nodeOnline(n: NodeInfo): boolean {
-  // available 또는 세션이 도는 노드 = 온라인. offline 표식만 제외.
+  if (n.offline) return false;
   return n.session_state !== undefined ? true : n.available !== false;
 }
