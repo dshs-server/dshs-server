@@ -66,6 +66,7 @@ db = firestore_async.client()
 COL_NODES = "nodes"
 COL_SESSIONS = "sessions"
 COL_USERS = "users"
+COL_ACTIVITY = "activity"
 
 # ── Metrics cache ─────────────────────────────────────────────────────────────
 # node_id → {cpu, ram_used_gb, ram_total_gb, storage_used_gb, storage_total_gb,
@@ -249,6 +250,16 @@ async def _poll_nodes_loop():
                         if node_ip and not _metrics.get(nid, {}).get("offline"):
                             await _ssh(node_ip, f"docker stop {_container_name(doc.id)}", node_suser)
                         await doc.reference.update({"status": "suspended", "suspended_at": now})
+                        await _log_activity(
+                            s.get("owner", ""),
+                            "session_suspend",
+                            "세션이 만료되어 보관되었습니다",
+                            s.get("project_name") or doc.id,
+                            members=s.get("team_members"),
+                            node_id=nid,
+                            project_name=s.get("project_name"),
+                            ts=now,
+                        )
                         await _send_email(
                             s.get("owner", ""),
                             "[PC대여] 세션이 만료되어 일시중지되었습니다",
@@ -750,12 +761,46 @@ async def node_specs():
 # ── Routes: sessions ──────────────────────────────────────────────────────────
 
 
+async def _log_activity(
+    owner: str,
+    type_: str,
+    title: str,
+    detail: str = "",
+    *,
+    members: Optional[list] = None,
+    node_id: Optional[str] = None,
+    project_name: Optional[str] = None,
+    byte_count: Optional[int] = None,
+    ts: Optional[float] = None,
+) -> None:
+    """사용 기록(활동 로그)을 activity 컬렉션에 적재한다. 실패해도 본 흐름을 막지 않는다."""
+    try:
+        doc = {
+            "owner": (owner or "").lower(),
+            "members": [m.lower() for m in (members or []) if isinstance(m, str)],
+            "type": type_,
+            "title": title,
+            "detail": detail,
+            "ts": ts if ts is not None else time.time(),
+        }
+        if node_id:
+            doc["node_id"] = node_id
+        if project_name:
+            doc["project_name"] = project_name
+        if byte_count is not None:
+            doc["bytes"] = int(byte_count)
+        await db.collection(COL_ACTIVITY).add(doc)
+    except Exception:
+        pass  # 사용 기록 적재 실패는 본 흐름을 막지 않는다
+
+
 class SessionBody(BaseModel):
     node_id: Optional[str] = None
     project_name: Optional[str] = None
     team_members: Optional[list[str]] = None
     resources: Optional[dict] = None
     duration_days: Optional[int] = 7
+    work_type: Optional[str] = None
     replace_session_id: Optional[str] = None
 
 
@@ -790,6 +835,15 @@ async def get_session(
     _suser = node.get("ssh_user", SSH_USER)
     dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
 
+    meta = {
+        "project_name": s.get("project_name", ""),
+        "work_type": s.get("work_type", ""),
+        "node_id": s["node_id"],
+        "node_name": node.get("name", s["node_id"]),
+        "node_gpu": node.get("gpu", ""),
+        "node_ip": node.get("ip", ""),
+    }
+
     if dock == "running":
         url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
         return {
@@ -798,6 +852,7 @@ async def get_session(
             "url": url,
             "expires_at": s.get("expires_at"),
             "suspended_sessions": suspended_sessions,
+            **meta,
         }
 
     if dock in ("none", "dead"):
@@ -817,7 +872,7 @@ async def get_session(
         return {"status": "none", "suspended_sessions": suspended_sessions}
 
     # restarting, paused 등 — 실제로 준비 중
-    return {"status": "starting", "session_id": session_id, "suspended_sessions": suspended_sessions}
+    return {"status": "starting", "session_id": session_id, "suspended_sessions": suspended_sessions, **meta}
 
 
 @app.get("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])
@@ -839,12 +894,21 @@ async def poll_session(
     _suser = node.get("ssh_user", SSH_USER)
     dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
 
+    meta = {
+        "project_name": s.get("project_name", ""),
+        "work_type": s.get("work_type", ""),
+        "node_id": s["node_id"],
+        "node_name": node.get("name", s["node_id"]),
+        "node_gpu": node.get("gpu", ""),
+        "node_ip": node.get("ip", ""),
+    }
+
     if dock == "running":
         url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
-        return {"status": "ready", "url": url}
+        return {"status": "ready", "url": url, **meta}
     if dock in ("exited", "dead"):
         return {"status": "error", "message": "컨테이너가 예기치 않게 종료되었습니다."}
-    return {"status": "starting"}
+    return {"status": "starting", **meta}
 
 
 @app.post("/session", dependencies=[Depends(require_key), Depends(require_user)])
@@ -881,6 +945,15 @@ async def create_session(
         await target.reference.update({"status": "starting", "created_at": time.time()})
         if s.get("port"):
             await _nginx_update(s["node_id"], node["ip"], _suser, node.get("kasm_url", ""))
+        await _log_activity(
+            me,
+            "session_resume",
+            "세션을 이어서 시작했습니다",
+            s.get("project_name") or target.id,
+            members=s.get("team_members"),
+            node_id=s.get("node_id"),
+            project_name=s.get("project_name"),
+        )
         return {"session_id": target.id, "status": "starting"}
 
     # ── New session ────────────────────────────────────────────────────────────
@@ -974,12 +1047,22 @@ async def create_session(
         "status": "starting",
         "created_at": time.time(),
         "expires_at": time.time() + duration * 86400,
+        "work_type": (body.work_type if body else None) or "",
         "resources": (body.resources if body else None) or {},
         "port": port,
         "url": _session_url(new_id, kasm_url),
     })
 
     await _nginx_update(node_id, node["ip"], _suser, kasm_url)
+    await _log_activity(
+        me,
+        "session_start",
+        "세션을 시작했습니다",
+        f"{(body.project_name if body else '') or '세션'} · {node.get('name', node_id)}",
+        members=(body.team_members if body else None),
+        node_id=node_id,
+        project_name=(body.project_name if body else None),
+    )
     return {"session_id": new_id, "status": "starting"}
 
 
@@ -1008,6 +1091,15 @@ async def delete_session(
         await _ssh(node["ip"], f"docker rm -f {container}", _suser)
         await doc.reference.delete()
         await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+        await _log_activity(
+            s.get("owner", me),
+            "session_delete",
+            "세션을 영구 삭제했습니다",
+            s.get("project_name") or session_id,
+            members=s.get("team_members"),
+            node_id=s.get("node_id"),
+            project_name=s.get("project_name"),
+        )
         await _send_email(
             s.get("owner", ""),
             "[PC대여] 세션이 삭제되었습니다",
@@ -1018,6 +1110,15 @@ async def delete_session(
     await _ssh(node["ip"], f"docker stop {container}", _suser)
     await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
     await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+    await _log_activity(
+        s.get("owner", me),
+        "session_suspend",
+        "세션이 보관되었습니다",
+        s.get("project_name") or session_id,
+        members=s.get("team_members"),
+        node_id=s.get("node_id"),
+        project_name=s.get("project_name"),
+    )
     await _send_email(
         s.get("owner", ""),
         "[PC대여] 세션을 일시중지했습니다",
@@ -1025,6 +1126,68 @@ async def delete_session(
         f"포털(https://dshs-app.net)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
     )
     return {"status": "suspended"}
+
+
+@app.get("/history", dependencies=[Depends(require_key), Depends(require_user)])
+async def get_history(
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    me = x_user_email.lower()
+    now = time.time()
+    lt = time.localtime(now)
+    month_start = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+
+    act_snap = await db.collection(COL_ACTIVITY).where("owner", "==", me).get()
+    events = sorted(
+        (d.to_dict() for d in act_snap),
+        key=lambda e: e.get("ts", 0),
+        reverse=True,
+    )
+
+    sessions_started = sum(
+        1
+        for e in events
+        if e.get("type") in ("session_start", "session_resume") and e.get("ts", 0) >= month_start
+    )
+    upload_bytes = sum(
+        int(e.get("bytes", 0))
+        for e in events
+        if e.get("type") == "file_upload" and e.get("ts", 0) >= month_start
+    )
+
+    # 이번 달에 걸친 세션 활성 구간 합산 (근사치)
+    sess_snap = await db.collection(COL_SESSIONS).where("owner", "==", me).get()
+    usage_seconds = 0
+    for d in sess_snap:
+        s = d.to_dict()
+        created = s.get("created_at")
+        if not isinstance(created, (int, float)):
+            continue
+        end = s.get("suspended_at")
+        if not isinstance(end, (int, float)):
+            end = now if s.get("status") in ("active", "starting") else created
+        start = max(created, month_start)
+        if end > start:
+            usage_seconds += int(end - start)
+
+    recent = [
+        {
+            "ts": e.get("ts", 0),
+            "type": e.get("type", ""),
+            "title": e.get("title", ""),
+            "detail": e.get("detail", ""),
+        }
+        for e in events[:40]
+    ]
+    return {
+        "summary": {
+            "usage_seconds": usage_seconds,
+            "sessions_started": sessions_started,
+            "upload_bytes": upload_bytes,
+        },
+        "events": recent,
+    }
 
 
 # ── Routes: file upload ───────────────────────────────────────────────────────
@@ -1100,6 +1263,16 @@ async def upload_files(
                 )
     except (OSError, asyncssh.Error) as e:
         raise HTTPException(status_code=502, detail=f"노드 전송 실패: {e}")
+
+    if saved:
+        await _log_activity(
+            email,
+            "file_upload",
+            "파일 전송 완료",
+            ", ".join(saved[:3]) + (f" 외 {len(saved) - 3}개" if len(saved) > 3 else ""),
+            node_id=target.get("node_id"),
+            project_name=target.get("project_name"),
+        )
 
     return {
         "uploaded": saved,
@@ -1244,6 +1417,38 @@ _CLEANUP_CMD = (
     "docker ps -a --filter status=exited --filter status=dead "
     "--format '{{.Names}}' | grep '^kasm_' | xargs -r docker rm -f"
 )
+
+
+@app.get("/admin/sessions", dependencies=[Depends(require_key)])
+async def admin_sessions():
+    snap = await db.collection(COL_SESSIONS).get()
+    node_names: dict[str, str] = {}
+    result = []
+    for doc in snap:
+        s = doc.to_dict()
+        nid = s.get("node_id")
+        name = nid
+        if nid:
+            if nid not in node_names:
+                try:
+                    ndoc = await db.collection(COL_NODES).document(nid).get()
+                    node_names[nid] = (ndoc.to_dict() or {}).get("name", nid) if ndoc.exists else nid
+                except Exception:
+                    node_names[nid] = nid
+            name = node_names[nid]
+        result.append({
+            "id": doc.id,
+            "owner": s.get("owner"),
+            "project_name": s.get("project_name"),
+            "node_id": nid,
+            "node_name": name,
+            "status": s.get("status"),
+            "expires_at": s.get("expires_at"),
+            "suspended_at": s.get("suspended_at"),
+        })
+    order = {"active": 0, "starting": 1, "suspended": 2}
+    result.sort(key=lambda r: order.get(r.get("status"), 3))
+    return {"sessions": result}
 
 
 @app.get("/admin/status", dependencies=[Depends(require_key)])

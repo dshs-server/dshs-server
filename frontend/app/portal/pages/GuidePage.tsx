@@ -1,0 +1,55 @@
+"use client";
+
+import s from "../atelier.module.css";
+import { HelpTip } from "../ui";
+
+const STEPS: [string, string, string][] = [
+  ["01", "PC 신청", "작업 이름과 필요한 최소 사양(CPU·메모리·저장공간)을 입력하고 사용할 장비를 선택합니다."],
+  ["02", "원격 접속", "배정이 끝나면 ‘데스크톱 열기’를 눌러 브라우저에서 Ubuntu 환경에 접속합니다. 첫 로딩은 1~2분 걸릴 수 있습니다."],
+  ["03", "파일 전송", "‘파일 보내기’로 내 컴퓨터의 파일을 실행 중인 PC의 바탕화면/받은파일 폴더로 전송합니다."],
+  ["04", "종료와 보관", "작업 종료 시 설치 환경과 파일이 보관함에 30일간 저장되어 다음에 이어서 사용할 수 있습니다."],
+];
+
+const TIPS: string[] = [
+  "종료 5분 전 알림이 표시됩니다. 알림이 오면 작업을 꼭 저장하세요.",
+  "학교망에서 접속이 안 되면 VPN을 켜고 다시 시도하세요.",
+  "팀원도 같은 @ts.hs.kr 계정만 추가할 수 있습니다.",
+  "‘파일 완전히 제거’는 모든 파일·패키지를 영구 삭제하며 되돌릴 수 없습니다.",
+];
+
+export default function GuidePage() {
+  return (
+    <div className={s.enter}>
+      <div className={s.pageTitle}>
+        <div className={s.titleLine}>
+          <h1>이용 안내</h1>
+          <HelpTip text="GPU 전산실의 기본 사용 절차입니다." />
+        </div>
+      </div>
+
+      <section className={s.guideSheet}>
+        {STEPS.map((row) => (
+          <article key={row[0]}>
+            <span>{row[0]}</span>
+            <h2>{row[1]}</h2>
+            <p>{row[2]}</p>
+          </article>
+        ))}
+      </section>
+
+      <div className={s.contactLine}>
+        <div className={s.titleLine}>
+          <strong>알아두면 좋아요</strong>
+        </div>
+      </div>
+      <section className={s.guideSheet} style={{ marginTop: "14px" }}>
+        {TIPS.map((t, i) => (
+          <article key={i}>
+            <span>TIP</span>
+            <p style={{ marginTop: "12px" }}>{t}</p>
+          </article>
+        ))}
+      </section>
+    </div>
+  );
+}
