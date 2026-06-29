@@ -670,13 +670,32 @@ async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str
 
 
 def _node_session_state(node_id: str, sessions: list[dict]) -> str:
+    active_count = 0
+    has_suspended = False
     for s in sessions:
-        if s.get("node_id") == node_id:
-            if s.get("status") in ("active", "starting"):
-                return "active"
-            if s.get("status") == "suspended":
-                return "suspended"
+        if s.get("node_id") != node_id:
+            continue
+        if s.get("status") in ("active", "starting"):
+            active_count += 1
+        elif s.get("status") == "suspended":
+            has_suspended = True
+    if active_count >= 2:
+        return "full"
+    if active_count == 1:
+        return "partial"
+    if has_suspended:
+        return "suspended"
     return "none"
+
+
+def _node_resource_used(node_id: str, sessions: list[dict]) -> dict:
+    cpu_sum = ram_sum = 0
+    for s in sessions:
+        if s.get("node_id") == node_id and s.get("status") in ("active", "starting"):
+            r = s.get("resources") or {}
+            cpu_sum += r.get("cpu_cores", 0)
+            ram_sum += r.get("ram_gb", 0)
+    return {"cpu_cores": cpu_sum, "ram_gb": ram_sum}
 
 
 # ── File transfer helpers ─────────────────────────────────────────────────────
@@ -816,6 +835,15 @@ async def list_nodes(
             continue
 
         state = _node_session_state(n["id"], sessions)
+        res_used = _node_resource_used(n["id"], sessions)
+        m = _metrics.get(n["id"], {})
+        ram_total = m.get("ram_total_gb") or n.get("ram_gb") or 0
+        load = None if m.get("offline") or not m else {
+            "cpu_pct": m.get("cpu"),
+            "ram_pct": round(m["ram_used_gb"] / ram_total * 100, 1) if ram_total else None,
+            "gpu_pct": m.get("gpu"),
+        }
+        sc = 2 if state == "full" else (1 if state == "partial" else 0)
         result.append({
             "id": n["id"],
             "name": n.get("name", n["id"]),
@@ -824,8 +852,11 @@ async def list_nodes(
             "gpu": n.get("gpu", ""),
             "ram_gb": n.get("ram_gb", 0),
             "storage_gb": n.get("storage_gb", 0),
-            "available": state != "active",
+            "available": state not in ("full",),
             "session_state": state,
+            "session_count": sc,
+            "resource_used": res_used,
+            "load": load,
         })
 
     return {"nodes": result}
@@ -895,6 +926,7 @@ class SessionBody(BaseModel):
     duration_days: Optional[int] = 7
     work_type: Optional[str] = None
     replace_session_id: Optional[str] = None
+    behalf_of: Optional[str] = None  # admin only
 
 
 @app.get("/session", dependencies=[Depends(require_key), Depends(require_user)])
@@ -906,16 +938,22 @@ async def get_session(
     active = _sc_list(owner=me, status=["active", "starting"])
     suspended = _sc_list(owner=me, status="suspended")
 
-    suspended_sessions = [
-        {
+    now_ts = time.time()
+    suspended_sessions = []
+    for sid, s in suspended:
+        orig = s.get("original_created_at") or s.get("created_at", 0)
+        # 최소 1일로 재개해도 40일 초과 여부 체크
+        s_extend_blocked = (not s.get("extend_unlocked", False)) and \
+            ((now_ts + 86400 - orig) / 86400 >= 40)
+        suspended_sessions.append({
             "id": sid,
             "project_name": s.get("project_name", ""),
             "saved_at": s.get("suspended_at") or s.get("created_at", 0),
             "team_members": s.get("team_members", []),
             "resources": s.get("resources", {}),
-        }
-        for sid, s in suspended
-    ]
+            "original_created_at": orig,
+            "extend_blocked": s_extend_blocked,
+        })
 
     if not active:
         return {"status": "none", "suspended_sessions": suspended_sessions}
@@ -936,11 +974,17 @@ async def get_session(
 
     if dock == "running":
         url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
+        orig = s.get("original_created_at") or s.get("created_at", time.time())
+        expires = s.get("expires_at", time.time())
+        extend_blocked = (not s.get("extend_unlocked", False)) and \
+            ((expires - orig) / 86400 >= 40)
         return {
             "status": "ready",
             "session_id": session_id,
             "url": url,
-            "expires_at": s.get("expires_at"),
+            "expires_at": expires,
+            "original_created_at": orig,
+            "extend_blocked": extend_blocked,
             "suspended_sessions": suspended_sessions,
             **meta,
         }
@@ -958,9 +1002,15 @@ async def get_session(
             "status": "suspended",
             "suspended_at": time.time(),
         })
+        _orig = s.get("original_created_at") or s.get("created_at", 0)
+        _now_ts2 = time.time()
+        _s_ext_blocked = (not s.get("extend_unlocked", False)) and \
+            ((_now_ts2 + 86400 - _orig) / 86400 >= 40)
         suspended_sessions = [{"id": session_id, "project_name": s.get("project_name", ""),
-                                "saved_at": time.time(), "team_members": s.get("team_members", []),
-                                "resources": s.get("resources", {})}] + suspended_sessions
+                                "saved_at": _now_ts2, "team_members": s.get("team_members", []),
+                                "resources": s.get("resources", {}),
+                                "original_created_at": _orig,
+                                "extend_blocked": _s_ext_blocked}] + suspended_sessions
         return {"status": "none", "suspended_sessions": suspended_sessions}
 
     # restarting, paused 등 — 실제로 준비 중
@@ -1013,6 +1063,10 @@ async def create_session(
     me = x_user_email.lower()
     is_admin = x_user_admin == "1"
 
+    # behalf_of: 관리자가 다른 사용자 대신 신청
+    if is_admin and body and body.behalf_of:
+        me = body.behalf_of.lower().strip()
+
     if resume:
         suspended_docs = _sc_list(owner=me, status="suspended")
         if not suspended_docs:
@@ -1041,13 +1095,39 @@ async def create_session(
                 await db.collection(COL_SESSIONS).document(target_sid).delete()
             except Exception:
                 pass
-            raise HTTPException(status_code=409, detail="저장된 작업 파일이 더 이상 존재하지 않습니다. 새로 시작해주세요.")
+            raise HTTPException(status_code=409, detail="저장된 작업 파일이 더 이상 존재하지 않습니다. 새로 시작해주세요.", headers={"X-Container-Gone": "1"})
+
+        # duration 결정
+        resume_duration = (body.duration_days if body else None)
+        if resume_duration is None or resume_duration < 0:
+            resume_duration = 7
+        if resume_duration == 0:
+            expires_delta = 999 * 86400
+        else:
+            expires_delta = resume_duration * 86400
+
+        now_ts = time.time()
+        new_expires = now_ts + expires_delta
+        original_created = s.get("original_created_at") or s.get("created_at", now_ts)
+
+        # 40일 초과 체크
+        if not (is_admin or s.get("extend_unlocked")):
+            total_days = (new_expires - original_created) / 86400
+            if total_days > 40:
+                raise HTTPException(
+                    status_code=403,
+                    detail="세션 총 이용 기간이 40일을 초과합니다. 관리자 허가가 필요합니다.",
+                )
 
         stdout, rc = await _ssh(node["ip"], f"docker start {container}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
 
-        updates = {"status": "starting", "created_at": time.time()}
+        updates = {
+            "status": "starting",
+            "created_at": now_ts,
+            "expires_at": new_expires,
+        }
         _sc_update(target_sid, updates)
         await db.collection(COL_SESSIONS).document(target_sid).update(updates)
         if s.get("port"):
@@ -1087,25 +1167,59 @@ async def create_session(
 
     # Pick node — least-loaded with remaining port capacity
     node_id = body.node_id if body else None
+    req_res = (body.resources or {}) if body else {}
+    req_cpu = req_res.get("cpu_cores", 0)
+    req_ram = req_res.get("ram_gb", 0)
+
     if not node_id:
         all_nodes = await _get_nodes()
-        session_counts: dict[str, int] = {}
-        for _, sd2 in _sc_list(status=["active", "starting", "suspended"]):
+        active_sessions = list(_sc_list(status=["active", "starting"]))
+        node_sc: dict[str, int] = {}
+        node_ru: dict[str, dict] = {}
+        for _, sd2 in active_sessions:
             nid2 = sd2.get("node_id", "")
-            session_counts[nid2] = session_counts.get(nid2, 0) + 1
+            node_sc[nid2] = node_sc.get(nid2, 0) + 1
+            r2 = sd2.get("resources") or {}
+            if nid2 not in node_ru:
+                node_ru[nid2] = {"cpu_cores": 0, "ram_gb": 0}
+            node_ru[nid2]["cpu_cores"] += r2.get("cpu_cores", 0)
+            node_ru[nid2]["ram_gb"] += r2.get("ram_gb", 0)
 
         best_node: Optional[str] = None
         best_count = PORT_MAX - PORT_BASE + 1  # max capacity
         for nn in all_nodes:
-            count = session_counts.get(nn["id"], 0)
+            nid = nn["id"]
+            count = node_sc.get(nid, 0)
+            if count >= 2:
+                continue
+            used = node_ru.get(nid, {"cpu_cores": 0, "ram_gb": 0})
+            cpu_total = nn.get("cpu_cores", 0)
+            ram_total = nn.get("ram_gb", 0)
+            if cpu_total > 0 and req_cpu > 0 and (used["cpu_cores"] + req_cpu) / cpu_total > 0.9:
+                continue
+            if ram_total > 0 and req_ram > 0 and (used["ram_gb"] + req_ram) / ram_total > 0.9:
+                continue
             if count < best_count:
                 best_count = count
-                best_node = nn["id"]
+                best_node = nid
         if not best_node:
             raise HTTPException(status_code=503, detail="사용 가능한 PC가 없습니다.")
         node_id = best_node
 
     node = await _get_node(node_id)
+
+    # Per-node capacity check (also runs when node_id was explicitly provided)
+    node_active = [s for _, s in _sc_list(status=["active", "starting"]) if s.get("node_id") == node_id]
+    if len(node_active) >= 2:
+        raise HTTPException(status_code=503, detail="해당 PC가 꽉 찼습니다. 다른 PC를 선택해주세요.")
+    used_cpu = sum((s.get("resources") or {}).get("cpu_cores", 0) for s in node_active)
+    used_ram = sum((s.get("resources") or {}).get("ram_gb", 0) for s in node_active)
+    cpu_total = node.get("cpu_cores", 0)
+    ram_total = node.get("ram_gb", 0)
+    if cpu_total > 0 and req_cpu > 0 and (used_cpu + req_cpu) / cpu_total > 0.9:
+        raise HTTPException(status_code=503, detail="CPU 용량 초과 (90% 제한). 다른 PC를 선택해주세요.")
+    if ram_total > 0 and req_ram > 0 and (used_ram + req_ram) / ram_total > 0.9:
+        raise HTTPException(status_code=503, detail="메모리 용량 초과 (90% 제한). 다른 PC를 선택해주세요.")
     _suser = node.get("ssh_user", SSH_USER)
     kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
 
@@ -1121,9 +1235,16 @@ async def create_session(
         _suser,
     )
 
+    # 하드 리소스 제한: 신청값을 Docker에 직접 적용 → 컨테이너 이용률 합 ≤ 90% 보장
+    resource_flags = ""
+    if req_cpu > 0:
+        resource_flags += f"--cpus {req_cpu} "
+    if req_ram > 0:
+        resource_flags += f"--memory {req_ram}g "
+
     cmd = (
         f"docker run -d --name {container} --restart unless-stopped "
-        f"--gpus all --shm-size=2gb -p {port}:6901 {_mount_arg(me, _suser)} "
+        f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 {_mount_arg(me, _suser)} "
         f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
     )
     stdout, rc = await _ssh(node["ip"], cmd, _suser)
@@ -1132,22 +1253,33 @@ async def create_session(
         await _ssh(node["ip"], f"docker rm -f {container} 2>/dev/null || true", _suser)
         cmd_no_gpu = (
             f"docker run -d --name {container} --restart unless-stopped "
-            f"--shm-size=2gb -p {port}:6901 {_mount_arg(me, _suser)} "
+            f"--shm-size=2gb {resource_flags}-p {port}:6901 {_mount_arg(me, _suser)} "
             f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
         )
         stdout, rc = await _ssh(node["ip"], cmd_no_gpu, _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
 
-    duration = (body.duration_days if body else None) or 7
+    duration = (body.duration_days if body else None)
+    if duration is None or duration < 0:
+        duration = 7
+    # 무한(0) → 999일
+    if duration == 0:
+        expires_delta = 999 * 86400
+    else:
+        expires_delta = duration * 86400
+
+    now_ts = time.time()
     session_data = {
         "node_id": node_id,
         "owner": me,
         "team_members": (body.team_members if body else None) or [],
         "project_name": (body.project_name if body else None) or "",
         "status": "starting",
-        "created_at": time.time(),
-        "expires_at": time.time() + duration * 86400,
+        "created_at": now_ts,
+        "original_created_at": now_ts,  # 연장/재개 시 불변
+        "expires_at": now_ts + expires_delta,
+        "extend_unlocked": False,
         "work_type": (body.work_type if body else None) or "",
         "resources": (body.resources if body else None) or {},
         "port": port,
@@ -1167,6 +1299,81 @@ async def create_session(
         project_name=(body.project_name if body else None),
     )
     return {"session_id": new_id, "status": "starting"}
+
+
+class ExtendBody(BaseModel):
+    extend_days: Optional[int] = None
+    extend_unlocked: Optional[bool] = None
+
+
+@app.patch("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])
+async def patch_session(
+    session_id: str,
+    body: ExtendBody,
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    s = _sc_get(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    me = x_user_email.lower()
+    is_admin = x_user_admin == "1"
+
+    if not is_admin and s.get("owner") != me:
+        raise HTTPException(status_code=403, detail="본인 세션만 수정할 수 있습니다.")
+
+    # 관리자 전용: extend_unlocked 설정
+    if body.extend_unlocked is not None:
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="관리자만 허가할 수 있습니다.")
+        updates = {"extend_unlocked": body.extend_unlocked}
+        _sc_update(session_id, updates)
+        await db.collection(COL_SESSIONS).document(session_id).update(updates)
+        return {"ok": True}
+
+    # extend_days: 연장
+    if body.extend_days is not None:
+        if body.extend_days <= 0:
+            raise HTTPException(status_code=400, detail="extend_days는 양수여야 합니다.")
+
+        current_expires = s.get("expires_at", time.time())
+        now_ts = time.time()
+        remaining = current_expires - now_ts
+
+        # 2일 이내에만 연장 가능
+        if remaining > 2 * 86400 and not is_admin:
+            raise HTTPException(
+                status_code=400,
+                detail="세션 종료 2일 이내에만 연장할 수 있습니다.",
+            )
+
+        new_expires = current_expires + body.extend_days * 86400
+        orig = s.get("original_created_at") or s.get("created_at", now_ts)
+
+        # 40일 초과 체크
+        if not (is_admin or s.get("extend_unlocked")):
+            total_days = (new_expires - orig) / 86400
+            if total_days > 40:
+                raise HTTPException(
+                    status_code=403,
+                    detail="세션 총 이용 기간이 40일을 초과합니다. 관리자 허가가 필요합니다.",
+                )
+
+        updates = {"expires_at": new_expires}
+        _sc_update(session_id, updates)
+        await db.collection(COL_SESSIONS).document(session_id).update(updates)
+        await _log_activity(
+            s.get("owner", me),
+            "session_extend",
+            f"세션을 {body.extend_days}일 연장했습니다",
+            s.get("project_name") or session_id,
+            node_id=s.get("node_id"),
+            project_name=s.get("project_name"),
+        )
+        return {"expires_at": new_expires}
+
+    raise HTTPException(status_code=400, detail="extend_days 또는 extend_unlocked 중 하나를 제공해야 합니다.")
 
 
 @app.delete("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])
@@ -1544,6 +1751,10 @@ async def admin_sessions():
                 except Exception:
                     node_names[nid] = nid
             name = node_names[nid]
+        orig = s.get("original_created_at") or s.get("created_at", 0)
+        expires = s.get("expires_at", 0)
+        extend_blocked = (not s.get("extend_unlocked", False)) and \
+            ((expires - orig) / 86400 >= 40)
         result.append({
             "id": doc.id,
             "owner": s.get("owner"),
@@ -1551,8 +1762,10 @@ async def admin_sessions():
             "node_id": nid,
             "node_name": name,
             "status": s.get("status"),
-            "expires_at": s.get("expires_at"),
+            "expires_at": expires,
             "suspended_at": s.get("suspended_at"),
+            "original_created_at": orig,
+            "extend_blocked": extend_blocked,
         })
     order = {"active": 0, "starting": 1, "suspended": 2}
     result.sort(key=lambda r: order.get(r.get("status"), 3))
