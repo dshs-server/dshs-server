@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import s from "../atelier.module.css";
 import { HelpTip, PowerIcon, ConfirmSheet, formatRemaining } from "../ui";
 import { nodeState, type NodeInfo } from "../useNodes";
@@ -38,6 +38,14 @@ export default function WorkPage({
 }) {
   const { status } = ctrl;
   const [confirmTerminate, setConfirmTerminate] = useState(false);
+  const [date, setDate] = useState("");
+
+  useEffect(() => {
+    try {
+      setDate(new Date().toLocaleDateString("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "long" }));
+    } catch {}
+  }, []);
+
   const openNew = () => {
     ctrl.setReplaceSessionId(null);
     ctrl.setShowNewSessionModal(true);
@@ -47,14 +55,10 @@ export default function WorkPage({
     <div className={s.enter}>
       <div className={s.pageTitle}>
         <div className={s.titleLine}>
-          <h1>내 작업</h1>
+          <h1>DSHS 전산실</h1>
           <HelpTip text="배정된 PC와 보관 중인 환경을 확인합니다." />
         </div>
-        {(status === "idle" || status === "error") && (
-          <button className={s.solidButton} onClick={openNew}>
-            새 작업 신청
-          </button>
-        )}
+        {date && <span className={s.pageTitleDate}>{date}</span>}
       </div>
 
       <div className={s.workLayout}>
@@ -81,41 +85,6 @@ export default function WorkPage({
 
         <MachineLedger nodes={nodes} />
       </div>
-
-      <section className={s.recentBlock}>
-        <div className={s.blockHeading}>
-          <h2>보관 중인 작업</h2>
-        </div>
-        <div className={s.ledgerTable}>
-          <div className={s.ledgerHead}>
-            <span>작업명</span>
-            <span>환경</span>
-            <span>저장 용량</span>
-            <span>삭제 예정</span>
-            <span />
-          </div>
-          {ctrl.suspendedSessions.length === 0 ? (
-            <div className={s.ledgerRow}>
-              <span>
-                <small>보관 중인 작업이 없습니다.</small>
-              </span>
-            </div>
-          ) : (
-            ctrl.suspendedSessions.map((item) => (
-              <div className={s.ledgerRow} key={item.id}>
-                <span>
-                  <strong>{item.project_name || "저장된 세션"}</strong>
-                  <small>{item.saved_at ? new Date(item.saved_at * 1000).toLocaleDateString("ko-KR") : ""}</small>
-                </span>
-                <span>{item.resources?.gpu || `${item.resources?.cpu_cores ?? "—"}코어`}</span>
-                <span>{item.resources?.storage_gb ? `${item.resources.storage_gb}GB` : "—"}</span>
-                <span>{relDays(item.delete_after)}</span>
-                <button onClick={() => ctrl.handleResume(item.id)}>이어하기</button>
-              </div>
-            ))
-          )}
-        </div>
-      </section>
 
       {confirmTerminate && (
         <ConfirmSheet
@@ -148,7 +117,7 @@ function ReadyAssignment({
   const idx = nodes.findIndex((n) => n.id === activeMeta.node_id);
   const nodeNo = idx >= 0 ? String(idx + 1).padStart(2, "0") : "PC";
   const expiryStr = expiresAt
-    ? new Date(expiresAt * 1000).toLocaleString("ko-KR", { hour: "2-digit", minute: "2-digit" }) + " 종료"
+    ? new Date(expiresAt * 1000).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) + " 종료"
     : "";
 
   return (
@@ -178,7 +147,7 @@ function ReadyAssignment({
       </div>
 
       <div className={s.numbers}>
-        <Metric label="CPU" stat={stats?.cpu_pct} unit="%" cool="blue" />
+        <Metric label="CPU" stat={stats?.cpu_pct} unit="%" cool="blue" note={stats?.top_process || undefined} />
         <Metric label="GPU" stat={stats?.gpu_pct} unit="%" cool="green" />
         <Metric
           label="메모리"
@@ -354,9 +323,9 @@ function ErrorAssignment({ ctrl }: { ctrl: SessionController }) {
 function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
   const free = nodes.filter((n) => nodeState(n) === "available").length;
   const stateLabel = (st: "available" | "suspended" | "active") =>
-    st === "available" ? "가능" : st === "suspended" ? "보관됨" : "사용 중";
+    st === "active" ? "사용 중" : "가능";
   const stateAttr = (st: "available" | "suspended" | "active") =>
-    st === "available" ? "available" : "busy";
+    st === "active" ? "busy" : "available";
 
   return (
     <aside className={s.machineLedger}>
@@ -371,7 +340,7 @@ function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
           const st = nodeState(node);
           return (
             <article key={node.id} data-state={stateAttr(st)}>
-              <span>{String(index + 1).padStart(2, "0")}</span>
+              <span className={s.nodeNo}>{index + 1}</span>
               <div>
                 <strong>{node.name || node.id}</strong>
                 <small>{node.gpu}</small>

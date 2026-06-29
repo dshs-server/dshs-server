@@ -5,7 +5,7 @@ import s from "../atelier.module.css";
 import { HelpTip, Field, formatDateTime } from "../ui";
 import { useToast } from "@/components/toast";
 
-type AdminTab = "status" | "pc" | "session" | "people" | "notice" | "clean" | "log";
+type AdminTab = "status" | "session" | "people" | "notice" | "clean" | "log";
 
 interface NodeStatus {
   id: string;
@@ -53,7 +53,6 @@ interface StoppedContainer {
 
 const TABS: { key: AdminTab; label: string }[] = [
   { key: "status", label: "운영 현황" },
-  { key: "pc", label: "PC" },
   { key: "session", label: "세션" },
   { key: "people", label: "사용자" },
   { key: "notice", label: "공지" },
@@ -76,6 +75,7 @@ export default function AdminArea() {
   const [logContent, setLogContent] = useState<string | null>(null);
   const [logDate, setLogDate] = useState("");
   const [logLoading, setLogLoading] = useState(false);
+  const [terminateConfirmId, setTerminateConfirmId] = useState<string | null>(null);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -261,7 +261,6 @@ export default function AdminArea() {
             <section className={s.opsSheet}>
               <div className={s.blockHeading}>
                 <h2>장비 상태</h2>
-                <button onClick={() => setTab("pc")}>전체 보기</button>
               </div>
               {nodes.map((n, i) => (
                 <div className={s.opsMachine} key={n.id}>
@@ -273,7 +272,10 @@ export default function AdminArea() {
                   <em data-state={n.status === "idle" ? "available" : n.status === "in_use" ? "busy" : "offline"}>
                     {n.status === "idle" ? "대기" : n.status === "in_use" ? "사용 중" : "오프라인"}
                   </em>
-                  <p>{n.project_name || "—"}</p>
+                  <div>
+                    <strong>{n.owner || "—"}</strong>
+                    <small>{n.project_name || "작업 없음"}</small>
+                  </div>
                   <dl>
                     <div>
                       <dt>CPU</dt>
@@ -282,6 +284,10 @@ export default function AdminArea() {
                     <div>
                       <dt>GPU</dt>
                       <dd>{(n.gpu_usage ?? 0).toFixed(0)}%</dd>
+                    </div>
+                    <div>
+                      <dt>저장</dt>
+                      <dd>{n.storage_total_gb ? `${(n.storage_used_gb ?? 0).toFixed(0)}/${n.storage_total_gb}G` : "—"}</dd>
                     </div>
                   </dl>
                 </div>
@@ -318,62 +324,70 @@ export default function AdminArea() {
         </>
       )}
 
-      {tab === "pc" && (
-        <AdminTable title="PC 관리" headers={["장비", "상태", "사용자 / 작업", "CPU", "GPU", "저장 공간", ""]}>
-          {nodes.map((n, i) => (
-            <div className={s.adminRow} key={n.id}>
-              <span>
-                <b>{String(i + 1).padStart(2, "0")}</b>
-                {n.name || n.id}
-              </span>
-              <span>{n.status === "idle" ? "대기" : n.status === "in_use" ? "사용 중" : "오프라인"}</span>
-              <span>
-                {n.owner || "—"}
-                <small>{n.project_name || ""}</small>
-              </span>
-              <span>{(n.cpu_usage ?? 0).toFixed(0)}%</span>
-              <span>{(n.gpu_usage ?? 0).toFixed(0)}%</span>
-              <span>
-                {n.storage_total_gb
-                  ? `${(n.storage_used_gb ?? 0).toFixed(0)}/${n.storage_total_gb}GB`
-                  : "—"}
-              </span>
-              <button
-                disabled={n.status !== "in_use" || busy}
-                onClick={() => doAction("terminate", "세션 강제 종료")}
-              >
-                종료
-              </button>
-            </div>
-          ))}
-        </AdminTable>
-      )}
-
       {tab === "session" && (
-        <AdminTable title="세션 관리" headers={["작업", "사용자", "장비", "상태", "만료/삭제", ""]}>
-          {sessions.length === 0 ? (
-            <div className={s.adminRow}>
-              <span>
-                <strong>활성/보관 세션이 없습니다.</strong>
-              </span>
-            </div>
-          ) : (
-            sessions.map((se) => (
-              <div className={s.adminRow} key={se.id}>
+        <>
+          <AdminTable title="세션 관리" headers={["작업", "사용자", "장비", "상태", "만료", ""]}>
+            {sessions.filter((se) => se.status !== "suspended").length === 0 ? (
+              <div className={s.adminRow}>
                 <span>
-                  <strong>{se.project_name || "세션"}</strong>
+                  <strong>활성 세션이 없습니다.</strong>
                 </span>
-                <span>{se.owner || "—"}</span>
-                <span>{se.node_name || se.node_id || "—"}</span>
-                <span>{sessionStatusLabel(se.status)}</span>
-                <span>{formatDateTime(se.status === "suspended" ? se.suspended_at : se.expires_at)}</span>
-                <button onClick={() => doAction("terminate", "세션 강제 종료")} disabled={busy}>
-                  관리
-                </button>
               </div>
-            ))
+            ) : (
+              sessions
+                .filter((se) => se.status !== "suspended")
+                .map((se) => (
+                  <div className={s.adminRow} key={se.id}>
+                    <span>
+                      <strong>{se.project_name || "세션"}</strong>
+                    </span>
+                    <span>{se.owner || "—"}</span>
+                    <span>{se.node_name || se.node_id || "—"}</span>
+                    <span>{sessionStatusLabel(se.status)}</span>
+                    <span>{formatDateTime(se.expires_at)}</span>
+                    <button
+                      onClick={() => setTerminateConfirmId(se.id)}
+                      disabled={busy}
+                      style={{ color: "#e53e3e" }}
+                    >
+                      강제 종료
+                    </button>
+                  </div>
+                ))
+            )}
+          </AdminTable>
+          {terminateConfirmId && (
+            <div className={s.overlay}>
+              <section className={s.uploadSheet} style={{ width: "min(440px, 94vw)" }}>
+                <header>
+                  <div>
+                    <h2>세션 강제 종료</h2>
+                  </div>
+                  <button onClick={() => setTerminateConfirmId(null)}>닫기</button>
+                </header>
+                <p style={{ margin: "22px 24px", lineHeight: 1.6 }}>
+                  이 세션을 강제로 종료합니다. 저장되지 않은 작업이 손실될 수 있습니다.
+                </p>
+                <footer>
+                  <span style={{ flex: 1 }} />
+                  <button className={s.lineButton} onClick={() => setTerminateConfirmId(null)}>
+                    취소
+                  </button>
+                  <button
+                    className={s.solidButton}
+                    style={{ color: "#e53e3e" }}
+                    onClick={() => {
+                      doAction("terminate", "세션 강제 종료");
+                      setTerminateConfirmId(null);
+                    }}
+                  >
+                    강제 종료
+                  </button>
+                </footer>
+              </section>
+            </div>
           )}
-        </AdminTable>
+        </>
       )}
 
       {tab === "people" && (
@@ -446,23 +460,41 @@ export default function AdminArea() {
               <h2>중단된 컨테이너</h2>
               <HelpTip text="종료 후 남아 있는 컨테이너입니다." />
             </div>
+            {sessions.filter((se) => se.status === "suspended").length > 0 && (
+              <>
+                <p style={{ color: "var(--faint)", fontSize: "13px", margin: "0 0 8px" }}>보관된 세션</p>
+                {sessions
+                  .filter((se) => se.status === "suspended")
+                  .map((se) => (
+                    <article key={se.id}>
+                      <div>
+                        <strong>{se.project_name || se.id}</strong>
+                        <small>{se.owner || "—"} · {formatDateTime(se.suspended_at)}</small>
+                      </div>
+                      <span style={{ color: "var(--faint)", fontSize: "12px" }}>보관됨</span>
+                    </article>
+                  ))}
+              </>
+            )}
+            {containers.filter((c) => !c.is_saved_session).length > 0 && (
+              <p style={{ color: "var(--faint)", fontSize: "13px", margin: "12px 0 8px" }}>미분류 컨테이너</p>
+            )}
             {containers.length === 0 ? (
               <p style={{ color: "var(--dim)" }}>{containersLoading ? "조회 중…" : "중단된 컨테이너 없음"}</p>
             ) : (
-              containers.map((c) => (
-                <article key={c.name}>
-                  <div>
-                    <strong>{c.name}</strong>
-                    <small>
-                      {c.status}
-                      {c.is_saved_session ? " · 저장된 세션" : ""}
-                    </small>
-                  </div>
-                  <button onClick={() => deleteContainer(c.name)} disabled={deletingContainer === c.name}>
-                    {deletingContainer === c.name ? "삭제 중…" : "삭제"}
-                  </button>
-                </article>
-              ))
+              containers
+                .filter((c) => !c.is_saved_session)
+                .map((c) => (
+                  <article key={c.name}>
+                    <div>
+                      <strong>{c.name}</strong>
+                      <small>{c.status}</small>
+                    </div>
+                    <button onClick={() => deleteContainer(c.name)} disabled={deletingContainer === c.name}>
+                      {deletingContainer === c.name ? "삭제 중…" : "삭제"}
+                    </button>
+                  </article>
+                ))
             )}
             <button
               className={s.lineButton}
@@ -499,9 +531,29 @@ export default function AdminArea() {
         <section className={s.opsSheet}>
           <div className={s.blockHeading}>
             <h2>모니터링 로그 {logDate && `· ${logDate}`}</h2>
-            <button onClick={() => loadLog()} disabled={logLoading}>
-              {logLoading ? "불러오는 중…" : "새로고침"}
-            </button>
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <input
+                type="date"
+                value={logDate}
+                onChange={(e) => {
+                  setLogDate(e.target.value);
+                  loadLog(e.target.value || undefined);
+                }}
+                style={{
+                  height: "36px",
+                  padding: "0 10px",
+                  border: "1px solid var(--hair)",
+                  borderRadius: "8px",
+                  background: "rgba(255,255,255,.6)",
+                  color: "var(--paper)",
+                  fontSize: "13px",
+                  cursor: "pointer",
+                }}
+              />
+              <button onClick={() => loadLog(logDate || undefined)} disabled={logLoading}>
+                {logLoading ? "불러오는 중…" : "새로고침"}
+              </button>
+            </div>
           </div>
           {logContent ? (
             <pre

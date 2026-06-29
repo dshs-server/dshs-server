@@ -23,55 +23,62 @@ export default function SavedPage({
           <h1>보관함</h1>
           <HelpTip text="종료한 작업 환경은 30일간 보관됩니다." />
         </div>
+        <span className={s.pageTitleDate}>{items.length}개 저장됨</span>
       </div>
 
-      <section className={s.fullSheet}>
-        <div className={s.sheetTools}>
-          <strong>{items.length}개 작업</strong>
+      {items.length === 0 ? (
+        <div className={s.savedEmpty}>
+          보관 중인 작업이 없습니다. 세션을 종료하면 이곳에 저장됩니다.
         </div>
-
-        {items.length === 0 ? (
-          <div style={{ padding: "48px 24px", textAlign: "center", color: "var(--dim)" }}>
-            보관 중인 작업이 없습니다. 세션을 종료하면 이곳에 저장됩니다.
-          </div>
-        ) : (
-          items.map((item, index) => (
-            <article className={s.savedItem} key={item.id}>
-              <span className={s.savedIndex}>{String(index + 1).padStart(2, "0")}</span>
-              <div>
-                <h2>{item.project_name || "저장된 세션"}</h2>
-                <p>{item.saved_at ? `${formatDateTime(item.saved_at)} 저장` : "저장됨"}</p>
-              </div>
-              <dl>
+      ) : (
+        <div className={s.savedCards}>
+          {items.map((item, index) => (
+            <article className={s.savedCard} key={item.id}>
+              <header className={s.savedCardHead}>
+                <span className={s.savedIndex}>{String(index + 1).padStart(2, "0")}</span>
+                <div>
+                  <h2>{item.project_name || "저장된 세션"}</h2>
+                  <p>{item.saved_at ? `${formatDateTime(item.saved_at)} 저장` : "저장됨"}</p>
+                </div>
+              </header>
+              <dl className={s.savedCardMeta}>
                 <div>
                   <dt>환경</dt>
                   <dd>{specSummary(item.resources)}</dd>
                 </div>
                 <div>
                   <dt>저장 용량</dt>
-                  <dd>{item.resources?.storage_gb ? `${item.resources.storage_gb}GB` : "—"}</dd>
+                  <dd>
+                    {item.resources?.storage_used_gb != null
+                      ? `${item.resources.storage_used_gb}/${item.resources.storage_gb ?? "—"}GB`
+                      : item.resources?.storage_gb
+                      ? `—/${item.resources.storage_gb}GB`
+                      : "—"}
+                  </dd>
                 </div>
                 <div>
                   <dt>자동 삭제</dt>
                   <dd>{item.delete_after ? formatDateTime(item.delete_after) : "—"}</dd>
                 </div>
               </dl>
-              <button
-                className={s.solidButton}
-                onClick={() => {
-                  ctrl.handleResume(item.id);
-                  onNavigate("work");
-                }}
-              >
-                이어하기
-              </button>
-              <button className={s.quietButton} onClick={() => setPendingDelete(item.id)}>
-                삭제
-              </button>
+              <footer className={s.savedCardFoot}>
+                <button
+                  className={s.solidButton}
+                  onClick={() => {
+                    ctrl.handleResume(item.id);
+                    onNavigate("work");
+                  }}
+                >
+                  이어하기
+                </button>
+                <button className={s.quietButton} onClick={() => setPendingDelete(item.id)}>
+                  삭제
+                </button>
+              </footer>
             </article>
-          ))
-        )}
-      </section>
+          ))}
+        </div>
+      )}
 
       {pendingDelete && (
         <ConfirmSheet
@@ -92,8 +99,6 @@ export default function SavedPage({
 
 function specSummary(r?: { cpu_cores?: number; ram_gb?: number; gpu?: string }) {
   if (!r) return "—";
-  const parts = [r.gpu, r.cpu_cores ? `${r.cpu_cores} Core` : null, r.ram_gb ? `${r.ram_gb}GB` : null].filter(
-    Boolean
-  );
+  const parts = [r.gpu, r.cpu_cores ? `${r.cpu_cores} Core` : null, r.ram_gb ? `${r.ram_gb}GB` : null].filter(Boolean);
   return parts.length ? parts.join(" · ") : "—";
 }

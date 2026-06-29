@@ -21,24 +21,11 @@ const NAV: { key: Page; no: string; label: string }[] = [
   { key: "guide", no: "04", label: "이용 안내" },
 ];
 
-function todayLabel() {
-  try {
-    return new Date().toLocaleDateString("ko-KR", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      weekday: "long",
-    });
-  } catch {
-    return "";
-  }
-}
 
 export default function PortalShell({ initialPage = "work" }: { initialPage?: Page }) {
   const ctrl = useSession();
   const { nodes } = useNodes();
   const [page, setPage] = useState<Page>(initialPage);
-  const [date, setDate] = useState("");
   const [navWarn, setNavWarn] = useState(false);
 
   const onLogout = () => {
@@ -47,7 +34,6 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   };
 
   useEffect(() => {
-    setDate(todayLabel());
     const params = new URLSearchParams(window.location.search);
     const view = params.get("view");
     if (view && ["work", "saved", "history", "guide", "admin"].includes(view)) {
@@ -59,9 +45,6 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
 
   const isAdmin = !!ctrl.me?.isAdmin;
   const onlineCount = nodes.filter((n) => nodeOnline(n)).length;
-
-  const headerTitle =
-    page === "admin" ? "관리" : NAV.find((n) => n.key === page)?.label ?? "내 작업";
 
   return (
     <div className={s.root} data-variant="ivory">
@@ -75,7 +58,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
         <aside className={s.side}>
           <button className={s.wordmark} onClick={() => setPage("work")}>
             <span>DSHS</span>
-            <strong>GPU 전산실</strong>
+            <strong>전산실</strong>
           </button>
 
           <nav>
@@ -102,6 +85,10 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
           )}
 
           <div className={s.sideFoot}>
+            <div className={s.sideAccount}>
+              <span title={ctrl.me?.email ?? undefined}>{ctrl.me?.email ?? "—"}</span>
+              <button className={s.logoutBtn} onClick={onLogout}>로그아웃</button>
+            </div>
             <span>
               <i /> 운영 중
             </span>
@@ -113,17 +100,6 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
         </aside>
 
         <section className={s.stage}>
-          <header className={s.header}>
-            <div>
-              <strong>{headerTitle}</strong>
-              <span>{date}</span>
-            </div>
-            <div className={s.account}>
-              <span>{ctrl.me?.email ?? "—"}</span>
-              <button onClick={onLogout}>로그아웃</button>
-            </div>
-          </header>
-
           <main className={s.main}>
             {page === "work" && <WorkPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} />}
             {page === "saved" && <SavedPage ctrl={ctrl} onNavigate={setPage} />}

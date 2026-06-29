@@ -6,6 +6,7 @@ import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 import { signInWithPopup, GoogleAuthProvider } from "firebase/auth";
 import { auth } from "@/lib/firebase";
+import s from "./login.module.css";
 
 const ERROR_MESSAGES: Record<string, string> = {
   domain: "학교 계정(@ts.hs.kr)으로만 로그인할 수 있습니다.",
@@ -57,47 +58,45 @@ function LoginCard() {
   }
 
   return (
-    <div className="glass glass-strong fade-in" style={card}>
-      <div style={logoWrap}>
-        <div style={logoBadge}>🖥️</div>
+    <div className={s.card}>
+      <div className={s.wordmark}>
+        <span>DSHS</span>
+        <strong>전산실</strong>
       </div>
 
-      <h1 style={title}>PC 대여 포털</h1>
-      <p style={subtitle}>
+      <p className={s.subtitle}>
         학교 전산실의 GPU 데스크톱을
         <br />
         브라우저에서 바로 사용하세요.
       </p>
 
       {error && (
-        <div style={errorBox} className="fade-in">
-          <span style={{ fontSize: "16px" }}>⚠️</span>
+        <div className={s.error}>
+          <span>⚠</span>
           <span>{error}</span>
         </div>
       )}
 
       <button
+        className={s.googleBtn}
         onClick={handleGoogleLogin}
         disabled={loading}
-        className="btn btn-google btn-block"
-        style={{ marginTop: "8px", opacity: loading ? 0.7 : 1, cursor: loading ? "not-allowed" : "pointer" }}
       >
         <GoogleIcon />
-        {loading ? "로그인 중..." : "Google 계정으로 로그인"}
+        {loading ? "로그인 중…" : "Google 계정으로 로그인"}
       </button>
 
-      <div style={hintBox}>
-        <span style={{ color: "var(--text-faint)" }}>학생 계정</span>
-        <span style={{ fontWeight: 600 }}>@ts.hs.kr</span>
-        <span style={{ color: "var(--text-faint)" }}>전용</span>
-      </div>
+      <p className={s.hint}>
+        학생 계정 <b>@ts.hs.kr</b> 전용
+      </p>
     </div>
   );
 }
 
 export default function LoginPage() {
   return (
-    <div className="page center">
+    <div className={s.root}>
+      <div className={s.field} aria-hidden="true" />
       <Suspense>
         <LoginCard />
       </Suspense>
@@ -107,7 +106,7 @@ export default function LoginPage() {
 
 function GoogleIcon() {
   return (
-    <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden>
+    <svg width="20" height="20" viewBox="0 0 48 48" aria-hidden>
       <path
         fill="#EA4335"
         d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
@@ -127,60 +126,3 @@ function GoogleIcon() {
     </svg>
   );
 }
-
-const card: React.CSSProperties = {
-  width: "100%",
-  maxWidth: "400px",
-  padding: "44px 36px 32px",
-  textAlign: "center",
-};
-const logoWrap: React.CSSProperties = {
-  display: "flex",
-  justifyContent: "center",
-  marginBottom: "18px",
-};
-const logoBadge: React.CSSProperties = {
-  width: "64px",
-  height: "64px",
-  borderRadius: "18px",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  fontSize: "30px",
-  background: "linear-gradient(135deg, rgba(124,140,255,0.35), rgba(99,102,241,0.18))",
-  border: "1px solid var(--glass-border-strong)",
-  boxShadow: "0 8px 24px -8px var(--accent-glow)",
-};
-const title: React.CSSProperties = {
-  margin: "0 0 8px",
-  fontSize: "26px",
-  fontWeight: 800,
-  letterSpacing: "-0.5px",
-};
-const subtitle: React.CSSProperties = {
-  margin: "0 0 26px",
-  color: "var(--text-dim)",
-  fontSize: "14.5px",
-  lineHeight: 1.6,
-};
-const errorBox: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: "9px",
-  textAlign: "left",
-  fontSize: "13.5px",
-  color: "#fecdd3",
-  background: "rgba(244,63,94,0.12)",
-  border: "1px solid rgba(251,113,133,0.4)",
-  borderRadius: "12px",
-  padding: "12px 14px",
-  marginBottom: "18px",
-};
-const hintBox: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  gap: "6px",
-  marginTop: "22px",
-  fontSize: "13px",
-};

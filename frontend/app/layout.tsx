@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PC 대여 포털",
+  title: "DSHS 전산실",
   description: "학교 전산실 GPU 데스크톱 대여 시스템",
 };
 
@@ -25,7 +25,8 @@ export default function RootLayout({
           as="style"
           href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css"
         />
-        <meta name="theme-color" content="#0b1031" />
+        <meta name="theme-color" content="#f2f3f5" />
+        <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
       </head>
       <body>{children}</body>
     </html>

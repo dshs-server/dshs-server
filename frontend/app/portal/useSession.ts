@@ -27,6 +27,7 @@ export interface SessionStats {
   storage_pct?: number;
   storage_used_gb?: number;
   storage_total_gb?: number;
+  top_process?: string;
 }
 
 export interface SuspendedSession {
@@ -39,6 +40,7 @@ export interface SuspendedSession {
     cpu_cores?: number;
     ram_gb?: number;
     storage_gb?: number;
+    storage_used_gb?: number;
     gpu?: string;
   };
 }
