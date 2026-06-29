@@ -606,6 +606,38 @@
 .root[data-variant="ivory"] .queueState > div strong { color: #20242a; }
 .root[data-variant="ivory"] .assignment::before { background: rgba(25,31,39,.18); box-shadow: 0 17px rgba(25,31,39,.08), 0 34px rgba(25,31,39,.035); }
 
+/* ── 신청서·확인·업로드 시트: ivory 배경 누락분 보정(다크 배경+다크 글자 가독성 문제 해결) ── */
+.root[data-variant="ivory"] .requestSheet,
+.root[data-variant="ivory"] .uploadSheet {
+  color: #17191c;
+  border-color: rgba(26,31,38,.12);
+  background: radial-gradient(130% 120% at 8% -18%, rgba(255,255,255,.99), transparent 46%), linear-gradient(140deg, rgba(255,255,255,.97), rgba(248,248,247,.94) 56%, rgba(255,255,255,.97));
+  box-shadow: inset 0 1px 0 white, 0 35px 100px rgba(27,32,39,.22);
+}
+.root[data-variant="ivory"] .requestSheet > header,
+.root[data-variant="ivory"] .uploadSheet > header,
+.root[data-variant="ivory"] .formMain,
+.root[data-variant="ivory"] .formGrid,
+.root[data-variant="ivory"] .requestSheet > footer,
+.root[data-variant="ivory"] .uploadSheet > footer { border-color: rgba(25,31,39,.1); }
+.root[data-variant="ivory"] .requestSheet > footer,
+.root[data-variant="ivory"] .uploadSheet > footer { background: rgba(255,255,255,.55); }
+.root[data-variant="ivory"] .requestSheet header h2,
+.root[data-variant="ivory"] .uploadSheet header h2,
+.root[data-variant="ivory"] .selectMachine h3,
+.root[data-variant="ivory"] .workTypes span,
+.root[data-variant="ivory"] .fieldLabel > span,
+.root[data-variant="ivory"] .formMain legend { color: #17191c; }
+.root[data-variant="ivory"] .requestSheet header button,
+.root[data-variant="ivory"] .uploadSheet header button { color: #45484d; }
+.root[data-variant="ivory"] .workTypes small,
+.root[data-variant="ivory"] .selectMachine small,
+.root[data-variant="ivory"] .selectMachine em,
+.root[data-variant="ivory"] .fieldLabel small,
+.root[data-variant="ivory"] .uploadNote { color: rgba(23,25,28,.5); }
+.root[data-variant="ivory"] .workTypes input,
+.root[data-variant="ivory"] .specFields select option { color: #17191c; background: #ffffff; }
+
 /* ── Optical spacing: 글자와 유리 경계 사이의 안전 영역 ────── */
 .root button {
   min-height: 46px;
