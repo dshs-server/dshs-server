@@ -1002,11 +1002,22 @@ async def delete_session(
         await _ssh(node["ip"], f"docker rm -f {container}", _suser)
         await doc.reference.delete()
         await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+        await _send_email(
+            s.get("owner", ""),
+            "[PC대여] 세션이 삭제되었습니다",
+            f"'{s.get('project_name') or session_id}' 세션이 완전히 삭제되었습니다.\n\n- dshs 전산실",
+        )
         return {"message": "세션을 완전히 삭제했습니다."}
 
     await _ssh(node["ip"], f"docker stop {container}", _suser)
     await doc.reference.update({"status": "suspended", "suspended_at": time.time()})
     await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+    await _send_email(
+        s.get("owner", ""),
+        "[PC대여] 세션을 일시중지했습니다",
+        f"'{s.get('project_name') or session_id}' 세션이 일시중지되었습니다.\n"
+        f"포털(https://dshs-app.net)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
+    )
     return {"status": "suspended"}
 
 
