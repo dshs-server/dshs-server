@@ -49,6 +49,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))        # seconds (세
 IDLE_POLL_INTERVAL = int(os.environ.get("IDLE_POLL_INTERVAL", "60"))  # seconds (세션 없는 노드)
 LOG_INTERVAL = int(os.environ.get("LOG_INTERVAL", "600"))             # seconds (10분)
 LOG_DIR = os.path.expanduser(os.environ.get("LOG_DIR", "~/hub/logs"))
+RECOVERY_INTERVAL = int(os.environ.get("RECOVERY_INTERVAL", "60"))  # 노드당 복구 체크 최소 간격 (초)
 
 # 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
 # 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
@@ -79,6 +80,7 @@ COL_USERS = "users"
 #             gpu, top, docker, offline, last_seen}
 _metrics: dict[str, dict] = {}
 _last_polled: dict[str, float] = {}  # node_id → last SSH poll timestamp
+_last_recovery: dict[str, float] = {}  # node_id → last recovery attempt timestamp
 _nodes_cache: list[dict] = []  # populated from Firestore; cleared on admin write to force reload
 NODES_CACHE_FILE = os.path.expanduser("~/hub/nodes_cache.json")
 
@@ -225,6 +227,11 @@ top = sh("ps -eo comm --sort=-%cpu | sed -n '2p'") or None
 kasm_raw = sh("docker ps --filter 'name=kasm_' --format '{{.Names}}'")
 kasm_running = len([x for x in kasm_raw.splitlines() if x.strip()]) if kasm_raw.strip() else 0
 
+# Service status (부팅 후 자동 복구 판단용)
+svc_nginx     = sh('systemctl is-active nginx')
+svc_tunnel    = sh('systemctl is-active kasm-tunnel')
+svc_tailscale = sh('systemctl is-active tailscaled')
+
 print(json.dumps({
     'cpu': cpu,
     'ram_used_gb': round((rt - ra) / 1048576, 1),
@@ -234,6 +241,9 @@ print(json.dumps({
     'gpu': gpu,
     'top': top,
     'kasm_running': kasm_running,
+    'svc_nginx': svc_nginx,
+    'svc_tunnel': svc_tunnel,
+    'svc_tailscale': svc_tailscale,
 }))
 PYEOF"""
 
@@ -277,6 +287,41 @@ async def _collect_metrics(node_id: str, ip: str, ssh_user: str = SSH_USER) -> d
         return {"offline": True}
 
 
+async def _recover_services(node_id: str, node_ip: str, ssh_user: str, metrics: dict) -> None:
+    """메트릭에서 감지된 다운 서비스를 SSH로 자동 재시작한다."""
+    cmds = []
+    nginx_st  = metrics.get("svc_nginx", "")
+    tunnel_st = metrics.get("svc_tunnel", "")
+
+    if nginx_st and nginx_st not in ("active", "activating"):
+        logger.warning("[recover] %s: nginx=%s → restart", node_id, nginx_st)
+        cmds.append("sudo systemctl restart nginx")
+    if tunnel_st and tunnel_st not in ("active", "activating"):
+        logger.warning("[recover] %s: kasm-tunnel=%s → restart", node_id, tunnel_st)
+        cmds.append("sudo systemctl restart kasm-tunnel")
+
+    if cmds:
+        _, rc = await _ssh(node_ip, " && ".join(cmds), ssh_user)
+        logger.info("[recover] %s: 복구 명령 rc=%d  cmds=%s", node_id, rc, cmds)
+
+    # kasm 컨테이너가 exited 상태로 남아있으면 재시작 (--restart unless-stopped 누락 케이스 대비)
+    kasm_running = metrics.get("kasm_running", -1)
+    active_for_node = [
+        (sid, s) for sid, s in _sc_list(status=["active", "starting"])
+        if s.get("node_id") == node_id
+    ]
+    if active_for_node and kasm_running >= 0 and kasm_running < len(active_for_node):
+        for sid, s in active_for_node:
+            container = _container_name(sid)
+            dock = await _docker_status(node_ip, ssh_user, container)
+            if dock == "exited":
+                logger.warning("[recover] %s: %s exited → docker start", node_id, container)
+                _, rc = await _ssh(node_ip, f"docker start {container}", ssh_user)
+                if rc == 0:
+                    _sc_update(sid, {"status": "starting"})
+                    await db.collection(COL_SESSIONS).document(sid).update({"status": "starting"})
+
+
 async def _poll_nodes_loop():
     while True:
         try:
@@ -307,21 +352,21 @@ async def _poll_nodes_loop():
                     else:
                         _metrics[node["id"]] = result
 
-                # Sync session status: starting → active, auto-expire (reuse active_docs)
+                # Sync session status: starting → active, auto-expire
                 now = time.time()
-                for doc in active_docs:
-                    s = doc.to_dict()
+                for sid, s in list(_sc_list(status=["active", "starting"])):
                     nid = s.get("node_id", "")
                     # Auto-expire
                     if s.get("expires_at") and now >= s["expires_at"]:
                         node_ip, node_suser = node_info.get(nid, (None, SSH_USER))
                         if node_ip and not _metrics.get(nid, {}).get("offline"):
-                            await _ssh(node_ip, f"docker stop {_container_name(doc.id)}", node_suser)
-                        await doc.reference.update({"status": "suspended", "suspended_at": now})
+                            await _ssh(node_ip, f"docker stop {_container_name(sid)}", node_suser)
+                        _sc_update(sid, {"status": "suspended", "suspended_at": now})
+                        await db.collection(COL_SESSIONS).document(sid).update({"status": "suspended", "suspended_at": now})
                         await _send_email(
                             s.get("owner", ""),
                             "[PC대여] 세션이 만료되어 일시중지되었습니다",
-                            f"'{s.get('project_name') or doc.id}' 세션이 대여 기간 만료로 자동 일시중지되었습니다.\n"
+                            f"'{s.get('project_name') or sid}' 세션이 대여 기간 만료로 자동 일시중지되었습니다.\n"
                             f"포털(https://dshs-app.net)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
                         )
                         continue
@@ -329,9 +374,23 @@ async def _poll_nodes_loop():
                     if s.get("status") == "starting":
                         node_ip, node_suser = node_info.get(nid, (None, SSH_USER))
                         if node_ip:
-                            dock = await _docker_status(node_ip, node_suser, _container_name(doc.id))
+                            dock = await _docker_status(node_ip, node_suser, _container_name(sid))
                             if dock == "running":
-                                await doc.reference.update({"status": "active"})
+                                _sc_update(sid, {"status": "active"})
+                                await db.collection(COL_SESSIONS).document(sid).update({"status": "active"})
+
+                # 서비스 자동 복구 (온라인 노드, RECOVERY_INTERVAL 간격)
+                now_t = time.time()
+                recovery_tasks = []
+                for node in nodes_to_poll:
+                    m = _metrics.get(node["id"], {})
+                    if not m.get("offline") and now_t - _last_recovery.get(node["id"], 0) >= RECOVERY_INTERVAL:
+                        _last_recovery[node["id"]] = now_t
+                        recovery_tasks.append(
+                            _recover_services(node["id"], node["ip"], node.get("ssh_user", SSH_USER), m)
+                        )
+                if recovery_tasks:
+                    await asyncio.gather(*recovery_tasks, return_exceptions=True)
         except Exception:
             pass
 
@@ -1134,6 +1193,26 @@ async def upload_files(
 
 
 # ── Routes: admin monitoring ──────────────────────────────────────────────────
+
+
+@app.get("/admin/service-health", dependencies=[Depends(require_key)])
+async def admin_service_health():
+    """각 노드의 서비스(nginx·kasm-tunnel·tailscaled) 상태 반환. 메트릭 캐시 기반."""
+    nodes = await _get_nodes()
+    result = []
+    for n in nodes:
+        m = _metrics.get(n["id"], {})
+        result.append({
+            "id": n["id"],
+            "name": n.get("name", n["id"]),
+            "online": not m.get("offline", True),
+            "svc_nginx": m.get("svc_nginx", "unknown"),
+            "svc_tunnel": m.get("svc_tunnel", "unknown"),
+            "svc_tailscale": m.get("svc_tailscale", "unknown"),
+            "kasm_running": m.get("kasm_running", 0),
+            "last_seen": m.get("last_seen"),
+        })
+    return {"nodes": result}
 
 
 @app.get("/admin/nodes", dependencies=[Depends(require_key)])
