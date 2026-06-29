@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import s from "./atelier.module.css";
 import { Overlay, Field, HelpTip } from "./ui";
 import { nodeState, type NodeInfo } from "./useNodes";
@@ -38,9 +38,10 @@ export default function RequestSheet({
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
   useEffect(() => {
+    if (selectedNodeId !== null) return; // 이미 선택된 경우 유지
     const selectable = nodes.filter((n) => nodeState(n) !== "active");
     if (selectable.length === 1) setSelectedNodeId(selectable[0].id);
-  }, [nodes]);
+  }, [nodes, selectedNodeId]);
 
   function addMember() {
     const email = memberInput.trim().toLowerCase();
@@ -204,36 +205,14 @@ export default function RequestSheet({
             </div>
           </div>
 
-          <aside className={s.selectMachine}>
-            <div className={s.titleLine}>
-              <h3>장비 선택</h3>
-              <HelpTip text="요청 사양을 만족하는 장비만 선택할 수 있습니다." />
-            </div>
-            {nodes.length === 0 && <p>연결된 PC가 없습니다.</p>}
-            {nodes.map((node, index) => {
-              const st = nodeState(node);
-              const ok = meets(node) && st !== "active";
-              return (
-                <button
-                  key={node.id}
-                  disabled={!ok}
-                  data-on={selectedNodeId === node.id}
-                  onClick={() => ok && setSelectedNodeId(node.id)}
-                >
-                  <span>{String(index + 1).padStart(2, "0")}</span>
-                  <div>
-                    <strong>{node.name || node.id}</strong>
-                    <small>
-                      {node.gpu}
-                      <br />
-                      {node.ram_gb}GB · {node.storage_gb}GB
-                    </small>
-                  </div>
-                  <em>{st === "active" ? "사용 중" : meets(node) ? "선택 가능" : "사양 부족"}</em>
-                </button>
-              );
-            })}
-          </aside>
+          <SelectMachine
+            nodes={nodes}
+            cpu={cpu}
+            ram={ram}
+            storage={storage}
+            selectedNodeId={selectedNodeId}
+            onSelect={setSelectedNodeId}
+          />
         </div>
 
         <footer>
@@ -258,3 +237,57 @@ export default function RequestSheet({
 function workTypeLabel(key: string) {
   return WORK_TYPES.find((t) => t.key === key)?.label ?? "일반";
 }
+
+const SelectMachine = memo(function SelectMachine({
+  nodes,
+  cpu,
+  ram,
+  storage,
+  selectedNodeId,
+  onSelect,
+}: {
+  nodes: NodeInfo[];
+  cpu: number;
+  ram: number;
+  storage: number;
+  selectedNodeId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const meets = (node: NodeInfo) =>
+    (node.cpu_cores == null || node.cpu_cores >= cpu) &&
+    node.ram_gb >= ram &&
+    node.storage_gb >= storage;
+
+  return (
+    <aside className={s.selectMachine}>
+      <div className={s.titleLine}>
+        <h3>장비 선택</h3>
+        <HelpTip text="요청 사양을 만족하는 장비만 선택할 수 있습니다." />
+      </div>
+      {nodes.length === 0 && <p>연결된 PC가 없습니다.</p>}
+      {nodes.map((node, index) => {
+        const st = nodeState(node);
+        const ok = meets(node) && st !== "active";
+        return (
+          <button
+            key={node.id}
+            disabled={!ok}
+            data-on={selectedNodeId === node.id}
+            onClick={() => ok && onSelect(node.id)}
+          >
+            <span>{String(index + 1).padStart(2, "0")}</span>
+            <div>
+              <strong>{node.name || node.id}</strong>
+              <small>
+                {node.gpu}
+                <br />
+                {node.ram_gb}GB · {node.storage_gb}GB
+              </small>
+            </div>
+            <em>{st === "active" ? "사용 중" : meets(node) ? "선택 가능" : "사양 부족"}</em>
+          </button>
+        );
+      })}
+    </aside>
+  );
+});

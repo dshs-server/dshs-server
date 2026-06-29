@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export interface NodeInfo {
   id: string;
@@ -18,6 +18,7 @@ export interface NodeInfo {
 export function useNodes(pollMs = 8000) {
   const [nodes, setNodes] = useState<NodeInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const prevKeyRef = useRef<string>("");
 
   useEffect(() => {
     let alive = true;
@@ -26,7 +27,15 @@ export function useNodes(pollMs = 8000) {
         const r = await fetch("/api/nodes");
         if (r.ok) {
           const d = await r.json();
-          if (alive) setNodes(d.nodes || []);
+          const fresh: NodeInfo[] = d.nodes || [];
+          // 실제 변경이 있을 때만 state 업데이트 — 폴링마다 새 배열 참조 생성 방지
+          const key = JSON.stringify(fresh.map((n) => ({
+            id: n.id, av: n.available, ss: n.session_state,
+          })));
+          if (alive && key !== prevKeyRef.current) {
+            prevKeyRef.current = key;
+            setNodes(fresh);
+          }
         }
       } catch {
         // keep last

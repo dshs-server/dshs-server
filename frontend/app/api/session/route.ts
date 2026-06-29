@@ -65,8 +65,14 @@ export async function POST(request: Request) {
 
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      // 409 = 다른 사용자가 점유 중 (detail 안에 owner/queue_position)
+      // 409 = 다른 사용자가 점유 중(객체) or 컨테이너 없음(문자열)
       if (res.status === 409) {
+        if (typeof data.detail === "string") {
+          return NextResponse.json(
+            { error: data.detail, container_gone: true },
+            { status: 409 }
+          );
+        }
         const d = data.detail || {};
         return NextResponse.json(
           { error: "사용 중", owner: d.owner, queue_position: d.queue_position },

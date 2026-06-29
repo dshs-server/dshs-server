@@ -55,7 +55,7 @@ export default function WorkPage({
     <div className={s.enter}>
       <div className={s.pageTitle}>
         <div className={s.titleLine}>
-          <h1>DSHS 전산실</h1>
+          <h1>내 작업</h1>
           <HelpTip text="배정된 PC와 보관 중인 환경을 확인합니다." />
         </div>
         {date && <span className={s.pageTitleDate}>{date}</span>}

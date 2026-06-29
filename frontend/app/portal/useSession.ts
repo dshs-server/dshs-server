@@ -94,7 +94,7 @@ export function useSession() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [elapsed, setElapsed] = useState(0);
+  const elapsedRef = useRef(0); // state로 두면 1초마다 전체 리렌더링 유발
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [remaining, setRemaining] = useState<number | null>(null);
   const [owner, setOwner] = useState<string | null>(null);
@@ -193,10 +193,10 @@ export function useSession() {
       setStatus("starting");
       setErrorMsg(null);
       setUrl(null);
-      setElapsed(0);
+      elapsedRef.current = 0;
       setSessionId(null);
       expiredRef.current = false;
-      timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
+      timerRef.current = setInterval(() => { elapsedRef.current += 1; }, 1000);
 
       try {
         const body = {
@@ -263,17 +263,26 @@ export function useSession() {
       setStatus("starting");
       setErrorMsg(null);
       setUrl(null);
-      setElapsed(0);
+      elapsedRef.current = 0;
       setSessionId(null);
       expiredRef.current = false;
-      timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
+      timerRef.current = setInterval(() => { elapsedRef.current += 1; }, 1000);
 
       try {
         const extra =
           suspendedId !== "default" ? `&session_id=${encodeURIComponent(suspendedId)}` : "";
         const res = await fetch(`/api/session?resume=true${extra}`, { method: "POST" });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "세션 재시작 실패");
+        if (!res.ok) {
+          if (res.status === 409 && data.container_gone) {
+            setSuspendedSessions((prev) => prev.filter((x) => x.id !== suspendedId));
+            setStatus("idle");
+            clearIntervals();
+            toast(data.error || "저장된 작업 파일이 없습니다. 새로 시작해주세요.", "error");
+            return;
+          }
+          throw new Error(data.error || "세션 재시작 실패");
+        }
         setSuspendedSessions((prev) => {
           const item = prev.find((x) => x.id === suspendedId);
           if (item) {
@@ -509,15 +518,12 @@ export function useSession() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const progressPct = Math.min(elapsed * 3, 92);
-
   return {
     status,
     setStatus,
     sessionId,
     url,
     errorMsg,
-    elapsed,
     expiresAt,
     remaining,
     owner,
@@ -527,7 +533,6 @@ export function useSession() {
     notice,
     suspendedSessions,
     activeMeta,
-    progressPct,
     showNewSessionModal,
     setShowNewSessionModal,
     replaceSessionId,

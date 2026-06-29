@@ -47,7 +47,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   const onlineCount = nodes.filter((n) => nodeOnline(n)).length;
 
   return (
-    <div className={s.root} data-variant="ivory">
+    <div className={s.root} data-variant="ivory" data-modal={ctrl.showNewSessionModal || undefined}>
       <div className={s.field} aria-hidden="true">
         <i />
         <i />

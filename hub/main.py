@@ -267,7 +267,8 @@ async def _ssh(host: str, command: str, ssh_user: str = SSH_USER) -> tuple[str, 
             connect_timeout=10,
         ) as conn:
             r = await conn.run(command)
-            return (r.stdout or "").strip(), r.returncode or 0
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            return out, r.returncode or 0
     except Exception:
         return "", -1
 
@@ -1025,6 +1026,23 @@ async def create_session(
         _suser = node.get("ssh_user", SSH_USER)
 
         container = _container_name(target_sid)
+
+        # 컨테이너 존재 확인
+        inspect_out, inspect_rc = await _ssh(
+            node["ip"],
+            f"docker inspect --format={{{{.State.Status}}}} {container} 2>/dev/null",
+            _suser,
+        )
+        if inspect_rc == -1:
+            raise HTTPException(status_code=503, detail="노드 서버 연결 실패. 잠시 후 다시 시도하세요.")
+        if inspect_rc != 0 or not inspect_out:
+            _sc_del(target_sid)
+            try:
+                await db.collection(COL_SESSIONS).document(target_sid).delete()
+            except Exception:
+                pass
+            raise HTTPException(status_code=409, detail="저장된 작업 파일이 더 이상 존재하지 않습니다. 새로 시작해주세요.")
+
         stdout, rc = await _ssh(node["ip"], f"docker start {container}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
