@@ -36,6 +36,8 @@ export interface SuspendedSession {
   saved_at?: number;
   delete_after?: number;
   team_members?: string[];
+  original_created_at?: number;
+  extend_blocked?: boolean;
   resources?: {
     cpu_cores?: number;
     ram_gb?: number;
@@ -71,6 +73,8 @@ export interface SessionData {
   node_name?: string;
   node_gpu?: string;
   node_ip?: string;
+  original_created_at?: number;
+  extend_blocked?: boolean;
 }
 
 export interface ActiveMeta {
@@ -106,6 +110,7 @@ export function useSession() {
   const [activeMeta, setActiveMeta] = useState<ActiveMeta>({});
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [replaceSessionId, setReplaceSessionId] = useState<string | null>(null);
+  const [extendBlocked, setExtendBlocked] = useState(false);
 
   const captureMeta = useCallback((data: SessionData) => {
     setActiveMeta({
@@ -137,6 +142,7 @@ export function useSession() {
     if (data.owner) setOwner(data.owner);
     if (typeof data.queue_position === "number") setQueuePos(data.queue_position);
     if (Array.isArray(data.suspended_sessions)) setSuspendedSessions(data.suspended_sessions);
+    if (typeof data.extend_blocked === "boolean") setExtendBlocked(data.extend_blocked);
   }, []);
 
   const startStatsPolling = useCallback((sid: string) => {
@@ -259,7 +265,7 @@ export function useSession() {
   );
 
   const handleResume = useCallback(
-    async (suspendedId: string) => {
+    async (suspendedId: string, durationDays: number) => {
       setStatus("starting");
       setErrorMsg(null);
       setUrl(null);
@@ -271,7 +277,11 @@ export function useSession() {
       try {
         const extra =
           suspendedId !== "default" ? `&session_id=${encodeURIComponent(suspendedId)}` : "";
-        const res = await fetch(`/api/session?resume=true${extra}`, { method: "POST" });
+        const res = await fetch(`/api/session?resume=true${extra}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ duration_days: durationDays }),
+        });
         const data = await res.json();
         if (!res.ok) {
           if (res.status === 409 && data.container_gone) {
@@ -285,9 +295,7 @@ export function useSession() {
         }
         setSuspendedSessions((prev) => {
           const item = prev.find((x) => x.id === suspendedId);
-          if (item) {
-            setActiveMeta({ project_name: item.project_name });
-          }
+          if (item) setActiveMeta({ project_name: item.project_name });
           return prev.filter((x) => x.id !== suspendedId);
         });
         applyData(data);
@@ -337,6 +345,30 @@ export function useSession() {
     },
     [sessionId, clearIntervals, toast]
   );
+
+  const handleExtend = useCallback(async () => {
+    const sid = sessionId;
+    if (!sid) return;
+    try {
+      const res = await fetch(`/api/session/${sid}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ extend_days: 3 }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast(data.error || "연장에 실패했습니다.", "error");
+        return;
+      }
+      if (typeof data.expires_at === "number") {
+        setExpiresAt(data.expires_at);
+        // 연장 후 새 total 계산 → extendBlocked 재계산은 다음 poll/applyData에서 처리
+      }
+      toast("세션이 3일 연장되었습니다.", "success");
+    } catch {
+      toast("연장 중 오류가 발생했습니다.", "error");
+    }
+  }, [sessionId, toast]);
 
   const handlePermanentDelete = useCallback(
     async (id: string) => {
@@ -540,9 +572,11 @@ export function useSession() {
     handleStartNew,
     handleResume,
     handleTerminate,
+    handleExtend,
     handlePermanentDelete,
     handleCheckAvailability,
     handleLogout,
+    extendBlocked,
   };
 }
 
