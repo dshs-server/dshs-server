@@ -68,11 +68,7 @@ export default function RequestSheet({
   const meets = (node: NodeInfo) =>
     (node.cpu_cores == null || node.cpu_cores >= cpu) &&
     node.ram_gb >= ram &&
-    node.storage_gb >= storage &&
-    (node.resource_used == null || node.cpu_cores == null || node.cpu_cores === 0 ||
-      (node.resource_used.cpu_cores + cpu) / node.cpu_cores <= 0.9) &&
-    (node.resource_used == null || node.ram_gb === 0 ||
-      (node.resource_used.ram_gb + ram) / node.ram_gb <= 0.9);
+    node.storage_gb >= storage;
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId);
   const selectedOk = selectedNode ? meets(selectedNode) && nodeState(selectedNode) !== "active" : false;
@@ -286,11 +282,7 @@ const SelectMachine = memo(function SelectMachine({
   const meets = (node: NodeInfo) =>
     (node.cpu_cores == null || node.cpu_cores >= cpu) &&
     node.ram_gb >= ram &&
-    node.storage_gb >= storage &&
-    (node.resource_used == null || node.cpu_cores == null || node.cpu_cores === 0 ||
-      (node.resource_used.cpu_cores + cpu) / node.cpu_cores <= 0.9) &&
-    (node.resource_used == null || node.ram_gb === 0 ||
-      (node.resource_used.ram_gb + ram) / node.ram_gb <= 0.9);
+    node.storage_gb >= storage;
 
   return (
     <aside className={s.selectMachine}>

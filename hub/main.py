@@ -618,6 +618,26 @@ async def _docker_status(ip: str, ssh_user: str, container: str) -> str:
 def _container_name(session_id: str) -> str:
     return f"kasm_{session_id}"
 
+
+def _resource_limits_for_node(node: dict, n_sessions: int) -> tuple[float, float]:
+    """노드 90% 용량을 n_sessions 등분. (cpu_per, ram_gb_per) 반환."""
+    if n_sessions <= 0:
+        return (0.0, 0.0)
+    cpu_per = round(node.get("cpu_cores", 0) * 0.9 / n_sessions, 2)
+    ram_per = round(node.get("ram_gb", 0) * 0.9 / n_sessions, 1)
+    return (cpu_per, ram_per)
+
+
+async def _update_node_container_limits(
+    node_ip: str, ssh_user: str, containers: list[str], cpu: float, ram_gb: float
+) -> None:
+    """실행 중인 컨테이너들에 docker update로 리소스 한도 재적용."""
+    if not containers or cpu <= 0 or ram_gb <= 0:
+        return
+    names = " ".join(containers)
+    cmd = f"docker update --cpus {cpu} --memory {ram_gb}g {names} 2>&1 || true"
+    await _ssh(node_ip, cmd, ssh_user)
+
 def _session_url(session_id: str, kasm_url: str) -> str:
     return f"{kasm_url.rstrip('/')}/{session_id}/?path={session_id}/websockify"
 
@@ -1208,18 +1228,10 @@ async def create_session(
 
     node = await _get_node(node_id)
 
-    # Per-node capacity check (also runs when node_id was explicitly provided)
-    node_active = [s for _, s in _sc_list(status=["active", "starting"]) if s.get("node_id") == node_id]
-    if len(node_active) >= 2:
+    # Per-node capacity check: 최대 2 세션
+    node_active_sids = [(sid, s) for sid, s in _sc_list(status=["active", "starting"]) if s.get("node_id") == node_id]
+    if len(node_active_sids) >= 2:
         raise HTTPException(status_code=503, detail="해당 PC가 꽉 찼습니다. 다른 PC를 선택해주세요.")
-    used_cpu = sum((s.get("resources") or {}).get("cpu_cores", 0) for s in node_active)
-    used_ram = sum((s.get("resources") or {}).get("ram_gb", 0) for s in node_active)
-    cpu_total = node.get("cpu_cores", 0)
-    ram_total = node.get("ram_gb", 0)
-    if cpu_total > 0 and req_cpu > 0 and (used_cpu + req_cpu) / cpu_total > 0.9:
-        raise HTTPException(status_code=503, detail="CPU 용량 초과 (90% 제한). 다른 PC를 선택해주세요.")
-    if ram_total > 0 and req_ram > 0 and (used_ram + req_ram) / ram_total > 0.9:
-        raise HTTPException(status_code=503, detail="메모리 용량 초과 (90% 제한). 다른 PC를 선택해주세요.")
     _suser = node.get("ssh_user", SSH_USER)
     kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
 
@@ -1235,12 +1247,10 @@ async def create_session(
         _suser,
     )
 
-    # 하드 리소스 제한: 신청값을 Docker에 직접 적용 → 컨테이너 이용률 합 ≤ 90% 보장
-    resource_flags = ""
-    if req_cpu > 0:
-        resource_flags += f"--cpus {req_cpu} "
-    if req_ram > 0:
-        resource_flags += f"--memory {req_ram}g "
+    # 등분 리소스 한도: (기존 세션 수 + 1)로 노드 90% 용량 나눔
+    n_after = len(node_active_sids) + 1
+    cpu_per, ram_per = _resource_limits_for_node(node, n_after)
+    resource_flags = f"--cpus {cpu_per} --memory {ram_per}g " if cpu_per > 0 and ram_per > 0 else ""
 
     cmd = (
         f"docker run -d --name {container} --restart unless-stopped "
@@ -1287,6 +1297,11 @@ async def create_session(
     }
     _sc_set(new_id, session_data)
     await db.collection(COL_SESSIONS).document(new_id).set(session_data)
+
+    # 기존 컨테이너들도 동일 한도로 축소 (새 세션 포함 n_after 등분)
+    if node_active_sids:
+        existing_containers = [_container_name(sid) for sid, _ in node_active_sids]
+        await _update_node_container_limits(node["ip"], _suser, existing_containers, cpu_per, ram_per)
 
     await _nginx_update(node_id, node["ip"], _suser, kasm_url)
     await _log_activity(
@@ -1411,6 +1426,11 @@ async def delete_session(
         _sc_del(session_id)
         await db.collection(COL_SESSIONS).document(session_id).delete()
         await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+        # 남은 활성 컨테이너 한도 확장
+        remaining = [(sid, ss) for sid, ss in _sc_list(status=["active", "starting"]) if ss.get("node_id") == s["node_id"]]
+        if remaining:
+            cpu_per, ram_per = _resource_limits_for_node(node, len(remaining))
+            await _update_node_container_limits(node["ip"], _suser, [_container_name(sid) for sid, _ in remaining], cpu_per, ram_per)
         await _log_activity(
             s.get("owner", me),
             "session_delete",
@@ -1431,6 +1451,11 @@ async def delete_session(
     _sc_update(session_id, {"status": "suspended", "suspended_at": time.time()})
     await db.collection(COL_SESSIONS).document(session_id).update({"status": "suspended", "suspended_at": time.time()})
     await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+    # 중지된 컨테이너는 리소스 반납 → 남은 활성 컨테이너 한도 확장
+    remaining = [(sid, ss) for sid, ss in _sc_list(status=["active", "starting"]) if ss.get("node_id") == s["node_id"]]
+    if remaining:
+        cpu_per, ram_per = _resource_limits_for_node(node, len(remaining))
+        await _update_node_container_limits(node["ip"], _suser, [_container_name(sid) for sid, _ in remaining], cpu_per, ram_per)
     await _log_activity(
         s.get("owner", me),
         "session_suspend",
