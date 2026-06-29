@@ -51,6 +51,10 @@ LOG_INTERVAL = int(os.environ.get("LOG_INTERVAL", "600"))             # seconds 
 LOG_DIR = os.path.expanduser(os.environ.get("LOG_DIR", "~/hub/logs"))
 RECOVERY_INTERVAL = int(os.environ.get("RECOVERY_INTERVAL", "60"))  # 노드당 복구 체크 최소 간격 (초)
 
+KST_OFFSET = 9 * 3600  # KST = UTC+9
+REBOOT_UPTIME_DAYS = int(os.environ.get("REBOOT_UPTIME_DAYS", "5"))    # 재부팅 임계 가동 일수
+REBOOT_VERIFY_TIMEOUT = int(os.environ.get("REBOOT_VERIFY_TIMEOUT", "600"))  # 재부팅 후 검증 최대 대기(초)
+
 # 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
 # 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
 SHARED_BASE = os.environ.get("SHARED_BASE", "")
@@ -82,6 +86,7 @@ COL_ACTIVITY = "activity"
 _metrics: dict[str, dict] = {}
 _last_polled: dict[str, float] = {}  # node_id → last SSH poll timestamp
 _last_recovery: dict[str, float] = {}  # node_id → last recovery attempt timestamp
+_reboot_pending: dict[str, float] = {}  # node_id → reboot_sent_at timestamp
 _nodes_cache: list[dict] = []  # populated from Firestore; cleared on admin write to force reload
 NODES_CACHE_FILE = os.path.expanduser("~/hub/nodes_cache.json")
 
@@ -233,6 +238,9 @@ svc_nginx     = sh('systemctl is-active nginx')
 svc_tunnel    = sh('systemctl is-active kasm-tunnel')
 svc_tailscale = sh('systemctl is-active tailscaled')
 
+# 가동 시간 (/proc/uptime 첫 번째 숫자 = 부팅 후 초)
+uptime_s = float(open('/proc/uptime').readline().split()[0])
+
 print(json.dumps({
     'cpu': cpu,
     'ram_used_gb': round((rt - ra) / 1048576, 1),
@@ -245,6 +253,7 @@ print(json.dumps({
     'svc_nginx': svc_nginx,
     'svc_tunnel': svc_tunnel,
     'svc_tailscale': svc_tailscale,
+    'uptime_seconds': round(uptime_s),
 }))
 PYEOF"""
 
@@ -548,17 +557,102 @@ async def _email_notification_loop():
         await asyncio.sleep(EMAIL_CHECK_INTERVAL)
 
 
+# ── Reboot loop ───────────────────────────────────────────────────────────────
+
+
+def _seconds_until_3am_kst() -> float:
+    """다음 KST 03:00까지 남은 초."""
+    kst_3am = 3 * 3600
+    now_kst_in_day = (time.time() + KST_OFFSET) % 86400
+    if now_kst_in_day < kst_3am:
+        return kst_3am - now_kst_in_day
+    return 86400 - now_kst_in_day + kst_3am
+
+
+async def _verify_node_after_reboot(node_id: str, node_ip: str, ssh_user: str) -> None:
+    """재부팅 후 tailscale·nginx·kasm-tunnel 정상 작동 확인. 30초마다 폴링."""
+    logger.info("[reboot] %s: 재부팅 후 서비스 확인 시작 (최대 %ds)", node_id, REBOOT_VERIFY_TIMEOUT)
+    deadline = time.time() + REBOOT_VERIFY_TIMEOUT
+    while time.time() < deadline:
+        await asyncio.sleep(30)
+        m = await _collect_metrics(node_id, node_ip, ssh_user)
+        if m.get("offline"):
+            continue
+        _metrics[node_id] = m
+        nginx_ok     = m.get("svc_nginx") == "active"
+        tunnel_ok    = m.get("svc_tunnel") == "active"
+        tailscale_ok = m.get("svc_tailscale") == "active"
+        if nginx_ok and tunnel_ok and tailscale_ok:
+            logger.info(
+                "[reboot] %s: 재부팅 완료 — 모든 서비스 정상 (가동 %.0fs)",
+                node_id, m.get("uptime_seconds", 0),
+            )
+            _reboot_pending.pop(node_id, None)
+            return
+        # 아직 미기동 서비스 재시작 시도
+        cmds = []
+        if not nginx_ok:
+            cmds.append("sudo systemctl start nginx")
+        if not tunnel_ok:
+            cmds.append("sudo systemctl start kasm-tunnel")
+        if cmds:
+            logger.warning("[reboot] %s: 부팅 후 서비스 불완전 — 재시작 시도", node_id)
+            await _ssh(node_ip, " && ".join(cmds), ssh_user)
+    logger.error("[reboot] %s: 서비스 확인 타임아웃 (%ds 경과)", node_id, REBOOT_VERIFY_TIMEOUT)
+    _reboot_pending.pop(node_id, None)
+
+
+async def _reboot_loop() -> None:
+    """매일 KST 03:00에 REBOOT_UPTIME_DAYS일 이상 가동된 유휴 노드를 재부팅한다."""
+    while True:
+        wait = _seconds_until_3am_kst()
+        logger.info("[reboot] 다음 재부팅 점검까지 %.0f초 대기 (KST 03:00)", wait)
+        await asyncio.sleep(wait)
+        try:
+            nodes = await _get_nodes()
+            threshold = REBOOT_UPTIME_DAYS * 86400
+            for node in nodes:
+                nid      = node["id"]
+                node_ip  = node["ip"]
+                ssh_user = node.get("ssh_user", SSH_USER)
+
+                # 활성·시작 중 세션 있으면 건너뜀
+                active = [s for _, s in _sc_list(status=["active", "starting"]) if s.get("node_id") == nid]
+                if active:
+                    logger.info("[reboot] %s: 활성 세션 %d개 → 건너뜀", nid, len(active))
+                    continue
+
+                m = _metrics.get(nid, {})
+                if m.get("offline"):
+                    logger.info("[reboot] %s: 오프라인 → 건너뜀", nid)
+                    continue
+
+                uptime_s = m.get("uptime_seconds", 0)
+                if uptime_s < threshold:
+                    logger.info("[reboot] %s: 가동 %.1f일 < %d일 → 건너뜀", nid, uptime_s / 86400, REBOOT_UPTIME_DAYS)
+                    continue
+
+                logger.info("[reboot] %s: 가동 %.1f일 ≥ %d일, 세션 없음 → 재부팅 명령 전송", nid, uptime_s / 86400, REBOOT_UPTIME_DAYS)
+                await _ssh(node_ip, "sudo reboot", ssh_user)
+                _reboot_pending[nid] = time.time()
+                asyncio.create_task(_verify_node_after_reboot(nid, node_ip, ssh_user))
+        except Exception as e:
+            logger.error("[reboot] 루프 오류: %s", e)
+        await asyncio.sleep(60)  # 실행 직후 1분 대기 후 다음 루프에서 다음 3시까지 재슬립
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _init_sessions_cache()
-    poll_task = asyncio.create_task(_poll_nodes_loop())
-    log_task = asyncio.create_task(_log_loop())
-    email_task = asyncio.create_task(_email_notification_loop())
+    poll_task   = asyncio.create_task(_poll_nodes_loop())
+    log_task    = asyncio.create_task(_log_loop())
+    email_task  = asyncio.create_task(_email_notification_loop())
+    reboot_task = asyncio.create_task(_reboot_loop())
     yield
-    for t in (poll_task, log_task, email_task):
+    for t in (poll_task, log_task, email_task, reboot_task):
         t.cancel()
         try:
             await t
@@ -1675,6 +1769,7 @@ async def admin_nodes():
             "storage_used_gb": m.get("storage_used_gb", 0),
             "storage_total_gb": m.get("storage_total_gb") or n.get("storage_gb", 0),
             "top_process": m.get("top"),
+            "uptime_seconds": m.get("uptime_seconds"),
         }
 
         if n["id"] in active_by_node:

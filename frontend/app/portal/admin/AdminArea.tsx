@@ -20,6 +20,7 @@ interface NodeStatus {
   storage_used_gb?: number;
   storage_total_gb?: number;
   top_process?: string;
+  uptime_seconds?: number;
 }
 
 interface AdminStatusData {
@@ -363,6 +364,10 @@ export default function AdminArea() {
                     <div>
                       <dt>저장</dt>
                       <dd>{n.storage_total_gb ? `${(n.storage_used_gb ?? 0).toFixed(0)}/${n.storage_total_gb}G` : "—"}</dd>
+                    </div>
+                    <div>
+                      <dt>가동</dt>
+                      <dd>{formatUptime(n.uptime_seconds)}</dd>
                     </div>
                   </dl>
                 </div>
@@ -756,4 +761,12 @@ function sessionStatusLabel(st?: string) {
   if (st === "starting") return "준비 중";
   if (st === "suspended") return "보관됨";
   return st || "—";
+}
+
+function formatUptime(seconds?: number): string {
+  if (!seconds || seconds <= 0) return "—";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  if (d > 0) return `${d}일 ${h}h`;
+  return `${h}시간`;
 }
