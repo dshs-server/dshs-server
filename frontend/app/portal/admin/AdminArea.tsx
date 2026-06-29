@@ -42,6 +42,9 @@ interface AdminSession {
   status?: string;
   expires_at?: number;
   suspended_at?: number;
+  original_created_at?: number;
+  extend_blocked?: boolean;
+  extend_unlocked?: boolean;
 }
 
 interface StoppedContainer {
@@ -76,6 +79,11 @@ export default function AdminArea() {
   const [logDate, setLogDate] = useState("");
   const [logLoading, setLogLoading] = useState(false);
   const [terminateConfirmId, setTerminateConfirmId] = useState<string | null>(null);
+  const [behalfEmail, setBehalfEmail] = useState("");
+  const [behalfProject, setBehalfProject] = useState("");
+  const [behalfDuration, setBehalfDuration] = useState(7);
+  const [behalfNodeId, setBehalfNodeId] = useState("");
+  const [adminNodes2, setAdminNodes2] = useState<{ id: string; name?: string }[]>([]);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -111,6 +119,15 @@ export default function AdminArea() {
       setContainersLoading(false);
     }
   }, []);
+  const loadAdminNodes2 = useCallback(async () => {
+    try {
+      const r = await fetch("/api/nodes");
+      if (r.ok) {
+        const d = await r.json();
+        setAdminNodes2((d.nodes || []).map((n: { id: string; name?: string }) => ({ id: n.id, name: n.name })));
+      }
+    } catch {}
+  }, []);
   const loadLog = useCallback(async (date?: string) => {
     setLogLoading(true);
     try {
@@ -134,6 +151,7 @@ export default function AdminArea() {
     loadSessions();
     loadContainers();
     loadLog();
+    loadAdminNodes2();
     fetch("/api/notice")
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => d?.notice && setNotice(d.notice))
@@ -143,7 +161,7 @@ export default function AdminArea() {
       loadNodes();
     }, 4000);
     return () => clearInterval(iv);
-  }, [loadStatus, loadNodes, loadUsers, loadSessions, loadContainers, loadLog]);
+  }, [loadStatus, loadNodes, loadUsers, loadSessions, loadContainers, loadLog, loadAdminNodes2]);
 
   async function doAction(action: string, label: string) {
     setBusy(true);
@@ -159,6 +177,63 @@ export default function AdminArea() {
         loadNodes();
         loadSessions();
       } else toast(`${label} 실패`, "error");
+    } catch {
+      toast("백엔드 연결 실패", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unlockExtend(sessionId: string) {
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/admin/sessions?session_id=${encodeURIComponent(sessionId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ extend_unlocked: true }),
+      });
+      if (r.ok) {
+        toast("연장 허가 완료", "success");
+        loadSessions();
+      } else {
+        const d = await r.json().catch(() => ({}));
+        toast(d.error || "허가 실패", "error");
+      }
+    } catch {
+      toast("백엔드 연결 실패", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createBehalfSession() {
+    if (!behalfEmail.trim() || !behalfProject.trim()) {
+      toast("이메일과 작업 이름을 입력하세요.", "error");
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await fetch("/api/admin/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          behalf_of: behalfEmail.trim().toLowerCase(),
+          project_name: behalfProject.trim(),
+          duration_days: behalfDuration,
+          node_id: behalfNodeId || undefined,
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) {
+        toast(`${behalfEmail}의 세션을 생성했습니다.`, "success");
+        setBehalfEmail("");
+        setBehalfProject("");
+        setBehalfDuration(7);
+        setBehalfNodeId("");
+        loadSessions();
+      } else {
+        toast(d.error || "생성 실패", "error");
+      }
     } catch {
       toast("백엔드 연결 실패", "error");
     } finally {
@@ -329,9 +404,7 @@ export default function AdminArea() {
           <AdminTable title="세션 관리" headers={["작업", "사용자", "장비", "상태", "만료", ""]}>
             {sessions.filter((se) => se.status !== "suspended").length === 0 ? (
               <div className={s.adminRow}>
-                <span>
-                  <strong>활성 세션이 없습니다.</strong>
-                </span>
+                <span><strong>활성 세션이 없습니다.</strong></span>
               </div>
             ) : (
               sessions
@@ -340,29 +413,90 @@ export default function AdminArea() {
                   <div className={s.adminRow} key={se.id}>
                     <span>
                       <strong>{se.project_name || "세션"}</strong>
+                      {se.extend_blocked && (
+                        <small style={{ color: "#d8b365", marginLeft: "6px" }}>40일 초과</small>
+                      )}
                     </span>
                     <span>{se.owner || "—"}</span>
                     <span>{se.node_name || se.node_id || "—"}</span>
                     <span>{sessionStatusLabel(se.status)}</span>
                     <span>{formatDateTime(se.expires_at)}</span>
-                    <button
-                      onClick={() => setTerminateConfirmId(se.id)}
-                      disabled={busy}
-                      style={{ color: "#e53e3e" }}
-                    >
-                      강제 종료
-                    </button>
+                    <div style={{ display: "flex", gap: "6px" }}>
+                      {se.extend_blocked && !se.extend_unlocked && (
+                        <button
+                          onClick={() => unlockExtend(se.id)}
+                          disabled={busy}
+                          style={{ color: "#a78bfa" }}
+                        >
+                          연장 허가
+                        </button>
+                      )}
+                      <button
+                        onClick={() => setTerminateConfirmId(se.id)}
+                        disabled={busy}
+                        style={{ color: "#e53e3e" }}
+                      >
+                        강제 종료
+                      </button>
+                    </div>
                   </div>
                 ))
             )}
           </AdminTable>
+
+          {/* 대리 신청 폼 */}
+          <section className={s.opsSheet} style={{ marginTop: "14px", padding: "20px 22px" }}>
+            <div className={s.blockHeading}>
+              <h2>대리 세션 신청</h2>
+            </div>
+            <p style={{ margin: "0 0 16px", color: "var(--faint)", fontSize: "12px" }}>
+              관리자가 특정 학생 계정으로 세션을 개설합니다.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+              <Field label="학생 이메일 (@ts.hs.kr)">
+                <input
+                  value={behalfEmail}
+                  onChange={(e) => setBehalfEmail(e.target.value)}
+                  placeholder="ts250000@ts.hs.kr"
+                />
+              </Field>
+              <Field label="작업 이름">
+                <input
+                  value={behalfProject}
+                  onChange={(e) => setBehalfProject(e.target.value)}
+                  placeholder="프로젝트명"
+                />
+              </Field>
+              <Field label="유지 기간 (일, 0=무한)">
+                <input
+                  type="number"
+                  min={1}
+                  max={999}
+                  value={behalfDuration}
+                  onChange={(e) => setBehalfDuration(Number(e.target.value))}
+                />
+              </Field>
+              <Field label="노드 ID (선택)">
+                <select value={behalfNodeId} onChange={(e) => setBehalfNodeId(e.target.value)}>
+                  <option value="">자동 배정</option>
+                  {adminNodes2.map((n) => (
+                    <option key={n.id} value={n.id}>{n.name || n.id}</option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+            <div style={{ marginTop: "14px" }}>
+              <button className={s.solidButton} onClick={createBehalfSession} disabled={busy}>
+                대리 신청
+              </button>
+            </div>
+          </section>
+
           {terminateConfirmId && (
             <div className={s.overlay}>
               <section className={s.uploadSheet} style={{ width: "min(440px, 94vw)" }}>
                 <header>
-                  <div>
-                    <h2>세션 강제 종료</h2>
-                  </div>
+                  <div><h2>세션 강제 종료</h2></div>
                   <button onClick={() => setTerminateConfirmId(null)}>닫기</button>
                 </header>
                 <p style={{ margin: "22px 24px", lineHeight: 1.6 }}>
@@ -370,16 +504,11 @@ export default function AdminArea() {
                 </p>
                 <footer>
                   <span style={{ flex: 1 }} />
-                  <button className={s.lineButton} onClick={() => setTerminateConfirmId(null)}>
-                    취소
-                  </button>
+                  <button className={s.lineButton} onClick={() => setTerminateConfirmId(null)}>취소</button>
                   <button
                     className={s.solidButton}
                     style={{ color: "#e53e3e" }}
-                    onClick={() => {
-                      doAction("terminate", "세션 강제 종료");
-                      setTerminateConfirmId(null);
-                    }}
+                    onClick={() => { doAction("terminate", "세션 강제 종료"); setTerminateConfirmId(null); }}
                   >
                     강제 종료
                   </button>
