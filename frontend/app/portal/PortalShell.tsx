@@ -62,11 +62,12 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
             <strong>전산실</strong>
           </button>
 
-          <nav>
+          <nav aria-label="페이지 탐색">
             {NAV.map((item) => (
               <button
                 key={item.key}
                 data-on={page === item.key}
+                aria-current={page === item.key ? "page" : undefined}
                 onClick={() => setPage(item.key)}
               >
                 <span>{item.no}</span>
@@ -79,6 +80,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
             <button
               className={s.adminEntry}
               data-on={page === "admin"}
+              aria-current={page === "admin" ? "page" : undefined}
               onClick={() => setPage("admin")}
             >
               <span>05</span>관리
@@ -110,6 +112,30 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
           </main>
         </section>
       </div>
+
+      <nav className={s.mobileNav} aria-label="모바일 탐색">
+        {NAV.map((item) => (
+          <button
+            key={item.key}
+            data-on={page === item.key}
+            aria-current={page === item.key ? "page" : undefined}
+            onClick={() => setPage(item.key)}
+          >
+            <span className={s.mobileNavNo}>{item.no}</span>
+            <span>{item.label}</span>
+          </button>
+        ))}
+        {isAdmin && (
+          <button
+            data-on={page === "admin"}
+            aria-current={page === "admin" ? "page" : undefined}
+            onClick={() => setPage("admin")}
+          >
+            <span className={s.mobileNavNo}>05</span>
+            <span>관리</span>
+          </button>
+        )}
+      </nav>
 
       {ctrl.showNewSessionModal && (
         <RequestSheet

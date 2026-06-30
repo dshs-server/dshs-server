@@ -90,7 +90,7 @@ export default function RequestSheet({
 
   return (
     <Overlay>
-      <section className={s.requestSheet}>
+      <section className={s.requestSheet} role="dialog" aria-modal="true" aria-label="새 PC 배정">
         <header>
           <div>
             <span>작업 신청서</span>
