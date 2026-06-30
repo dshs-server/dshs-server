@@ -9,6 +9,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -16,9 +17,11 @@ import re
 import shlex
 import time
 import uuid
+from binascii import Error as BinasciiError
 from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Literal, Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +34,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore_async
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -51,6 +55,21 @@ LOG_INTERVAL = int(os.environ.get("LOG_INTERVAL", "600"))             # seconds 
 LOG_DIR = os.path.expanduser(os.environ.get("LOG_DIR", "~/hub/logs"))
 RECOVERY_INTERVAL = int(os.environ.get("RECOVERY_INTERVAL", "60"))  # 노드당 복구 체크 최소 간격 (초)
 
+# 활성 데스크톱의 최근 파일을 검사해 관리자 보안 경고를 만든다. 확장자 목록은
+# 쉼표로 덮어쓸 수 있으며 영숫자 확장자만 허용해 원격 셸 명령에 안전하게 넣는다.
+SECURITY_SCAN_ENABLED = os.environ.get("SECURITY_SCAN_ENABLED", "1").lower() not in {"0", "false", "no"}
+SECURITY_SCAN_LOOKBACK = int(os.environ.get("SECURITY_SCAN_LOOKBACK", str(max(LOG_INTERVAL * 2, 900))))
+SECURITY_ALERT_LIMIT = int(os.environ.get("SECURITY_ALERT_LIMIT", "200"))
+SECURITY_EXTENSIONS = tuple(
+    ext.strip().lower().lstrip(".")
+    for ext in os.environ.get(
+        "SECURITY_EXTENSIONS",
+        "exe,msi,bat,cmd,com,scr,pif,vbs,vbe,wsf,wsh,ps1,apk",
+    ).split(",")
+    if re.fullmatch(r"[a-zA-Z0-9]{1,12}", ext.strip().lstrip("."))
+)
+SECURITY_ALERT_DIR = os.path.join(LOG_DIR, "security-alerts")
+SECURITY_ALERTS_FILE = os.path.join(SECURITY_ALERT_DIR, "alerts.json")
 KST_OFFSET = 9 * 3600  # KST = UTC+9
 REBOOT_UPTIME_DAYS = int(os.environ.get("REBOOT_UPTIME_DAYS", "5"))    # 재부팅 임계 가동 일수
 REBOOT_VERIFY_TIMEOUT = int(os.environ.get("REBOOT_VERIFY_TIMEOUT", "600"))  # 재부팅 후 검증 최대 대기(초)
@@ -68,6 +87,8 @@ GMAIL_TOKEN = os.environ.get("GMAIL_TOKEN", "")
 GMAIL_SENDER = os.environ.get("GMAIL_SENDER", "")
 EMAIL_CHECK_INTERVAL = int(os.environ.get("EMAIL_CHECK_INTERVAL", "3600"))
 WARNING_SECONDS = 7 * 86400
+PORTAL_URL = os.environ.get("PORTAL_URL", "https://dshs-app.net")
+EMAIL_BRAND = os.environ.get("EMAIL_BRAND", "DSHS 전산실")
 
 # ── Firebase ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +117,9 @@ NODES_CACHE_FILE = os.path.expanduser("~/hub/nodes_cache.json")
 # Loaded from Firestore once at startup; falls back to local JSON file if quota exceeded.
 _sessions_cache: dict[str, dict] = {}
 SESSIONS_CACHE_FILE = os.path.expanduser("~/hub/sessions_cache.json")
+
+# 최신 항목부터 반환하지만 내부 저장은 오래된 순서로 유지한다.
+_security_alerts: list[dict] = []
 
 
 def _sc_get(session_id: str) -> dict | None:
@@ -384,11 +408,12 @@ async def _poll_nodes_loop():
                             project_name=s.get("project_name"),
                             ts=now,
                         )
-                        await _send_email(
-                            s.get("owner", ""),
-                            "[PC대여] 세션이 만료되어 일시중지되었습니다",
-                            f"'{s.get('project_name') or sid}' 세션이 대여 기간 만료로 자동 일시중지되었습니다.\n"
-                            f"포털(https://dshs-server.vercel.app)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
+                        await _send_session_email(
+                            "auto_suspend",
+                            sid,
+                            s,
+                            event_at=now,
+                            actor="시스템 · 대여 기간 만료",
                         )
                         continue
                     # starting → active when container running
@@ -413,7 +438,7 @@ async def _poll_nodes_loop():
                 if recovery_tasks:
                     await asyncio.gather(*recovery_tasks, return_exceptions=True)
         except Exception:
-            pass
+            logger.exception("[poll] 노드 및 세션 상태 동기화 실패")
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -431,6 +456,192 @@ async def _get_container_top3(node_ip: str, ssh_user: str, container: str) -> li
     if rc != 0 or not stdout:
         return []
     return [l.strip() for l in stdout.splitlines() if l.strip()]
+
+
+def _load_security_alerts() -> None:
+    """Load persisted alerts. A damaged file must never stop the hub."""
+    _security_alerts.clear()
+    try:
+        with open(SECURITY_ALERTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            _security_alerts.extend(item for item in data if isinstance(item, dict))
+    except (OSError, json.JSONDecodeError):
+        return
+
+
+def _persist_security_alerts() -> None:
+    os.makedirs(SECURITY_ALERT_DIR, exist_ok=True)
+    tmp_path = SECURITY_ALERTS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(_security_alerts, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, SECURITY_ALERTS_FILE)
+
+
+def _store_security_alert(alert: dict) -> None:
+    _security_alerts.append(alert)
+    while len(_security_alerts) > max(1, SECURITY_ALERT_LIMIT):
+        removed = _security_alerts.pop(0)
+        screenshot = removed.get("screenshot")
+        if screenshot:
+            try:
+                os.remove(os.path.join(SECURITY_ALERT_DIR, os.path.basename(screenshot)))
+            except OSError:
+                pass
+    _persist_security_alerts()
+
+
+def _public_security_alert(alert: dict) -> dict:
+    return {
+        key: value
+        for key, value in alert.items()
+        if key not in {"fingerprints", "screenshot"}
+    } | {"has_screenshot": bool(alert.get("screenshot"))}
+
+
+def _security_fingerprint(session_id: str, path: str, mtime: float) -> str:
+    raw = f"{session_id}\0{path}\0{mtime:.6f}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _security_reason(path: str) -> tuple[str, str]:
+    """Return a Korean reason and severity for a suspicious filename."""
+    name = os.path.basename(path).lower()
+    risky = "|".join(re.escape(ext) for ext in SECURITY_EXTENSIONS)
+    if risky and re.search(rf"\.[a-z0-9]{{1,8}}\.({risky})$", name):
+        return "문서처럼 위장한 이중 확장자", "critical"
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    return f"실행 위험 확장자 .{ext}", "high"
+
+
+def _parse_security_scan(stdout: str, session_id: str) -> list[dict]:
+    """Parse base64(find -printf) output without breaking on spaces or newlines."""
+    if not stdout:
+        return []
+    try:
+        decoded = base64.b64decode(stdout, validate=True).decode("utf-8", "replace")
+    except (BinasciiError, ValueError, UnicodeDecodeError):
+        return []
+
+    found: list[dict] = []
+    for record in decoded.split("\0"):
+        if not record:
+            continue
+        parts = record.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            mtime, size = float(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        path = parts[2]
+        reason, severity = _security_reason(path)
+        found.append({
+            "path": path,
+            "size": size,
+            "mtime": mtime,
+            "reason": reason,
+            "severity": severity,
+            "fingerprint": _security_fingerprint(session_id, path, mtime),
+        })
+    return found
+
+
+def _security_scan_command(container: str) -> str:
+    minutes = max(2, (SECURITY_SCAN_LOOKBACK + 59) // 60)
+    patterns = " -o ".join(f"-iname {shlex.quote('*.%s' % ext)}" for ext in SECURITY_EXTENSIONS)
+    if not patterns:
+        return "true"
+    inner = (
+        "find /home/kasm-user/Desktop /home/kasm-user/Downloads "
+        "/home/kasm-user/받은파일 -xdev -type f "
+        f"-mmin -{minutes} \\( {patterns} \\) "
+        "-printf '%T@\\t%s\\t%p\\0' 2>/dev/null | head -z -n 100 | base64 -w0"
+    )
+    return f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(inner)}"
+
+
+async def _capture_container_screenshot(
+    node_ip: str,
+    ssh_user: str,
+    container: str,
+    alert_id: str,
+) -> Optional[str]:
+    """Capture a compact JPEG from the active Kasm X display and save it locally."""
+    inner = (
+        "export DISPLAY=${DISPLAY:-:1}; "
+        "import -window root png:- 2>/dev/null | "
+        "convert png:- -resize '1280x720>' -quality 70 jpg:- 2>/dev/null | base64 -w0"
+    )
+    stdout, rc = await _ssh(
+        node_ip,
+        f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(inner)}",
+        ssh_user,
+    )
+    if rc != 0 or not stdout:
+        return None
+    try:
+        image = base64.b64decode(stdout, validate=True)
+    except (BinasciiError, ValueError):
+        return None
+    if not image.startswith(b"\xff\xd8\xff") or len(image) > 3_000_000:
+        return None
+
+    os.makedirs(SECURITY_ALERT_DIR, exist_ok=True)
+    filename = f"{alert_id}.jpg"
+    with open(os.path.join(SECURITY_ALERT_DIR, filename), "wb") as f:
+        f.write(image)
+    return filename
+
+
+async def _scan_session_security(session: dict, node: dict) -> Optional[dict]:
+    if not SECURITY_SCAN_ENABLED or not SECURITY_EXTENSIONS:
+        return None
+    session_id = str(session.get("id") or "")
+    if not session_id:
+        return None
+    container = _container_name(session_id)
+    ssh_user = node.get("ssh_user", SSH_USER)
+    stdout, rc = await _ssh(node["ip"], _security_scan_command(container), ssh_user)
+    if rc != 0:
+        return None
+
+    already_seen = {
+        fingerprint
+        for alert in _security_alerts
+        for fingerprint in (alert.get("fingerprints") or [])
+    }
+    files = [item for item in _parse_security_scan(stdout, session_id) if item["fingerprint"] not in already_seen]
+    if not files:
+        return None
+
+    alert_id = uuid.uuid4().hex
+    screenshot = await _capture_container_screenshot(
+        node["ip"], ssh_user, container, alert_id
+    )
+    alert = {
+        "id": alert_id,
+        "created_at": time.time(),
+        "session_id": session_id,
+        "owner": session.get("owner", ""),
+        "project_name": session.get("project_name", ""),
+        "node_id": node.get("id", session.get("node_id", "")),
+        "node_name": node.get("name", node.get("id", "")),
+        "severity": "critical" if any(item["severity"] == "critical" for item in files) else "high",
+        "files": [{k: v for k, v in item.items() if k != "fingerprint"} for item in files],
+        "fingerprints": [item["fingerprint"] for item in files],
+        "screenshot": screenshot,
+        "acknowledged": False,
+    }
+    _store_security_alert(alert)
+    logger.warning(
+        "[security] %s 세션에서 위험 파일 %d개 감지 (owner=%s, node=%s)",
+        session_id,
+        len(files),
+        alert["owner"],
+        alert["node_id"],
+    )
+    return alert
 
 
 async def _write_log():
@@ -466,6 +677,19 @@ async def _write_log():
                 r = top3_results[idx]
                 session_top3[s["id"]] = r if isinstance(r, list) else []
                 idx += 1
+
+    # 최근 위험 파일 검사도 세션별로 병렬 수행한다. 실패한 노드는 로그 작성을 막지 않는다.
+    security_alerts: list[dict] = []
+    if SECURITY_SCAN_ENABLED and active_sessions:
+        scan_results = await asyncio.gather(
+            *[
+                _scan_session_security(s, nodes[s["node_id"]])
+                for s in active_sessions
+                if s.get("node_id") in nodes
+            ],
+            return_exceptions=True,
+        )
+        security_alerts = [result for result in scan_results if isinstance(result, dict)]
 
     lines = [f"=== {now.strftime('%Y-%m-%d %H:%M:%S')} ===", ""]
 
@@ -506,6 +730,16 @@ async def _write_log():
         )
 
     lines.append("")
+    lines.append(f"[보안 경고] 신규 {len(security_alerts)}건")
+    for alert in security_alerts:
+        lines.append(
+            f"  [{alert['session_id']}] {alert.get('owner', '?')} @ {alert.get('node_id', '?')}"
+            f" — 위험 파일 {len(alert.get('files', []))}개"
+        )
+        for item in alert.get("files", []):
+            lines.append(f"    {item.get('path', '?')} ({item.get('reason', '확인 필요')})")
+
+    lines.append("")
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -529,22 +763,22 @@ async def _check_and_send_warnings() -> None:
     now = time.time()
     for sid, s in _sc_list(status=["active", "starting"]):
         expires_at = s.get("expires_at")
+        sent_to = set(s.get("warning_email_sent_to") or [])
         if not expires_at or s.get("warning_email_sent"):
             continue
         if expires_at - now <= WARNING_SECONDS:
-            owner = s.get("owner", "")
-            expire_str = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
-            project = s.get("project_name") or sid
-            await _send_email(
-                owner,
-                "[PC대여] 세션이 7일 후 자동 일시중지됩니다",
-                f"안녕하세요.\n\n"
-                f"'{project}' 세션이 {expire_str}에 자동으로 일시중지될 예정입니다.\n\n"
-                f"계속 사용하시려면 포털(https://dshs-server.vercel.app)에서 이어서 사용을 눌러주세요.\n\n"
-                f"- dshs 전산실",
-            )
-            _sc_update(sid, {"warning_email_sent": True})
-            await db.collection(COL_SESSIONS).document(sid).update({"warning_email_sent": True})
+            recipients = _session_email_recipients(s)
+            pending = [email for email in recipients if email not in sent_to]
+            if pending:
+                batch = await _send_session_email("warning", sid, s, recipients=pending, event_at=now)
+                sent_to.update(batch.successful_recipients)
+            complete = bool(recipients) and all(email in sent_to for email in recipients)
+            updates = {
+                "warning_email_sent": complete,
+                "warning_email_sent_to": sorted(sent_to),
+            }
+            _sc_update(sid, updates)
+            await db.collection(COL_SESSIONS).document(sid).update(updates)
 
 
 async def _email_notification_loop():
@@ -552,8 +786,8 @@ async def _email_notification_loop():
     while True:
         try:
             await _check_and_send_warnings()
-        except Exception as e:
-            print(f"[email-loop] 오류: {e}")
+        except Exception:
+            logger.exception("[email-loop] 만료 경고 처리 실패")
         await asyncio.sleep(EMAIL_CHECK_INTERVAL)
 
 
@@ -646,6 +880,7 @@ async def _reboot_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_security_alerts()
     await _init_sessions_cache()
     poll_task   = asyncio.create_task(_poll_nodes_loop())
     log_task    = asyncio.create_task(_log_loop())
@@ -893,6 +1128,320 @@ async def _container_has_share_mount(host: str, container: str, ssh_user: str = 
 # ── Email ────────────────────────────────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class EmailContent:
+    subject: str
+    text: str
+    html: str
+
+
+@dataclass(frozen=True)
+class EmailSendResult:
+    state: Literal["sent", "skipped", "failed"]
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.state == "sent"
+
+
+EmailKind = Literal[
+    "created",
+    "resumed",
+    "warning",
+    "auto_suspend",
+    "suspend",
+    "admin_suspend",
+    "unexpected_stop",
+    "delete",
+]
+
+
+@dataclass(frozen=True)
+class EmailBatchResult:
+    results: dict[str, EmailSendResult]
+
+    @property
+    def successful_recipients(self) -> list[str]:
+        return [email for email, result in self.results.items() if result.ok]
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.results) and all(result.ok for result in self.results.values())
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _normalise_email(value: object) -> Optional[str]:
+    email = str(value or "").strip().lower()
+    return email if email and _EMAIL_RE.fullmatch(email) else None
+
+
+def _session_email_recipients(session: dict) -> list[str]:
+    """세션 소유자와 팀원을 순서대로 중복 제거해 반환한다."""
+    members = session.get("team_members") or []
+    if isinstance(members, str):
+        members = [members]
+    candidates = [session.get("owner"), *members]
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        email = _normalise_email(candidate)
+        if email and email not in seen:
+            seen.add(email)
+            recipients.append(email)
+    return recipients
+
+
+def _email_runtime_status() -> dict:
+    token_exists = bool(GMAIL_TOKEN) and os.path.exists(GMAIL_TOKEN)
+    creds_exists = bool(GMAIL_CREDENTIALS) and os.path.exists(GMAIL_CREDENTIALS)
+    warnings: list[str] = []
+    if not GMAIL_SENDER:
+        warnings.append("GMAIL_SENDER가 설정되지 않았습니다.")
+    if not GMAIL_TOKEN:
+        warnings.append("GMAIL_TOKEN이 설정되지 않았습니다.")
+    elif not token_exists:
+        warnings.append("GMAIL_TOKEN 파일을 찾을 수 없습니다.")
+    if GMAIL_CREDENTIALS and not creds_exists:
+        warnings.append("GMAIL_CREDENTIALS 파일을 찾을 수 없습니다.")
+    return {
+        "can_send": bool(GMAIL_SENDER and token_exists),
+        "sender": GMAIL_SENDER,
+        "token_configured": bool(GMAIL_TOKEN),
+        "token_exists": token_exists,
+        "credentials_configured": bool(GMAIL_CREDENTIALS),
+        "credentials_exists": creds_exists,
+        "check_interval_seconds": EMAIL_CHECK_INTERVAL,
+        "portal_url": PORTAL_URL,
+        "brand": EMAIL_BRAND,
+        "supported_events": [
+            "created",
+            "resumed",
+            "warning",
+            "auto_suspend",
+            "suspend",
+            "admin_suspend",
+            "unexpected_stop",
+            "delete",
+        ],
+        "warnings": warnings,
+    }
+
+
+def _email_display_brand() -> str:
+    return EMAIL_BRAND.upper()
+
+
+def _format_email_ts(ts: Optional[float]) -> str:
+    if not ts:
+        return "-"
+    kst = timezone(timedelta(hours=9), name="KST")
+    return datetime.fromtimestamp(ts, tz=kst).strftime("%Y.%m.%d %H:%M KST")
+
+
+def _email_html_block(text: str) -> str:
+    return "<br/>".join(html.escape(line) for line in text.splitlines()) if text else ""
+
+
+def _render_email_html(
+    *,
+    status_label: str,
+    title: str,
+    summary: str,
+    tone: Literal["info", "warning", "danger", "success"] = "info",
+    facts: Optional[list[tuple[str, str]]] = None,
+    cta_label: Optional[str] = None,
+    cta_url: Optional[str] = None,
+) -> str:
+    tone_map = {
+        "info": ("#445064", "#eef1f5", "#d7dce4"),
+        "warning": ("#8a5d00", "#fff7df", "#ead39a"),
+        "danger": ("#8f2727", "#fff0ee", "#e9bbb6"),
+        "success": ("#266145", "#edf8f1", "#bddfc9"),
+    }
+    accent, tint, tint_border = tone_map[tone]
+    facts_html = "".join(
+        (
+            "<tr>"
+            f"<td width='34%' style='padding:12px 14px;border-bottom:1px solid #e7e8e9;"
+            "color:#777c83;font-size:12px;line-height:1.5;'>"
+            f"{html.escape(label)}</td>"
+            "<td style='padding:12px 14px;border-bottom:1px solid #e7e8e9;"
+            "color:#17191c;font-size:13px;font-weight:600;line-height:1.5;word-break:break-word;'>"
+            f"{html.escape(value)}</td>"
+            "</tr>"
+        )
+        for label, value in (facts or [])
+        if value
+    )
+    cta_html = ""
+    if cta_label and cta_url:
+        cta_html = (
+            "<table role='presentation' cellspacing='0' cellpadding='0' border='0' style='margin-top:26px;'>"
+            "<tr><td style='border-radius:3px;background:#17191c;'>"
+            f"<a href='{html.escape(cta_url, quote=True)}' style='display:inline-block;padding:13px 18px;"
+            "color:#ffffff;text-decoration:none;font-size:13px;font-weight:700;letter-spacing:-.01em;'>"
+            f"{html.escape(cta_label)}&nbsp;&nbsp;→</a></td></tr></table>"
+        )
+    preheader = html.escape(summary.replace("\n", " ")[:110])
+    return (
+        "<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' "
+        "content='width=device-width,initial-scale=1'><style>"
+        "@media(max-width:640px){.mail-wrap{padding:18px 10px!important}.mail-card{width:100%!important}"
+        ".mail-head,.mail-body{padding-left:22px!important;padding-right:22px!important}.mail-title{font-size:27px!important}}"
+        "</style></head><body style='margin:0;padding:0;background:#f3f3f1;color:#17191c;'>"
+        f"<div style='display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;'>{preheader}</div>"
+        "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' border='0' style='width:100%;background:#f3f3f1;'>"
+        "<tr><td class='mail-wrap' align='center' style='padding:38px 16px;'>"
+        "<table role='presentation' class='mail-card' width='640' cellspacing='0' cellpadding='0' border='0' "
+        "style='width:640px;max-width:640px;background:#ffffff;border:1px solid #dedfdf;border-collapse:separate;"
+        "border-spacing:0;border-radius:14px;overflow:hidden;box-shadow:0 18px 55px rgba(23,25,28,.08);'>"
+        f"<tr><td style='height:4px;background:{accent};font-size:0;line-height:0;'>&nbsp;</td></tr>"
+        "<tr><td class='mail-head' style='padding:25px 34px 22px;border-bottom:1px solid #e7e8e9;'>"
+        "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' border='0'><tr>"
+        f"<td style='font-family:Arial,Malgun Gothic,sans-serif;color:#17191c;font-size:17px;font-weight:800;"
+        f"letter-spacing:-.02em;'>{html.escape(_email_display_brand())}</td>"
+        f"<td align='right'><span style='display:inline-block;padding:7px 10px;border:1px solid {tint_border};"
+        f"border-radius:999px;background:{tint};color:{accent};font-family:Arial,Malgun Gothic,sans-serif;"
+        f"font-size:11px;font-weight:700;'>{html.escape(status_label)}</span></td>"
+        "</tr></table></td></tr>"
+        "<tr><td class='mail-body' style='padding:34px;font-family:Arial,Apple SD Gothic Neo,Malgun Gothic,sans-serif;'>"
+        "<div style='margin:0 0 12px;color:#8a8e93;font-size:11px;font-weight:700;letter-spacing:.13em;'>SESSION NOTICE</div>"
+        f"<h1 class='mail-title' style='margin:0;color:#17191c;font-family:Georgia,Malgun Gothic,serif;"
+        f"font-size:32px;font-weight:700;line-height:1.28;letter-spacing:-.035em;'>{html.escape(title)}</h1>"
+        f"<p style='margin:18px 0 24px;color:#4e535a;font-size:14px;line-height:1.85;letter-spacing:-.01em;'>"
+        f"{_email_html_block(summary)}</p>"
+        "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' border='0' "
+        "style='width:100%;border:1px solid #e1e2e3;border-collapse:separate;border-spacing:0;border-radius:7px;overflow:hidden;'>"
+        f"{facts_html}</table>"
+        f"{cta_html}"
+        "<p style='margin:28px 0 0;padding-top:18px;border-top:1px solid #ececed;color:#8a8e93;font-size:11px;line-height:1.7;'>"
+        "본 메일은 PC 대여 포털의 세션 상태 변경에 따라 자동 발송되었습니다.<br>"
+        f"문의가 필요하면 {html.escape(_email_display_brand())}에 연락해 주세요.</p>"
+        "</td></tr></table></td></tr></table></body></html>"
+    )
+
+
+def _build_session_email(
+    kind: EmailKind,
+    session_id: str,
+    project_name: Optional[str] = None,
+    expires_at: Optional[float] = None,
+    event_at: Optional[float] = None,
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> EmailContent:
+    project = project_name or session_id or "이름 없는 세션"
+    expires_when = _format_email_ts(expires_at)
+    event_when = _format_email_ts(event_at or time.time())
+    facts = [("세션", project), ("세션 ID", session_id)]
+    actor_label = (actor or "").strip()
+    subject: str
+    title: str
+    status_label: str
+    summary: str
+    tone: Literal["info", "warning", "danger", "success"]
+    cta_label: Optional[str] = "포털에서 확인하기"
+
+    if kind == "created":
+        subject = "[PC대여] 새 세션 준비를 시작했습니다"
+        title = "새 작업 공간을 준비하고 있어요"
+        status_label = "준비 중"
+        summary = f"'{project}' 세션 생성 요청이 정상적으로 접수되었습니다.\n준비가 끝나면 포털에서 바로 접속할 수 있습니다."
+        tone = "success"
+        if expires_at:
+            facts.append(("사용 종료 예정", expires_when))
+    elif kind == "resumed":
+        subject = "[PC대여] 세션을 다시 시작했습니다"
+        title = "작업 공간을 다시 여는 중이에요"
+        status_label = "재개 중"
+        summary = f"보관 중이던 '{project}' 세션을 다시 시작했습니다.\n잠시 후 포털에서 이어서 작업할 수 있습니다."
+        tone = "info"
+    if kind == "warning":
+        subject = "[PC대여] 세션이 7일 후 자동 일시중지됩니다"
+        title = "세션 만료가 7일 남았습니다"
+        status_label = "만료 예정"
+        summary = (
+            f"'{project}' 세션이 {expires_when}에 자동으로 일시중지될 예정입니다.\n"
+            "계속 사용하시려면 포털에서 이어서 사용을 눌러주세요."
+        )
+        tone = "warning"
+        facts.append(("일시중지 예정", expires_when))
+        cta_label = "포털에서 기간 확인하기"
+    elif kind == "auto_suspend":
+        subject = "[PC대여] 세션이 만료되어 일시중지되었습니다"
+        title = "세션을 안전하게 보관했습니다"
+        status_label = "자동 보관"
+        summary = (
+            f"'{project}' 세션이 대여 기간 만료로 자동 일시중지되었습니다.\n"
+            "포털에서 이어서 사용을 눌러 다시 시작할 수 있습니다."
+        )
+        tone = "warning"
+        if expires_at:
+            facts.append(("만료 시각", expires_when))
+        cta_label = "보관된 세션 이어서 사용"
+    elif kind == "suspend":
+        subject = "[PC대여] 세션을 일시중지했습니다"
+        title = "작업 공간을 보관했습니다"
+        status_label = "일시중지"
+        summary = (
+            f"'{project}' 세션이{f' {actor_label}의 요청으로' if actor_label else ''} 일시중지되었습니다.\n"
+            "포털에서 이어서 사용을 눌러 다시 시작할 수 있습니다."
+        )
+        tone = "info"
+        cta_label = "보관된 세션 이어서 사용"
+    elif kind == "admin_suspend":
+        subject = "[PC대여] 관리자에 의해 세션이 일시중지되었습니다"
+        title = "관리자가 세션을 보관했습니다"
+        status_label = "관리자 조치"
+        summary = (
+            f"'{project}' 세션이 {actor_label or '관리자'}에 의해 일시중지되었습니다.\n"
+            "필요한 경우 포털에서 다시 시작하거나 전산실에 문의해 주세요."
+        )
+        tone = "warning"
+    elif kind == "unexpected_stop":
+        subject = "[PC대여] 세션이 예기치 않게 중지되었습니다"
+        title = "세션 상태를 확인해 주세요"
+        status_label = "확인 필요"
+        detail = reason or "실행 중이던 컴퓨터 환경이 예기치 않게 중지되었습니다."
+        summary = f"'{project}' 세션을 정상적으로 실행할 수 없는 상태입니다.\n{detail}\n포털에서 다시 시작되지 않으면 전산실에 문의해 주세요."
+        tone = "danger"
+    elif kind == "delete":
+        subject = "[PC대여] 세션이 삭제되었습니다"
+        title = "세션 삭제가 완료되었습니다"
+        status_label = "삭제 완료"
+        summary = f"'{project}' 세션이{f' {actor_label}의 요청으로' if actor_label else ''} 완전히 삭제되었습니다."
+        tone = "danger"
+        cta_label = "포털로 이동"
+    elif kind not in ("created", "resumed", "warning"):
+        raise ValueError(f"지원하지 않는 이메일 종류입니다: {kind}")
+
+    if actor_label:
+        facts.append(("처리한 사람", actor_label))
+    facts.append(("처리 시각", event_when))
+    plain_facts = "\n".join(f"- {label}: {value}" for label, value in facts)
+    text = (
+        f"안녕하세요.\n\n{summary}\n\n{plain_facts}\n\n"
+        f"포털: {PORTAL_URL}\n\n"
+        f"본 메일은 자동 발송되었습니다.\n- {_email_display_brand()}"
+    )
+    return EmailContent(
+        subject=subject,
+        text=text,
+        html=_render_email_html(
+            status_label=status_label,
+            title=title,
+            summary=summary,
+            tone=tone,
+            facts=facts,
+            cta_label=cta_label,
+            cta_url=PORTAL_URL,
+        ),
+    )
+
+
 def _build_gmail_service():
     """OAuth2 token.json으로 Gmail API 서비스 객체 생성. 미설정/만료 시 None 반환."""
     if not GMAIL_TOKEN or not os.path.exists(GMAIL_TOKEN):
@@ -912,33 +1461,99 @@ def _build_gmail_service():
                 f.write(creds.to_json())
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
     except Exception as e:
-        print(f"[gmail] 서비스 초기화 실패: {e}")
+        logger.warning("[gmail] 서비스 초기화 실패: %s", e)
         return None
 
 
-async def _send_email(to: str, subject: str, body: str) -> None:
+async def _send_email(
+    to: str,
+    subject: str,
+    text_body: str,
+    html_body: Optional[str] = None,
+) -> EmailSendResult:
     """Gmail API로 이메일 발송. 실패해도 세션 로직에 영향 없음."""
     if not GMAIL_SENDER or not to:
-        return
+        return EmailSendResult("skipped", "sender-or-recipient-missing")
+    recipient = _normalise_email(to)
+    sender = _normalise_email(GMAIL_SENDER)
+    if not recipient or not sender:
+        return EmailSendResult("failed", "invalid-sender-or-recipient")
     try:
+        import email.mime.multipart as _multipart
         import email.mime.text as _mime
+        import email.utils as _utils
         service = _build_gmail_service()
         if not service:
-            return
-        msg = _mime.MIMEText(body, "plain", "utf-8")
-        msg["To"] = to
-        msg["From"] = GMAIL_SENDER
-        msg["Subject"] = subject
+            return EmailSendResult("skipped", "gmail-service-unavailable")
+        msg = _multipart.MIMEMultipart("alternative")
+        msg["To"] = recipient
+        msg["From"] = _utils.formataddr((_email_display_brand(), sender))
+        msg["Reply-To"] = sender
+        msg["Subject"] = subject.replace("\r", " ").replace("\n", " ")
+        msg["Auto-Submitted"] = "auto-generated"
+        msg["X-Auto-Response-Suppress"] = "All"
+        msg.attach(_mime.MIMEText(text_body, "plain", "utf-8"))
+        if html_body:
+            msg.attach(_mime.MIMEText(html_body, "html", "utf-8"))
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
+        response = await loop.run_in_executor(
             None,
             lambda: service.users().messages().send(
                 userId="me", body={"raw": raw}
             ).execute(),
         )
+        return EmailSendResult("sent", str((response or {}).get("id", "")))
     except Exception as e:
-        print(f"[email] 발송 실패 ({to}): {e}")
+        logger.warning("[email] 발송 실패 (%s): %s", recipient, e)
+        return EmailSendResult("failed", str(e))
+
+
+async def _send_session_email(
+    kind: EmailKind,
+    session_id: str,
+    session: dict,
+    *,
+    recipients: Optional[list[str]] = None,
+    event_at: Optional[float] = None,
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> EmailBatchResult:
+    """세션 소유자와 팀원에게 동일한 알림을 개별 발송한다."""
+    targets = recipients if recipients is not None else _session_email_recipients(session)
+    deduped_targets: list[str] = []
+    seen: set[str] = set()
+    for target in targets:
+        email = _normalise_email(target)
+        if email and email not in seen:
+            seen.add(email)
+            deduped_targets.append(email)
+
+    content = _build_session_email(
+        kind,
+        session_id,
+        session.get("project_name"),
+        session.get("expires_at"),
+        event_at=event_at,
+        reason=reason,
+        actor=actor,
+    )
+    results: dict[str, EmailSendResult] = {}
+    for target in deduped_targets:
+        result = await _send_email(target, content.subject, content.text, content.html)
+        results[target] = result
+        if not result.ok:
+            logger.warning(
+                "[email] 세션 알림 미발송 kind=%s sid=%s to=%s state=%s detail=%s",
+                kind,
+                session_id,
+                target,
+                result.state,
+                result.detail,
+            )
+    if not results:
+        logger.warning("[email] 세션 알림 수신자 없음 kind=%s sid=%s", kind, session_id)
+    return EmailBatchResult(results)
 
 
 # ── Routes: health ────────────────────────────────────────────────────────────
@@ -1069,6 +1684,21 @@ class SessionBody(BaseModel):
     behalf_of: Optional[str] = None  # admin only
 
 
+class EmailPreviewBody(BaseModel):
+    kind: EmailKind = "warning"
+    to: Optional[str] = None
+    session_id: Optional[str] = None
+    project_name: Optional[str] = None
+    expires_at: Optional[float] = None
+    event_at: Optional[float] = None
+    reason: Optional[str] = None
+    actor: Optional[str] = None
+
+
+class SecurityAlertUpdate(BaseModel):
+    acknowledged: bool = True
+
+
 @app.get("/session", dependencies=[Depends(require_key), Depends(require_user)])
 async def get_session(
     x_user_email: str = Header(""),
@@ -1135,6 +1765,13 @@ async def get_session(
         # 컨테이너가 없거나 완전히 죽음 — stale 세션 정리
         _sc_del(session_id)
         await db.collection(COL_SESSIONS).document(session_id).delete()
+        await _send_session_email(
+            "unexpected_stop",
+            session_id,
+            s,
+            reason="실행 환경을 찾을 수 없어 세션 기록을 정리했습니다.",
+            actor="시스템 · 상태 감지",
+        )
         return {"status": "none", "suspended_sessions": suspended_sessions}
 
     if dock == "exited":
@@ -1144,6 +1781,13 @@ async def get_session(
             "status": "suspended",
             "suspended_at": time.time(),
         })
+        await _send_session_email(
+            "unexpected_stop",
+            session_id,
+            s,
+            reason="실행 환경이 중지되어 세션을 보관 상태로 전환했습니다.",
+            actor="시스템 · 상태 감지",
+        )
         _orig = s.get("original_created_at") or s.get("created_at", 0)
         _now_ts2 = time.time()
         _s_ext_blocked = (not s.get("extend_unlocked", False)) and \
@@ -1302,6 +1946,7 @@ async def create_session(
             node_id=s.get("node_id"),
             project_name=s.get("project_name"),
         )
+        await _send_session_email("resumed", target_sid, s, actor=me)
         return {"session_id": target_sid, "status": "starting"}
 
     # ── New session ────────────────────────────────────────────────────────────
@@ -1456,6 +2101,18 @@ async def create_session(
         node_id=node_id,
         project_name=(body.project_name if body else None),
     )
+    created_batch = await _send_session_email("created", new_id, session_data, actor=me)
+    # 7일 이하 대여는 생성 안내에 종료 예정 시각이 포함되므로 같은 내용의
+    # 7일 전 경고를 1분 뒤 중복 발송하지 않는다. 실패한 수신자만 경고 루프에서 재시도한다.
+    if duration <= 7:
+        recipients = _session_email_recipients(session_data)
+        sent_to = sorted(created_batch.successful_recipients)
+        warning_updates = {
+            "warning_email_sent": bool(recipients) and len(sent_to) == len(recipients),
+            "warning_email_sent_to": sent_to,
+        }
+        _sc_update(new_id, warning_updates)
+        await db.collection(COL_SESSIONS).document(new_id).update(warning_updates)
     return {"session_id": new_id, "status": "starting"}
 
 
@@ -1761,11 +2418,7 @@ async def delete_session(
             node_id=s.get("node_id"),
             project_name=s.get("project_name"),
         )
-        await _send_email(
-            s.get("owner", ""),
-            "[PC대여] 세션이 삭제되었습니다",
-            f"'{s.get('project_name') or session_id}' 세션이 완전히 삭제되었습니다.\n\n- dshs 전산실",
-        )
+        await _send_session_email("delete", session_id, s, actor=me)
         return {"message": "세션을 완전히 삭제했습니다."}
 
     await _ssh(node["ip"], f"docker stop {container}", _suser)
@@ -1786,12 +2439,7 @@ async def delete_session(
         node_id=s.get("node_id"),
         project_name=s.get("project_name"),
     )
-    await _send_email(
-        s.get("owner", ""),
-        "[PC대여] 세션을 일시중지했습니다",
-        f"'{s.get('project_name') or session_id}' 세션이 일시중지되었습니다.\n"
-        f"포털(https://dshs-server.vercel.app)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
-    )
+    await _send_session_email("suspend", session_id, s, actor=me)
     return {"status": "suspended"}
 
 
@@ -2090,6 +2738,66 @@ class NodeBody(BaseModel):
     kasm_url: str = "https://kasm.dshs-app.net"
 
 
+@app.get("/admin/email/status", dependencies=[Depends(require_key)])
+async def admin_email_status():
+    return _email_runtime_status()
+
+
+@app.post("/admin/email/preview", dependencies=[Depends(require_key)])
+async def admin_email_preview(body: EmailPreviewBody):
+    session_id = body.session_id or "sample-session"
+    project_name = body.project_name or "샘플 프로젝트"
+    expires_at = body.expires_at if body.expires_at is not None else time.time() + WARNING_SECONDS
+    content = _build_session_email(
+        body.kind,
+        session_id,
+        project_name,
+        expires_at,
+        event_at=body.event_at,
+        reason=body.reason,
+        actor=body.actor,
+    )
+    return {
+        "kind": body.kind,
+        "to": body.to or GMAIL_SENDER,
+        "session_id": session_id,
+        "project_name": project_name,
+        "expires_at": expires_at,
+        "event_at": body.event_at,
+        "subject": content.subject,
+        "text": content.text,
+        "html": content.html,
+        "runtime": _email_runtime_status(),
+    }
+
+
+@app.post("/admin/email/test", dependencies=[Depends(require_key)])
+async def admin_email_test(body: EmailPreviewBody):
+    recipient = _normalise_email(body.to or GMAIL_SENDER)
+    if not recipient:
+        raise HTTPException(status_code=400, detail="올바른 테스트 수신자(to) 또는 GMAIL_SENDER가 필요합니다.")
+    session_id = body.session_id or "sample-session"
+    project_name = body.project_name or "샘플 프로젝트"
+    expires_at = body.expires_at if body.expires_at is not None else time.time() + WARNING_SECONDS
+    content = _build_session_email(
+        body.kind,
+        session_id,
+        project_name,
+        expires_at,
+        event_at=body.event_at,
+        reason=body.reason,
+        actor=body.actor,
+    )
+    result = await _send_email(recipient, content.subject, content.text, content.html)
+    return {
+        "status": result.state,
+        "detail": result.detail,
+        "to": recipient,
+        "subject": content.subject,
+        "runtime": _email_runtime_status(),
+    }
+
+
 @app.post("/admin/nodes", dependencies=[Depends(require_key)])
 async def register_node(node_id: str = Query(...), body: NodeBody = Body(...)):
     data = body.model_dump()
@@ -2178,15 +2886,27 @@ async def admin_status():
 
 
 @app.post("/admin/terminate", dependencies=[Depends(require_key)])
-async def admin_terminate(node_id: Optional[str] = Query(None)):
+async def admin_terminate(
+    node_id: Optional[str] = Query(None),
+    x_user_email: str = Header(""),
+):
     terminated = []
     for sid, s in _sc_list(status=["active", "starting"]):
         if node_id and s.get("node_id") != node_id:
             continue
         node = await _get_node(s["node_id"])
         await _ssh(node["ip"], f"docker stop {_container_name(sid)}", node.get("ssh_user", SSH_USER))
-        _sc_update(sid, {"status": "suspended", "suspended_at": time.time()})
-        await db.collection(COL_SESSIONS).document(sid).update({"status": "suspended", "suspended_at": time.time()})
+        suspended_at = time.time()
+        _sc_update(sid, {"status": "suspended", "suspended_at": suspended_at})
+        await db.collection(COL_SESSIONS).document(sid).update({"status": "suspended", "suspended_at": suspended_at})
+        actor = _normalise_email(x_user_email) or "관리자"
+        await _send_session_email(
+            "admin_suspend",
+            sid,
+            s,
+            event_at=suspended_at,
+            actor=actor,
+        )
         terminated.append(sid)
     return {"terminated": terminated, "count": len(terminated)}
 
@@ -2201,6 +2921,39 @@ async def admin_cleanup(node_id: Optional[str] = Query(None)):
         stdout, rc = await _ssh(n["ip"], _CLEANUP_CMD, n.get("ssh_user", SSH_USER))
         results[n["id"]] = {"removed": stdout.strip(), "ok": rc == 0}
     return {"nodes": results}
+
+
+@app.get("/admin/security-alerts", dependencies=[Depends(require_key)])
+async def get_security_alerts():
+    alerts = [_public_security_alert(alert) for alert in reversed(_security_alerts)]
+    return {
+        "alerts": alerts,
+        "unacknowledged": sum(not alert.get("acknowledged", False) for alert in _security_alerts),
+        "scan_enabled": SECURITY_SCAN_ENABLED,
+        "extensions": list(SECURITY_EXTENSIONS),
+    }
+
+
+@app.patch("/admin/security-alerts/{alert_id}", dependencies=[Depends(require_key)])
+async def update_security_alert(alert_id: str, body: SecurityAlertUpdate):
+    for alert in _security_alerts:
+        if alert.get("id") == alert_id:
+            alert["acknowledged"] = body.acknowledged
+            alert["acknowledged_at"] = time.time() if body.acknowledged else None
+            _persist_security_alerts()
+            return _public_security_alert(alert)
+    raise HTTPException(status_code=404, detail="보안 경고를 찾을 수 없습니다.")
+
+
+@app.get("/admin/security-alerts/{alert_id}/screenshot", dependencies=[Depends(require_key)])
+async def get_security_alert_screenshot(alert_id: str):
+    alert = next((item for item in _security_alerts if item.get("id") == alert_id), None)
+    if not alert or not alert.get("screenshot"):
+        raise HTTPException(status_code=404, detail="스크린샷이 없습니다.")
+    screenshot_path = os.path.join(SECURITY_ALERT_DIR, os.path.basename(alert["screenshot"]))
+    if not os.path.isfile(screenshot_path):
+        raise HTTPException(status_code=404, detail="스크린샷 파일이 없습니다.")
+    return FileResponse(screenshot_path, media_type="image/jpeg", filename=f"security-{alert_id}.jpg")
 
 
 @app.get("/admin/log", dependencies=[Depends(require_key)])
