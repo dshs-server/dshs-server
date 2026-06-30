@@ -388,7 +388,7 @@ async def _poll_nodes_loop():
                             s.get("owner", ""),
                             "[PC대여] 세션이 만료되어 일시중지되었습니다",
                             f"'{s.get('project_name') or sid}' 세션이 대여 기간 만료로 자동 일시중지되었습니다.\n"
-                            f"포털(https://dshs-app.net)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
+                            f"포털(https://dshs-server.vercel.app)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
                         )
                         continue
                     # starting → active when container running
@@ -540,7 +540,7 @@ async def _check_and_send_warnings() -> None:
                 "[PC대여] 세션이 7일 후 자동 일시중지됩니다",
                 f"안녕하세요.\n\n"
                 f"'{project}' 세션이 {expire_str}에 자동으로 일시중지될 예정입니다.\n\n"
-                f"계속 사용하시려면 포털(https://dshs-app.net)에서 이어서 사용을 눌러주세요.\n\n"
+                f"계속 사용하시려면 포털(https://dshs-server.vercel.app)에서 이어서 사용을 눌러주세요.\n\n"
                 f"- dshs 전산실",
             )
             _sc_update(sid, {"warning_email_sent": True})
@@ -1594,7 +1594,7 @@ async def delete_session(
         s.get("owner", ""),
         "[PC대여] 세션을 일시중지했습니다",
         f"'{s.get('project_name') or session_id}' 세션이 일시중지되었습니다.\n"
-        f"포털(https://dshs-app.net)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
+        f"포털(https://dshs-server.vercel.app)에서 이어서 사용할 수 있습니다.\n\n- dshs 전산실",
     )
     return {"status": "suspended"}
 
