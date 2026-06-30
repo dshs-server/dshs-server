@@ -7,9 +7,9 @@ import { useToast } from "@/components/toast";
  * 파일 업로드 버튼 — 활성 세션이 있을 때만 표시.
  *
  * 흐름:
- *  1) /api/upload-ticket 으로 서명 토큰 + 허브 LAN 주소를 받는다.
- *  2) 파일을 브라우저에서 중앙 PC(허브)로 직접 전송한다 (Vercel 우회 → 대용량 OK).
- *  3) 허브가 내 세션이 떠 있는 노드로 보내 컨테이너 바탕화면/받은파일 에 표시.
+ *  1) /api/upload-ticket 으로 서명 토큰을 받는다.
+ *  2) 파일을 브라우저에서 허브(hub.dshs-app.net)로 직접 전송한다 (Vercel 우회 → 대용량 OK).
+ *  3) 허브가 내 세션이 떠 있는 노드로 SSH 전송 → 컨테이너 바탕화면/받은파일 에 표시.
  */
 export function UploadButton() {
   const { toast } = useToast();
@@ -50,11 +50,7 @@ export function UploadButton() {
         "success"
       );
     } catch {
-      // mixed content / 네트워크 / 학교 WiFi 밖 접속 등
-      toast(
-        "중앙 PC에 연결할 수 없습니다. 학교 WiFi에 연결됐는지 확인해주세요.",
-        "error"
-      );
+      toast("파일 전송에 실패했습니다. 네트워크 연결을 확인해주세요.", "error");
     } finally {
       setBusy(false);
       if (inputRef.current) inputRef.current.value = "";

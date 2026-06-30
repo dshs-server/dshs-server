@@ -71,7 +71,7 @@ export function ConfirmSheet({
           <div>
             <h2>{title}</h2>
           </div>
-          <button onClick={onCancel}>닫기</button>
+
         </header>
         <p style={{ margin: "22px 24px", lineHeight: 1.6 }}>{message}</p>
         <footer>
