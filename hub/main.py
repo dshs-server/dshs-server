@@ -1634,6 +1634,32 @@ async def get_history(
 # ── Routes: file upload ───────────────────────────────────────────────────────
 
 
+@app.get("/upload-ticket", dependencies=[Depends(require_key)])
+async def upload_ticket(x_user_email: str = Header("")):
+    """노드 직접 업로드용 서명 토큰 + 노드 URL 반환. Vercel API 라우트가 호출한다."""
+    me = x_user_email.lower()
+    if not me:
+        raise HTTPException(status_code=400, detail="x-user-email 헤더 필요")
+
+    active = _sc_list(owner=me, status=["active", "starting"])
+    suspended = _sc_list(owner=me, status="suspended")
+    target = (active or suspended or [None])[0]
+    if not target:
+        raise HTTPException(status_code=400, detail="먼저 PC 세션을 시작한 뒤 파일을 보낼 수 있습니다.")
+
+    session_id, s = target
+    node = await _get_node(s["node_id"])
+    container = _container_name(session_id)
+    upload_url = node.get("kasm_url", "")
+
+    exp = int(time.time()) + 300
+    payload = f"{me}|{container}|{exp}"
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
+    sig = hmac.new(UPLOAD_SECRET.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+
+    return {"token": f"{payload_b64}.{sig}", "upload_url": upload_url, "expires_at": exp}
+
+
 @app.post("/upload")
 async def upload_files(
     files: list[UploadFile] = File(...),
@@ -1671,18 +1697,23 @@ async def upload_files(
             known_hosts=None,
             connect_timeout=10,
         ) as conn:
-            async with conn.start_sftp_client() as sftp:
-                for f in files:
-                    fname = os.path.basename(f.filename or "file") or "file"
-                    remote = f"{share_dir}/{fname}"
-                    async with sftp.open(remote, "wb") as rf:
-                        while True:
-                            chunk = await f.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            await rf.write(chunk)
-                    await conn.run(f"chmod 666 {shlex.quote(remote)}")
-                    saved.append(fname)
+            for f in files:
+                fname = os.path.basename(f.filename or "file") or "file"
+                remote = f"{share_dir}/{fname}"
+                proc = await conn.create_process(
+                    f"cat > {shlex.quote(remote)}", encoding=None
+                )
+                while True:
+                    chunk = await f.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    proc.stdin.write(chunk)
+                proc.stdin.write_eof()
+                await proc.wait_closed()
+                if proc.returncode != 0:
+                    raise asyncssh.Error(f"파일 쓰기 실패: {fname}")
+                await conn.run(f"chmod 666 {shlex.quote(remote)}")
+                saved.append(fname)
 
             # 마운트 없이 이미 떠 있는 컨테이너에는 docker cp로 즉시 반영
             if not has_mount:

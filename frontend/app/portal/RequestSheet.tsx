@@ -15,11 +15,7 @@ const WORK_TYPES: { key: string; label: string; sub: string }[] = [
 const CPU_OPTS = [2, 4, 8, 16, 32];
 const RAM_OPTS = [4, 8, 16, 32, 64];
 const STORAGE_OPTS = [50, 100, 250, 500];
-
 const ADMIN_EMAIL = "ts250024@ts.hs.kr";
-
-// 1~28 + 특수값: -1 = 28+, 0 = 무한
-const DURATION_DAYS: number[] = Array.from({ length: 28 }, (_, i) => i + 1);
 
 export default function RequestSheet({
   nodes,
@@ -174,11 +170,10 @@ export default function RequestSheet({
                 </select>
                 <small>GB</small>
               </Field>
+              <Field label="유지 기간">
+                <DurationPicker value={duration} onChange={setDuration} isAdmin={isAdmin} />
+              </Field>
             </div>
-
-            <Field label="유지 기간">
-              <DurationPicker value={duration} onChange={setDuration} isAdmin={isAdmin} />
-            </Field>
           </div>
 
           <SelectMachine
@@ -217,39 +212,13 @@ export function DurationPicker({
 }) {
   return (
     <>
-      <div className={s.durationGrid}>
-        {DURATION_DAYS.map((d) => (
-          <button
-            key={d}
-            type="button"
-            className={s.durationBtn}
-            data-on={value === d}
-            onClick={() => onChange(d)}
-          >
-            {d}
-          </button>
+      <select value={value} onChange={(e) => onChange(Number(e.target.value))}>
+        {Array.from({ length: 28 }, (_, i) => i + 1).map((d) => (
+          <option key={d} value={d}>{d}일</option>
         ))}
-        <button
-          type="button"
-          className={s.durationBtn}
-          data-on={value === -1}
-          data-special="true"
-          onClick={() => onChange(-1)}
-        >
-          28+
-        </button>
-        {isAdmin && (
-          <button
-            type="button"
-            className={s.durationBtn}
-            data-on={value === 0}
-            data-infinite="true"
-            onClick={() => onChange(0)}
-          >
-            ∞ 무한
-          </button>
-        )}
-      </div>
+        <option value={-1}>28+ (관리자 승인 필요)</option>
+        {isAdmin && <option value={0}>∞ 무한</option>}
+      </select>
       {value === -1 && (
         <p className={s.durationOverNotice}>
           28일 초과 이용은 관리자 승인이 필요합니다.
