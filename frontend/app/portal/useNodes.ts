@@ -34,7 +34,7 @@ export function useNodes(pollMs = 8000) {
           const fresh: NodeInfo[] = d.nodes || [];
           // 실제 변경이 있을 때만 state 업데이트 — 폴링마다 새 배열 참조 생성 방지
           const key = JSON.stringify(fresh.map((n) => ({
-            id: n.id, av: n.available, ss: n.session_state, sc: n.session_count,
+            id: n.id, av: n.available, ss: n.session_state, sc: n.session_count, off: n.offline, ld: n.load === null,
           })));
           if (alive && key !== prevKeyRef.current) {
             prevKeyRef.current = key;
@@ -58,8 +58,12 @@ export function useNodes(pollMs = 8000) {
   return { nodes, loading };
 }
 
+export function isOffline(n: NodeInfo): boolean {
+  return !!n.offline || n.load === null;
+}
+
 export function nodeState(n: NodeInfo): "available" | "partial" | "suspended" | "active" | "offline" {
-  if (n.offline) return "offline";
+  if (isOffline(n)) return "offline";
   if (n.session_state === "full") return "active";
   if (n.session_state === "partial") return "partial";
   if (n.session_state === "suspended") return "suspended";

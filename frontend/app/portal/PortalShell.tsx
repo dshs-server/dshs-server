@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import s from "./atelier.module.css";
 import { useSession } from "./useSession";
-import { useNodes, type NodeInfo } from "./useNodes";
+import { useNodes, isOffline } from "./useNodes";
 import WorkPage from "./pages/WorkPage";
 import SavedPage from "./pages/SavedPage";
 import HistoryPage from "./pages/HistoryPage";
@@ -44,7 +44,8 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   }, []);
 
   const isAdmin = !!ctrl.me?.isAdmin;
-  const onlineCount = nodes.filter((n) => nodeOnline(n)).length;
+  const onlineCount = nodes.filter((n) => !isOffline(n)).length;
+  const nonOfflineCount = nodes.filter((n) => !isOffline(n)).length;
 
   return (
     <div className={s.root} data-variant="ivory" data-modal={ctrl.showNewSessionModal || undefined}>
@@ -93,7 +94,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
               <i /> 운영 중
             </span>
             <strong>
-              {onlineCount} / {nodes.length || "—"}
+              {onlineCount} / {nonOfflineCount || "—"}
             </strong>
             <small>온라인 장비</small>
           </div>
@@ -141,7 +142,3 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   );
 }
 
-function nodeOnline(n: NodeInfo): boolean {
-  if (n.offline) return false;
-  return n.session_state !== undefined ? true : n.available !== false;
-}

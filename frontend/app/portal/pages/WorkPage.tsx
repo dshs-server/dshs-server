@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import s from "../atelier.module.css";
 import { HelpTip, PowerIcon, ConfirmSheet, formatRemaining } from "../ui";
-import { nodeState, type NodeInfo } from "../useNodes";
+import { nodeState, isOffline, type NodeInfo } from "../useNodes";
 import type { SessionController, Status, SessionStats } from "../useSession";
 import type { Page } from "../PortalShell";
 import { UploadButton } from "@/components/upload";
@@ -345,7 +345,7 @@ function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
   const free = nodes.filter((n) => nodeState(n) === "available").length;
   const stateLabel = (st: "available" | "partial" | "suspended" | "active" | "offline") => {
     if (st === "active") return "사용 중";
-    if (st === "offline") return "사용 불가";
+    if (st === "offline") return "오프라인";
     return "가능";
   };
   const stateAttr = (st: "available" | "partial" | "suspended" | "active" | "offline") => {
@@ -354,12 +354,14 @@ function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
     return "available";
   };
 
+  const total = nodes.filter((n) => !isOffline(n)).length;
+
   return (
     <aside className={s.machineLedger}>
       <div className={s.machineLedgerHead}>
         <h2>PC 배정 현황</h2>
         <span>
-          {free} / {nodes.length} 사용 가능
+          {free} / {total} 사용 가능
         </span>
       </div>
       <div>
