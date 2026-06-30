@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import s from "./atelier.module.css";
 import { useSession } from "./useSession";
-import { useNodes, type NodeInfo } from "./useNodes";
+import { useNodes, isOffline } from "./useNodes";
 import WorkPage from "./pages/WorkPage";
 import SavedPage from "./pages/SavedPage";
 import HistoryPage from "./pages/HistoryPage";
@@ -21,24 +21,11 @@ const NAV: { key: Page; no: string; label: string }[] = [
   { key: "guide", no: "04", label: "이용 안내" },
 ];
 
-function todayLabel() {
-  try {
-    return new Date().toLocaleDateString("ko-KR", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      weekday: "long",
-    });
-  } catch {
-    return "";
-  }
-}
 
 export default function PortalShell({ initialPage = "work" }: { initialPage?: Page }) {
   const ctrl = useSession();
   const { nodes } = useNodes();
   const [page, setPage] = useState<Page>(initialPage);
-  const [date, setDate] = useState("");
   const [navWarn, setNavWarn] = useState(false);
 
   const onLogout = () => {
@@ -47,7 +34,6 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   };
 
   useEffect(() => {
-    setDate(todayLabel());
     const params = new URLSearchParams(window.location.search);
     const view = params.get("view");
     if (view && ["work", "saved", "history", "guide", "admin"].includes(view)) {
@@ -58,13 +44,11 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   }, []);
 
   const isAdmin = !!ctrl.me?.isAdmin;
-  const onlineCount = nodes.filter((n) => nodeOnline(n)).length;
-
-  const headerTitle =
-    page === "admin" ? "관리" : NAV.find((n) => n.key === page)?.label ?? "내 작업";
+  const onlineCount = nodes.filter((n) => !isOffline(n)).length;
+  const totalCount = nodes.length;
 
   return (
-    <div className={s.root} data-variant="ivory">
+    <div className={s.root} data-variant="ivory" data-modal={ctrl.showNewSessionModal || undefined}>
       <div className={s.field} aria-hidden="true">
         <i />
         <i />
@@ -75,14 +59,15 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
         <aside className={s.side}>
           <button className={s.wordmark} onClick={() => setPage("work")}>
             <span>DSHS</span>
-            <strong>GPU 전산실</strong>
+            <strong>전산실</strong>
           </button>
 
-          <nav>
+          <nav aria-label="페이지 탐색">
             {NAV.map((item) => (
               <button
                 key={item.key}
                 data-on={page === item.key}
+                aria-current={page === item.key ? "page" : undefined}
                 onClick={() => setPage(item.key)}
               >
                 <span>{item.no}</span>
@@ -95,6 +80,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
             <button
               className={s.adminEntry}
               data-on={page === "admin"}
+              aria-current={page === "admin" ? "page" : undefined}
               onClick={() => setPage("admin")}
             >
               <span>05</span>관리
@@ -102,31 +88,24 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
           )}
 
           <div className={s.sideFoot}>
+            <div className={s.sideAccount}>
+              <span title={ctrl.me?.email ?? undefined}>{ctrl.me?.email ?? "—"}</span>
+              <button className={s.logoutBtn} onClick={onLogout}>로그아웃</button>
+            </div>
             <span>
               <i /> 운영 중
             </span>
             <strong>
-              {onlineCount} / {nodes.length || "—"}
+              {onlineCount} / {totalCount || "—"}
             </strong>
             <small>온라인 장비</small>
           </div>
         </aside>
 
         <section className={s.stage}>
-          <header className={s.header}>
-            <div>
-              <strong>{headerTitle}</strong>
-              <span>{date}</span>
-            </div>
-            <div className={s.account}>
-              <span>{ctrl.me?.email ?? "—"}</span>
-              <button onClick={onLogout}>로그아웃</button>
-            </div>
-          </header>
-
           <main className={s.main}>
             {page === "work" && <WorkPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} />}
-            {page === "saved" && <SavedPage ctrl={ctrl} onNavigate={setPage} />}
+            {page === "saved" && <SavedPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} />}
             {page === "history" && <HistoryPage />}
             {page === "guide" && <GuidePage />}
             {page === "admin" && isAdmin && <AdminArea />}
@@ -134,9 +113,34 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
         </section>
       </div>
 
+      <nav className={s.mobileNav} aria-label="모바일 탐색">
+        {NAV.map((item) => (
+          <button
+            key={item.key}
+            data-on={page === item.key}
+            aria-current={page === item.key ? "page" : undefined}
+            onClick={() => setPage(item.key)}
+          >
+            <span className={s.mobileNavNo}>{item.no}</span>
+            <span>{item.label}</span>
+          </button>
+        ))}
+        {isAdmin && (
+          <button
+            data-on={page === "admin"}
+            aria-current={page === "admin" ? "page" : undefined}
+            onClick={() => setPage("admin")}
+          >
+            <span className={s.mobileNavNo}>05</span>
+            <span>관리</span>
+          </button>
+        )}
+      </nav>
+
       {ctrl.showNewSessionModal && (
         <RequestSheet
           nodes={nodes}
+          isAdmin={isAdmin}
           onClose={() => {
             ctrl.setShowNewSessionModal(false);
             ctrl.setReplaceSessionId(null);
@@ -162,9 +166,4 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
       )}
     </div>
   );
-}
-
-function nodeOnline(n: NodeInfo): boolean {
-  // available 또는 세션이 도는 노드 = 온라인. offline 표식만 제외.
-  return n.session_state !== undefined ? true : n.available !== false;
 }

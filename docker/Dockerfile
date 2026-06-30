@@ -101,4 +101,7 @@ RUN cd /home/kasm-default-profile/Desktop && \
         ! -name "code.desktop" \
         -delete
 
+RUN echo 'kasm-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kasm-user && \
+    chmod 440 /etc/sudoers.d/kasm-user
+
 USER 1000

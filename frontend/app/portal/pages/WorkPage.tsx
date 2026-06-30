@@ -1,14 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import s from "../atelier.module.css";
 import { HelpTip, PowerIcon, ConfirmSheet, formatRemaining } from "../ui";
-import { nodeState, type NodeInfo } from "../useNodes";
+import { nodeState, isOffline, type NodeInfo } from "../useNodes";
 import type { SessionController, Status, SessionStats } from "../useSession";
 import type { Page } from "../PortalShell";
 import { UploadButton } from "@/components/upload";
 
-type WorkMark = "ready" | "idle" | "starting" | "queued" | "error";
+type WorkMark = "ready" | "idle" | "starting" | "queued" | "error" | "migrating";
 
 const markFor: Record<Status, WorkMark> = {
   checking: "starting",
@@ -18,6 +18,7 @@ const markFor: Record<Status, WorkMark> = {
   busy: "error",
   queued: "queued",
   error: "error",
+  migrating: "migrating",
 };
 
 const markLabel: Record<WorkMark, string> = {
@@ -26,7 +27,9 @@ const markLabel: Record<WorkMark, string> = {
   starting: "준비 중",
   queued: "대기 중",
   error: "연결 오류",
+  migrating: "이전 중",
 };
+
 
 export default function WorkPage({
   ctrl,
@@ -38,6 +41,14 @@ export default function WorkPage({
 }) {
   const { status } = ctrl;
   const [confirmTerminate, setConfirmTerminate] = useState(false);
+  const [date, setDate] = useState("");
+
+  useEffect(() => {
+    try {
+      setDate(new Date().toLocaleDateString("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "long" }));
+    } catch {}
+  }, []);
+
   const openNew = () => {
     ctrl.setReplaceSessionId(null);
     ctrl.setShowNewSessionModal(true);
@@ -50,11 +61,7 @@ export default function WorkPage({
           <h1>내 작업</h1>
           <HelpTip text="배정된 PC와 보관 중인 환경을 확인합니다." />
         </div>
-        {(status === "idle" || status === "error") && (
-          <button className={s.solidButton} onClick={openNew}>
-            새 작업 신청
-          </button>
-        )}
+        {date && <span className={s.pageTitleDate}>{date}</span>}
       </div>
 
       <div className={s.workLayout}>
@@ -76,46 +83,12 @@ export default function WorkPage({
           )}
           {status === "queued" && <QueuedAssignment ctrl={ctrl} />}
           {status === "busy" && <BusyAssignment ctrl={ctrl} />}
+          {status === "migrating" && <MigratingAssignment message={ctrl.migratingMsg} />}
           {status === "error" && <ErrorAssignment ctrl={ctrl} />}
         </section>
 
         <MachineLedger nodes={nodes} />
       </div>
-
-      <section className={s.recentBlock}>
-        <div className={s.blockHeading}>
-          <h2>보관 중인 작업</h2>
-        </div>
-        <div className={s.ledgerTable}>
-          <div className={s.ledgerHead}>
-            <span>작업명</span>
-            <span>환경</span>
-            <span>저장 용량</span>
-            <span>삭제 예정</span>
-            <span />
-          </div>
-          {ctrl.suspendedSessions.length === 0 ? (
-            <div className={s.ledgerRow}>
-              <span>
-                <small>보관 중인 작업이 없습니다.</small>
-              </span>
-            </div>
-          ) : (
-            ctrl.suspendedSessions.map((item) => (
-              <div className={s.ledgerRow} key={item.id}>
-                <span>
-                  <strong>{item.project_name || "저장된 세션"}</strong>
-                  <small>{item.saved_at ? new Date(item.saved_at * 1000).toLocaleDateString("ko-KR") : ""}</small>
-                </span>
-                <span>{item.resources?.gpu || `${item.resources?.cpu_cores ?? "—"}코어`}</span>
-                <span>{item.resources?.storage_gb ? `${item.resources.storage_gb}GB` : "—"}</span>
-                <span>{relDays(item.delete_after)}</span>
-                <button onClick={() => ctrl.handleResume(item.id)}>이어하기</button>
-              </div>
-            ))
-          )}
-        </div>
-      </section>
 
       {confirmTerminate && (
         <ConfirmSheet
@@ -142,14 +115,17 @@ function ReadyAssignment({
   nodes: NodeInfo[];
   onTerminate: () => void;
 }) {
-  const { activeMeta, remaining, expiresAt, stats, url } = ctrl;
+  const { activeMeta, remaining, expiresAt, stats, url, terminalUrl, extendBlocked } = ctrl;
   const timeLevel =
     remaining == null ? "normal" : remaining <= 300 ? "critical" : remaining <= 1800 ? "warning" : "normal";
   const idx = nodes.findIndex((n) => n.id === activeMeta.node_id);
   const nodeNo = idx >= 0 ? String(idx + 1).padStart(2, "0") : "PC";
   const expiryStr = expiresAt
-    ? new Date(expiresAt * 1000).toLocaleString("ko-KR", { hour: "2-digit", minute: "2-digit" }) + " 종료"
+    ? new Date(expiresAt * 1000).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) + " 종료"
     : "";
+
+  const canExtend = remaining != null && remaining <= 2 * 86400 && !extendBlocked;
+  const showExtendRow = (remaining != null && remaining <= 2 * 86400) || extendBlocked;
 
   return (
     <div className={s.readyAssignment}>
@@ -178,7 +154,7 @@ function ReadyAssignment({
       </div>
 
       <div className={s.numbers}>
-        <Metric label="CPU" stat={stats?.cpu_pct} unit="%" cool="blue" />
+        <Metric label="CPU" stat={stats?.cpu_pct} unit="%" cool="blue" note={stats?.top_process || undefined} />
         <Metric label="GPU" stat={stats?.gpu_pct} unit="%" cool="green" />
         <Metric
           label="메모리"
@@ -209,11 +185,39 @@ function ReadyAssignment({
         >
           데스크톱 열기 <span>↗</span>
         </a>
+        {terminalUrl && (
+          <a
+            className={s.lineButton}
+            href={terminalUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            터미널 <span>↗</span>
+          </a>
+        )}
         <span />
         <button className={s.powerButton} aria-label="작업 종료" title="작업 종료" onClick={onTerminate}>
           <PowerIcon />
         </button>
       </div>
+
+      {showExtendRow && !extendBlocked && (
+        <div className={s.extendRow}>
+          <span>세션 종료 2일 이내 · 3일 연장 가능</span>
+          <button className={s.lineButton} onClick={ctrl.handleExtend} disabled={!canExtend}>
+            + 3일 연장
+          </button>
+        </div>
+      )}
+
+      {extendBlocked && (
+        <div className={s.extendBanner}>
+          <span>이 세션은 총 이용 기간 40일을 초과해 연장이 제한됩니다.</span>
+          <a href={`mailto:ts250024@ts.hs.kr?subject=[PC대여] 세션 연장 허가 요청`} className={s.lineButton}>
+            관리자에게 연락하기
+          </a>
+        </div>
+      )}
 
       <div className={s.uploadRow}>
         <UploadButton />
@@ -259,7 +263,7 @@ function Metric({
 }
 
 function IdleAssignment({ nodes, onRequest }: { nodes: NodeInfo[]; onRequest: () => void }) {
-  const free = nodes.filter((n) => nodeState(n) === "available").length;
+  const free = nodes.filter((n) => { const st = nodeState(n); return st === "available" || st === "partial"; }).length;
   return (
     <div className={s.plainState}>
       <span className={s.stateCode}>00</span>
@@ -290,6 +294,29 @@ function StartingAssignment({ nodeName }: { nodeName?: string }) {
           </li>
           <li>
             원격 접속 확인 <span>대기</span>
+          </li>
+        </ol>
+      </div>
+    </div>
+  );
+}
+
+function MigratingAssignment({ message }: { message?: string | null }) {
+  return (
+    <div className={s.prepState}>
+      <span className={s.stateCode}>02</span>
+      <div>
+        <h2>다른 PC로 환경을 이전하고 있습니다.</h2>
+        <p>{message || "저장된 환경을 전송하고 있습니다. 수 분이 소요될 수 있습니다."}</p>
+        <ol>
+          <li data-done="true">
+            PC 선택 <span>완료</span>
+          </li>
+          <li data-now="true">
+            환경 이미지 전송 <span>진행 중</span>
+          </li>
+          <li>
+            새 PC에서 시작 <span>대기</span>
           </li>
         </ol>
       </div>
@@ -352,18 +379,26 @@ function ErrorAssignment({ ctrl }: { ctrl: SessionController }) {
 }
 
 function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
-  const free = nodes.filter((n) => nodeState(n) === "available").length;
-  const stateLabel = (st: "available" | "suspended" | "active") =>
-    st === "available" ? "가능" : st === "suspended" ? "보관됨" : "사용 중";
-  const stateAttr = (st: "available" | "suspended" | "active") =>
-    st === "available" ? "available" : "busy";
+  const free = nodes.filter((n) => { const st = nodeState(n); return st === "available" || st === "partial"; }).length;
+  const stateLabel = (st: "available" | "partial" | "suspended" | "active" | "offline") => {
+    if (st === "active") return "사용 중";
+    if (st === "offline") return "오프라인";
+    return "가능";
+  };
+  const stateAttr = (st: "available" | "partial" | "suspended" | "active" | "offline") => {
+    if (st === "active") return "busy";
+    if (st === "offline") return "offline";
+    return "available";
+  };
+
+  const total = nodes.filter((n) => !isOffline(n)).length;
 
   return (
     <aside className={s.machineLedger}>
       <div className={s.machineLedgerHead}>
         <h2>PC 배정 현황</h2>
         <span>
-          {free} / {nodes.length} 사용 가능
+          {free} / {total} 사용 가능
         </span>
       </div>
       <div>
@@ -371,7 +406,7 @@ function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
           const st = nodeState(node);
           return (
             <article key={node.id} data-state={stateAttr(st)}>
-              <span>{String(index + 1).padStart(2, "0")}</span>
+              <span className={s.nodeNo}>{index + 1}</span>
               <div>
                 <strong>{node.name || node.id}</strong>
                 <small>{node.gpu}</small>

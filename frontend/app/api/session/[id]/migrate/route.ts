@@ -1,0 +1,43 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getSessionEmail, isAdmin } from "@/lib/auth";
+
+const BACKEND_URL = process.env.BACKEND_URL!;
+const API_KEY = process.env.API_KEY!;
+
+async function userHeaders() {
+  const email = await getSessionEmail();
+  if (!email) return null;
+  return {
+    "x-api-key": API_KEY,
+    "x-user-email": email || "",
+    "x-user-admin": isAdmin(email) ? "1" : "0",
+  };
+}
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+  const headers = await userHeaders();
+  if (!headers) {
+    return NextResponse.json({ error: "로그인이 필요합니다." }, { status: 401 });
+  }
+  try {
+    const body = await request.json();
+    const res = await fetch(`${BACKEND_URL}/session/${id}/migrate`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = typeof data.detail === "string" ? data.detail : null;
+      return NextResponse.json({ error: detail || "이전 요청 실패" }, { status: res.status });
+    }
+    return NextResponse.json(data);
+  } catch (e) {
+    console.error("session migrate error:", e);
+    return NextResponse.json({ error: "백엔드 서버에 연결할 수 없습니다." }, { status: 503 });
+  }
+}

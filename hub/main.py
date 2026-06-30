@@ -70,6 +70,9 @@ SECURITY_EXTENSIONS = tuple(
 )
 SECURITY_ALERT_DIR = os.path.join(LOG_DIR, "security-alerts")
 SECURITY_ALERTS_FILE = os.path.join(SECURITY_ALERT_DIR, "alerts.json")
+KST_OFFSET = 9 * 3600  # KST = UTC+9
+REBOOT_UPTIME_DAYS = int(os.environ.get("REBOOT_UPTIME_DAYS", "5"))    # 재부팅 임계 가동 일수
+REBOOT_VERIFY_TIMEOUT = int(os.environ.get("REBOOT_VERIFY_TIMEOUT", "600"))  # 재부팅 후 검증 최대 대기(초)
 
 # 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
 # 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
@@ -104,6 +107,7 @@ COL_ACTIVITY = "activity"
 _metrics: dict[str, dict] = {}
 _last_polled: dict[str, float] = {}  # node_id → last SSH poll timestamp
 _last_recovery: dict[str, float] = {}  # node_id → last recovery attempt timestamp
+_reboot_pending: dict[str, float] = {}  # node_id → reboot_sent_at timestamp
 _nodes_cache: list[dict] = []  # populated from Firestore; cleared on admin write to force reload
 NODES_CACHE_FILE = os.path.expanduser("~/hub/nodes_cache.json")
 
@@ -258,6 +262,9 @@ svc_nginx     = sh('systemctl is-active nginx')
 svc_tunnel    = sh('systemctl is-active kasm-tunnel')
 svc_tailscale = sh('systemctl is-active tailscaled')
 
+# 가동 시간 (/proc/uptime 첫 번째 숫자 = 부팅 후 초)
+uptime_s = float(open('/proc/uptime').readline().split()[0])
+
 print(json.dumps({
     'cpu': cpu,
     'ram_used_gb': round((rt - ra) / 1048576, 1),
@@ -270,6 +277,7 @@ print(json.dumps({
     'svc_nginx': svc_nginx,
     'svc_tunnel': svc_tunnel,
     'svc_tailscale': svc_tailscale,
+    'uptime_seconds': round(uptime_s),
 }))
 PYEOF"""
 
@@ -292,7 +300,8 @@ async def _ssh(host: str, command: str, ssh_user: str = SSH_USER) -> tuple[str, 
             connect_timeout=10,
         ) as conn:
             r = await conn.run(command)
-            return (r.stdout or "").strip(), r.returncode or 0
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            return out, r.returncode or 0
     except Exception:
         return "", -1
 
@@ -782,6 +791,90 @@ async def _email_notification_loop():
         await asyncio.sleep(EMAIL_CHECK_INTERVAL)
 
 
+# ── Reboot loop ───────────────────────────────────────────────────────────────
+
+
+def _seconds_until_3am_kst() -> float:
+    """다음 KST 03:00까지 남은 초."""
+    kst_3am = 3 * 3600
+    now_kst_in_day = (time.time() + KST_OFFSET) % 86400
+    if now_kst_in_day < kst_3am:
+        return kst_3am - now_kst_in_day
+    return 86400 - now_kst_in_day + kst_3am
+
+
+async def _verify_node_after_reboot(node_id: str, node_ip: str, ssh_user: str) -> None:
+    """재부팅 후 tailscale·nginx·kasm-tunnel 정상 작동 확인. 30초마다 폴링."""
+    logger.info("[reboot] %s: 재부팅 후 서비스 확인 시작 (최대 %ds)", node_id, REBOOT_VERIFY_TIMEOUT)
+    deadline = time.time() + REBOOT_VERIFY_TIMEOUT
+    while time.time() < deadline:
+        await asyncio.sleep(30)
+        m = await _collect_metrics(node_id, node_ip, ssh_user)
+        if m.get("offline"):
+            continue
+        _metrics[node_id] = m
+        nginx_ok     = m.get("svc_nginx") == "active"
+        tunnel_ok    = m.get("svc_tunnel") == "active"
+        tailscale_ok = m.get("svc_tailscale") == "active"
+        if nginx_ok and tunnel_ok and tailscale_ok:
+            logger.info(
+                "[reboot] %s: 재부팅 완료 — 모든 서비스 정상 (가동 %.0fs)",
+                node_id, m.get("uptime_seconds", 0),
+            )
+            _reboot_pending.pop(node_id, None)
+            return
+        # 아직 미기동 서비스 재시작 시도
+        cmds = []
+        if not nginx_ok:
+            cmds.append("sudo systemctl start nginx")
+        if not tunnel_ok:
+            cmds.append("sudo systemctl start kasm-tunnel")
+        if cmds:
+            logger.warning("[reboot] %s: 부팅 후 서비스 불완전 — 재시작 시도", node_id)
+            await _ssh(node_ip, " && ".join(cmds), ssh_user)
+    logger.error("[reboot] %s: 서비스 확인 타임아웃 (%ds 경과)", node_id, REBOOT_VERIFY_TIMEOUT)
+    _reboot_pending.pop(node_id, None)
+
+
+async def _reboot_loop() -> None:
+    """매일 KST 03:00에 REBOOT_UPTIME_DAYS일 이상 가동된 유휴 노드를 재부팅한다."""
+    while True:
+        wait = _seconds_until_3am_kst()
+        logger.info("[reboot] 다음 재부팅 점검까지 %.0f초 대기 (KST 03:00)", wait)
+        await asyncio.sleep(wait)
+        try:
+            nodes = await _get_nodes()
+            threshold = REBOOT_UPTIME_DAYS * 86400
+            for node in nodes:
+                nid      = node["id"]
+                node_ip  = node["ip"]
+                ssh_user = node.get("ssh_user", SSH_USER)
+
+                # 활성·시작 중 세션 있으면 건너뜀
+                active = [s for _, s in _sc_list(status=["active", "starting"]) if s.get("node_id") == nid]
+                if active:
+                    logger.info("[reboot] %s: 활성 세션 %d개 → 건너뜀", nid, len(active))
+                    continue
+
+                m = _metrics.get(nid, {})
+                if m.get("offline"):
+                    logger.info("[reboot] %s: 오프라인 → 건너뜀", nid)
+                    continue
+
+                uptime_s = m.get("uptime_seconds", 0)
+                if uptime_s < threshold:
+                    logger.info("[reboot] %s: 가동 %.1f일 < %d일 → 건너뜀", nid, uptime_s / 86400, REBOOT_UPTIME_DAYS)
+                    continue
+
+                logger.info("[reboot] %s: 가동 %.1f일 ≥ %d일, 세션 없음 → 재부팅 명령 전송", nid, uptime_s / 86400, REBOOT_UPTIME_DAYS)
+                await _ssh(node_ip, "sudo reboot", ssh_user)
+                _reboot_pending[nid] = time.time()
+                asyncio.create_task(_verify_node_after_reboot(nid, node_ip, ssh_user))
+        except Exception as e:
+            logger.error("[reboot] 루프 오류: %s", e)
+        await asyncio.sleep(60)  # 실행 직후 1분 대기 후 다음 루프에서 다음 3시까지 재슬립
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 
@@ -789,11 +882,12 @@ async def _email_notification_loop():
 async def lifespan(app: FastAPI):
     _load_security_alerts()
     await _init_sessions_cache()
-    poll_task = asyncio.create_task(_poll_nodes_loop())
-    log_task = asyncio.create_task(_log_loop())
-    email_task = asyncio.create_task(_email_notification_loop())
+    poll_task   = asyncio.create_task(_poll_nodes_loop())
+    log_task    = asyncio.create_task(_log_loop())
+    email_task  = asyncio.create_task(_email_notification_loop())
+    reboot_task = asyncio.create_task(_reboot_loop())
     yield
-    for t in (poll_task, log_task, email_task):
+    for t in (poll_task, log_task, email_task, reboot_task):
         t.cancel()
         try:
             await t
@@ -853,8 +947,34 @@ async def _docker_status(ip: str, ssh_user: str, container: str) -> str:
 def _container_name(session_id: str) -> str:
     return f"kasm_{session_id}"
 
+
+def _resource_limits_for_node(node: dict, n_sessions: int) -> tuple[float, float]:
+    """노드 90% 용량을 n_sessions 등분. (cpu_per, ram_gb_per) 반환."""
+    if n_sessions <= 0:
+        return (0.0, 0.0)
+    cpu_per = round(node.get("cpu_cores", 0) * 0.9 / n_sessions, 2)
+    ram_per = round(node.get("ram_gb", 0) * 0.9 / n_sessions, 1)
+    return (cpu_per, ram_per)
+
+
+async def _update_node_container_limits(
+    node_ip: str, ssh_user: str, containers: list[str], cpu: float, ram_gb: float
+) -> None:
+    """실행 중인 컨테이너들에 docker update로 리소스 한도 재적용."""
+    if not containers or cpu <= 0 or ram_gb <= 0:
+        return
+    names = " ".join(containers)
+    cmd = f"docker update --cpus {cpu} --memory {ram_gb}g {names} 2>&1 || true"
+    await _ssh(node_ip, cmd, ssh_user)
+
 def _session_url(session_id: str, kasm_url: str) -> str:
     return f"{kasm_url.rstrip('/')}/{session_id}/?path={session_id}/websockify"
+
+def _terminal_url(session_id: str, kasm_url: str) -> str:
+    return f"{kasm_url.rstrip('/')}/{session_id}/terminal/"
+
+def _ttyd_port(vnc_port: int) -> int:
+    return vnc_port + 200  # VNC: 8081-8199, ttyd: 8281-8399
 
 async def _allocate_port(node_id: str, node_ip: str, ssh_user: str) -> int:
     used = {s.get("port") for _, s in _sc_list(status=["active", "starting", "suspended"]) if s.get("node_id") == node_id and s.get("port")}
@@ -875,6 +995,14 @@ async def _allocate_port(node_id: str, node_ip: str, ssh_user: str) -> int:
     raise HTTPException(503, "노드 포트 부족 — 최대 세션 수 초과")
 
 _NGINX_LOCATION = """\
+    location /{session_id}/terminal/ {{
+        proxy_pass http://localhost:{ttyd_port}/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+    }}
     location /{session_id}/ {{
         proxy_pass https://localhost:{port}/;
         proxy_set_header Authorization "Basic a2FzbV91c2VyOnRlc3QxMjM0";
@@ -890,12 +1018,23 @@ _NGINX_LOCATION = """\
 async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str):
     domain = kasm_url.removeprefix("https://").rstrip("/")
     locations = [
-        _NGINX_LOCATION.format(session_id=sid, port=s["port"])
+        _NGINX_LOCATION.format(session_id=sid, port=s["port"], ttyd_port=_ttyd_port(s["port"]))
         for sid, s in _sc_list(status=["active", "starting", "suspended"])
         if s.get("node_id") == node_id and s.get("port")
     ]
     inner = "\n".join(locations) if locations else "    # no sessions"
-    config = f"server {{\n    listen 80;\n    server_name {domain};\n{inner}\n}}"
+    config = (
+        f"server {{\n"
+        f"    listen 80;\n"
+        f"    server_name {domain};\n"
+        f"    client_max_body_size 500M;\n"
+        f"    location /upload {{\n"
+        f"        proxy_pass http://localhost:8100;\n"
+        f"        proxy_read_timeout 600;\n"
+        f"    }}\n"
+        f"{inner}\n"
+        f"}}"
+    )
     b64 = base64.b64encode(config.encode()).decode()
     cmd = (
         f"echo {b64} | base64 -d > /home/{ssh_user}/.nginx-kasm.conf "
@@ -905,13 +1044,32 @@ async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str
 
 
 def _node_session_state(node_id: str, sessions: list[dict]) -> str:
+    active_count = 0
+    has_suspended = False
     for s in sessions:
-        if s.get("node_id") == node_id:
-            if s.get("status") in ("active", "starting"):
-                return "active"
-            if s.get("status") == "suspended":
-                return "suspended"
+        if s.get("node_id") != node_id:
+            continue
+        if s.get("status") in ("active", "starting"):
+            active_count += 1
+        elif s.get("status") == "suspended":
+            has_suspended = True
+    if active_count >= 2:
+        return "full"
+    if active_count == 1:
+        return "partial"
+    if has_suspended:
+        return "suspended"
     return "none"
+
+
+def _node_resource_used(node_id: str, sessions: list[dict]) -> dict:
+    cpu_sum = ram_sum = 0
+    for s in sessions:
+        if s.get("node_id") == node_id and s.get("status") in ("active", "starting"):
+            r = s.get("resources") or {}
+            cpu_sum += r.get("cpu_cores", 0)
+            ram_sum += r.get("ram_gb", 0)
+    return {"cpu_cores": cpu_sum, "ram_gb": ram_sum}
 
 
 # ── File transfer helpers ─────────────────────────────────────────────────────
@@ -1431,6 +1589,15 @@ async def list_nodes(
             continue
 
         state = _node_session_state(n["id"], sessions)
+        res_used = _node_resource_used(n["id"], sessions)
+        m = _metrics.get(n["id"], {})
+        ram_total = m.get("ram_total_gb") or n.get("ram_gb") or 0
+        load = None if m.get("offline") or not m else {
+            "cpu_pct": m.get("cpu"),
+            "ram_pct": round(m["ram_used_gb"] / ram_total * 100, 1) if ram_total else None,
+            "gpu_pct": m.get("gpu"),
+        }
+        sc = 2 if state == "full" else (1 if state == "partial" else 0)
         result.append({
             "id": n["id"],
             "name": n.get("name", n["id"]),
@@ -1439,8 +1606,12 @@ async def list_nodes(
             "gpu": n.get("gpu", ""),
             "ram_gb": n.get("ram_gb", 0),
             "storage_gb": n.get("storage_gb", 0),
-            "available": state != "active",
+            "available": state not in ("full",),
+            "offline": m.get("offline", not bool(m)),
             "session_state": state,
+            "session_count": sc,
+            "resource_used": res_used,
+            "load": load,
         })
 
     return {"nodes": result}
@@ -1510,6 +1681,7 @@ class SessionBody(BaseModel):
     duration_days: Optional[int] = 7
     work_type: Optional[str] = None
     replace_session_id: Optional[str] = None
+    behalf_of: Optional[str] = None  # admin only
 
 
 class EmailPreviewBody(BaseModel):
@@ -1536,16 +1708,22 @@ async def get_session(
     active = _sc_list(owner=me, status=["active", "starting"])
     suspended = _sc_list(owner=me, status="suspended")
 
-    suspended_sessions = [
-        {
+    now_ts = time.time()
+    suspended_sessions = []
+    for sid, s in suspended:
+        orig = s.get("original_created_at") or s.get("created_at", 0)
+        # 최소 1일로 재개해도 40일 초과 여부 체크
+        s_extend_blocked = (not s.get("extend_unlocked", False)) and \
+            ((now_ts + 86400 - orig) / 86400 >= 40)
+        suspended_sessions.append({
             "id": sid,
             "project_name": s.get("project_name", ""),
             "saved_at": s.get("suspended_at") or s.get("created_at", 0),
             "team_members": s.get("team_members", []),
             "resources": s.get("resources", {}),
-        }
-        for sid, s in suspended
-    ]
+            "original_created_at": orig,
+            "extend_blocked": s_extend_blocked,
+        })
 
     if not active:
         return {"status": "none", "suspended_sessions": suspended_sessions}
@@ -1565,12 +1743,20 @@ async def get_session(
     }
 
     if dock == "running":
-        url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
+        _kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
+        url = _session_url(session_id, _kasm_url)
+        orig = s.get("original_created_at") or s.get("created_at", time.time())
+        expires = s.get("expires_at", time.time())
+        extend_blocked = (not s.get("extend_unlocked", False)) and \
+            ((expires + 86400 - orig) / 86400 > 40)
         return {
             "status": "ready",
             "session_id": session_id,
             "url": url,
-            "expires_at": s.get("expires_at"),
+            "terminal_url": _terminal_url(session_id, _kasm_url),
+            "expires_at": expires,
+            "original_created_at": orig,
+            "extend_blocked": extend_blocked,
             "suspended_sessions": suspended_sessions,
             **meta,
         }
@@ -1602,9 +1788,15 @@ async def get_session(
             reason="실행 환경이 중지되어 세션을 보관 상태로 전환했습니다.",
             actor="시스템 · 상태 감지",
         )
+        _orig = s.get("original_created_at") or s.get("created_at", 0)
+        _now_ts2 = time.time()
+        _s_ext_blocked = (not s.get("extend_unlocked", False)) and \
+            ((_now_ts2 + 86400 - _orig) / 86400 >= 40)
         suspended_sessions = [{"id": session_id, "project_name": s.get("project_name", ""),
-                                "saved_at": time.time(), "team_members": s.get("team_members", []),
-                                "resources": s.get("resources", {})}] + suspended_sessions
+                                "saved_at": _now_ts2, "team_members": s.get("team_members", []),
+                                "resources": s.get("resources", {}),
+                                "original_created_at": _orig,
+                                "extend_blocked": _s_ext_blocked}] + suspended_sessions
         return {"status": "none", "suspended_sessions": suspended_sessions}
 
     # restarting, paused 등 — 실제로 준비 중
@@ -1625,6 +1817,24 @@ async def poll_session(
     if x_user_admin != "1" and s.get("owner") != me:
         raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
 
+    # 이전 중: docker 상태 확인 없이 즉시 반환
+    if s.get("status") == "migrating":
+        src_node_id = s.get("migration_source_node") or s["node_id"]
+        try:
+            src_node = await _get_node(src_node_id)
+        except Exception:
+            src_node = {"name": src_node_id, "gpu": "", "ip": "", "kasm_url": ""}
+        return {
+            "status": "migrating",
+            "message": s.get("migration_msg", "환경 이전 중…"),
+            "project_name": s.get("project_name", ""),
+            "work_type": s.get("work_type", ""),
+            "node_id": src_node_id,
+            "node_name": src_node.get("name", src_node_id),
+            "node_gpu": src_node.get("gpu", ""),
+            "node_ip": src_node.get("ip", ""),
+        }
+
     node = await _get_node(s["node_id"])
     _suser = node.get("ssh_user", SSH_USER)
     dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
@@ -1639,8 +1849,9 @@ async def poll_session(
     }
 
     if dock == "running":
-        url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
-        return {"status": "ready", "url": url, **meta}
+        _kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
+        url = _session_url(session_id, _kasm_url)
+        return {"status": "ready", "url": url, "terminal_url": _terminal_url(session_id, _kasm_url), **meta}
     if dock in ("exited", "dead"):
         return {"status": "error", "message": "컨테이너가 예기치 않게 종료되었습니다."}
     return {"status": "starting", **meta}
@@ -1657,6 +1868,10 @@ async def create_session(
     me = x_user_email.lower()
     is_admin = x_user_admin == "1"
 
+    # behalf_of: 관리자가 다른 사용자 대신 신청
+    if is_admin and body and body.behalf_of:
+        me = body.behalf_of.lower().strip()
+
     if resume:
         suspended_docs = _sc_list(owner=me, status="suspended")
         if not suspended_docs:
@@ -1670,11 +1885,54 @@ async def create_session(
         _suser = node.get("ssh_user", SSH_USER)
 
         container = _container_name(target_sid)
+
+        # 컨테이너 존재 확인
+        inspect_out, inspect_rc = await _ssh(
+            node["ip"],
+            f"docker inspect --format={{{{.State.Status}}}} {container} 2>/dev/null",
+            _suser,
+        )
+        if inspect_rc == -1:
+            raise HTTPException(status_code=503, detail="노드 서버 연결 실패. 잠시 후 다시 시도하세요.")
+        if inspect_rc != 0 or not inspect_out:
+            _sc_del(target_sid)
+            try:
+                await db.collection(COL_SESSIONS).document(target_sid).delete()
+            except Exception:
+                pass
+            raise HTTPException(status_code=409, detail="저장된 작업 파일이 더 이상 존재하지 않습니다. 새로 시작해주세요.", headers={"X-Container-Gone": "1"})
+
+        # duration 결정
+        resume_duration = (body.duration_days if body else None)
+        if resume_duration is None or resume_duration < 0:
+            resume_duration = 7
+        if resume_duration == 0:
+            expires_delta = 999 * 86400
+        else:
+            expires_delta = resume_duration * 86400
+
+        now_ts = time.time()
+        new_expires = now_ts + expires_delta
+        original_created = s.get("original_created_at") or s.get("created_at", now_ts)
+
+        # 40일 초과 체크
+        if not (is_admin or s.get("extend_unlocked")):
+            total_days = (new_expires - original_created) / 86400
+            if total_days > 40:
+                raise HTTPException(
+                    status_code=403,
+                    detail="세션 총 이용 기간이 40일을 초과합니다. 관리자 허가가 필요합니다.",
+                )
+
         stdout, rc = await _ssh(node["ip"], f"docker start {container}", _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker start 실패: {stdout}")
 
-        updates = {"status": "starting", "created_at": time.time()}
+        updates = {
+            "status": "starting",
+            "created_at": now_ts,
+            "expires_at": new_expires,
+        }
         _sc_update(target_sid, updates)
         await db.collection(COL_SESSIONS).document(target_sid).update(updates)
         if s.get("port"):
@@ -1715,31 +1973,58 @@ async def create_session(
 
     # Pick node — least-loaded with remaining port capacity
     node_id = body.node_id if body else None
+    req_res = (body.resources or {}) if body else {}
+    req_cpu = req_res.get("cpu_cores", 0)
+    req_ram = req_res.get("ram_gb", 0)
+
     if not node_id:
         all_nodes = await _get_nodes()
-        session_counts: dict[str, int] = {}
-        for _, sd2 in _sc_list(status=["active", "starting", "suspended"]):
+        active_sessions = list(_sc_list(status=["active", "starting"]))
+        node_sc: dict[str, int] = {}
+        node_ru: dict[str, dict] = {}
+        for _, sd2 in active_sessions:
             nid2 = sd2.get("node_id", "")
-            session_counts[nid2] = session_counts.get(nid2, 0) + 1
+            node_sc[nid2] = node_sc.get(nid2, 0) + 1
+            r2 = sd2.get("resources") or {}
+            if nid2 not in node_ru:
+                node_ru[nid2] = {"cpu_cores": 0, "ram_gb": 0}
+            node_ru[nid2]["cpu_cores"] += r2.get("cpu_cores", 0)
+            node_ru[nid2]["ram_gb"] += r2.get("ram_gb", 0)
 
         best_node: Optional[str] = None
         best_count = PORT_MAX - PORT_BASE + 1  # max capacity
         for nn in all_nodes:
-            count = session_counts.get(nn["id"], 0)
+            nid = nn["id"]
+            count = node_sc.get(nid, 0)
+            if count >= 2:
+                continue
+            used = node_ru.get(nid, {"cpu_cores": 0, "ram_gb": 0})
+            cpu_total = nn.get("cpu_cores", 0)
+            ram_total = nn.get("ram_gb", 0)
+            if cpu_total > 0 and req_cpu > 0 and (used["cpu_cores"] + req_cpu) / cpu_total > 0.9:
+                continue
+            if ram_total > 0 and req_ram > 0 and (used["ram_gb"] + req_ram) / ram_total > 0.9:
+                continue
             if count < best_count:
                 best_count = count
-                best_node = nn["id"]
+                best_node = nid
         if not best_node:
             raise HTTPException(status_code=503, detail="사용 가능한 PC가 없습니다.")
         node_id = best_node
 
     node = await _get_node(node_id)
+
+    # Per-node capacity check: 최대 2 세션
+    node_active_sids = [(sid, s) for sid, s in _sc_list(status=["active", "starting"]) if s.get("node_id") == node_id]
+    if len(node_active_sids) >= 2:
+        raise HTTPException(status_code=503, detail="해당 PC가 꽉 찼습니다. 다른 PC를 선택해주세요.")
     _suser = node.get("ssh_user", SSH_USER)
     kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
 
     new_id = uuid.uuid4().hex[:8]
     port = await _allocate_port(node_id, node["ip"], _suser)
     container = _container_name(new_id)
+    ttyd_port = _ttyd_port(port)
 
     # 사용자별 공유 폴더 준비 후 컨테이너 바탕화면에 bind-mount → 업로드한 파일이 보임
     share_dir = _share_dir(me, _suser)
@@ -1749,9 +2034,14 @@ async def create_session(
         _suser,
     )
 
+    # 등분 리소스 한도: (기존 세션 수 + 1)로 노드 90% 용량 나눔
+    n_after = len(node_active_sids) + 1
+    cpu_per, ram_per = _resource_limits_for_node(node, n_after)
+    resource_flags = f"--cpus {cpu_per} --memory {ram_per}g " if cpu_per > 0 and ram_per > 0 else ""
+
     cmd = (
         f"docker run -d --name {container} --restart unless-stopped "
-        f"--gpus all --shm-size=2gb -p {port}:6901 {_mount_arg(me, _suser)} "
+        f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {_mount_arg(me, _suser)} "
         f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
     )
     stdout, rc = await _ssh(node["ip"], cmd, _suser)
@@ -1760,29 +2050,46 @@ async def create_session(
         await _ssh(node["ip"], f"docker rm -f {container} 2>/dev/null || true", _suser)
         cmd_no_gpu = (
             f"docker run -d --name {container} --restart unless-stopped "
-            f"--shm-size=2gb -p {port}:6901 {_mount_arg(me, _suser)} "
+            f"--shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {_mount_arg(me, _suser)} "
             f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
         )
         stdout, rc = await _ssh(node["ip"], cmd_no_gpu, _suser)
         if rc != 0:
             raise HTTPException(status_code=500, detail=f"docker run 실패: {stdout}")
 
-    duration = (body.duration_days if body else None) or 7
+    duration = (body.duration_days if body else None)
+    if duration is None or duration < 0:
+        duration = 7
+    # 무한(0) → 999일
+    if duration == 0:
+        expires_delta = 999 * 86400
+    else:
+        expires_delta = duration * 86400
+
+    now_ts = time.time()
     session_data = {
         "node_id": node_id,
         "owner": me,
         "team_members": (body.team_members if body else None) or [],
         "project_name": (body.project_name if body else None) or "",
         "status": "starting",
-        "created_at": time.time(),
-        "expires_at": time.time() + duration * 86400,
+        "created_at": now_ts,
+        "original_created_at": now_ts,  # 연장/재개 시 불변
+        "expires_at": now_ts + expires_delta,
+        "extend_unlocked": False,
         "work_type": (body.work_type if body else None) or "",
         "resources": (body.resources if body else None) or {},
         "port": port,
         "url": _session_url(new_id, kasm_url),
+        "terminal_url": _terminal_url(new_id, kasm_url),
     }
     _sc_set(new_id, session_data)
     await db.collection(COL_SESSIONS).document(new_id).set(session_data)
+
+    # 기존 컨테이너들도 동일 한도로 축소 (새 세션 포함 n_after 등분)
+    if node_active_sids:
+        existing_containers = [_container_name(sid) for sid, _ in node_active_sids]
+        await _update_node_container_limits(node["ip"], _suser, existing_containers, cpu_per, ram_per)
 
     await _nginx_update(node_id, node["ip"], _suser, kasm_url)
     await _log_activity(
@@ -1807,6 +2114,269 @@ async def create_session(
         _sc_update(new_id, warning_updates)
         await db.collection(COL_SESSIONS).document(new_id).update(warning_updates)
     return {"session_id": new_id, "status": "starting"}
+
+
+class ExtendBody(BaseModel):
+    extend_days: Optional[int] = None
+    extend_unlocked: Optional[bool] = None
+
+
+class MigrateBody(BaseModel):
+    target_node_id: str
+    duration_days: Optional[int] = 7
+
+
+@app.patch("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])
+async def patch_session(
+    session_id: str,
+    body: ExtendBody,
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    s = _sc_get(session_id)
+    if s is None:
+        # fallback to Firestore for suspended sessions evicted from memory
+        try:
+            doc = await db.collection(COL_SESSIONS).document(session_id).get()
+            if doc.exists:
+                s = doc.to_dict()
+            else:
+                raise HTTPException(status_code=404, detail="Session not found")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+    me = x_user_email.lower()
+    is_admin = x_user_admin == "1"
+
+    if not is_admin and s.get("owner") != me:
+        raise HTTPException(status_code=403, detail="본인 세션만 수정할 수 있습니다.")
+
+    # 관리자 전용: extend_unlocked 설정
+    if body.extend_unlocked is not None:
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="관리자만 허가할 수 있습니다.")
+        updates = {"extend_unlocked": body.extend_unlocked}
+        _sc_update(session_id, updates)
+        await db.collection(COL_SESSIONS).document(session_id).update(updates)
+        return {"ok": True}
+
+    # extend_days: 연장
+    if body.extend_days is not None:
+        if body.extend_days <= 0:
+            raise HTTPException(status_code=400, detail="extend_days는 양수여야 합니다.")
+
+        current_expires = s.get("expires_at", time.time())
+        now_ts = time.time()
+        remaining = current_expires - now_ts
+
+        # 2일 이내에만 연장 가능
+        if remaining > 2 * 86400 and not is_admin:
+            raise HTTPException(
+                status_code=400,
+                detail="세션 종료 2일 이내에만 연장할 수 있습니다.",
+            )
+
+        new_expires = current_expires + body.extend_days * 86400
+        orig = s.get("original_created_at") or s.get("created_at", now_ts)
+
+        # 40일 초과 체크
+        if not (is_admin or s.get("extend_unlocked")):
+            total_days = (new_expires - orig) / 86400
+            if total_days > 40:
+                raise HTTPException(
+                    status_code=403,
+                    detail="세션 총 이용 기간이 40일을 초과합니다. 관리자 허가가 필요합니다.",
+                )
+
+        updates = {"expires_at": new_expires}
+        _sc_update(session_id, updates)
+        await db.collection(COL_SESSIONS).document(session_id).update(updates)
+        await _log_activity(
+            s.get("owner", me),
+            "session_extend",
+            f"세션을 {body.extend_days}일 연장했습니다",
+            s.get("project_name") or session_id,
+            node_id=s.get("node_id"),
+            project_name=s.get("project_name"),
+        )
+        return {"expires_at": new_expires}
+
+    raise HTTPException(status_code=400, detail="extend_days 또는 extend_unlocked 중 하나를 제공해야 합니다.")
+
+
+async def _do_migration(
+    session_id: str,
+    s: dict,
+    src_node: dict,
+    tgt_node: dict,
+    duration_days: int,
+    owner: str,
+) -> None:
+    """docker commit → asyncssh 파이프 → docker run 으로 컨테이너를 다른 노드로 이전한다."""
+    src_ip = src_node["ip"]
+    src_user = src_node.get("ssh_user", SSH_USER)
+    tgt_ip = tgt_node["ip"]
+    tgt_user = tgt_node.get("ssh_user", SSH_USER)
+    container = _container_name(session_id)
+    tmp_image = f"dshs-migrate-{session_id}"
+
+    async def _msg(msg: str) -> None:
+        _sc_update(session_id, {"migration_msg": msg})
+
+    async def _fail(reason: str) -> None:
+        logger.error("[migrate] %s 실패: %s", session_id, reason)
+        _sc_update(session_id, {"status": "suspended", "migration_msg": None, "migration_source_node": None})
+        try:
+            await db.collection(COL_SESSIONS).document(session_id).update({"status": "suspended"})
+        except Exception:
+            pass
+        # 소스 임시 이미지 정리
+        await _ssh(src_ip, f"docker rmi {tmp_image} 2>/dev/null || true", src_user)
+
+    try:
+        # 1. 소스 노드에서 컨테이너 커밋
+        await _msg("컨테이너 스냅샷 생성 중…")
+        out, rc = await _ssh(src_ip, f"docker commit {container} {tmp_image}", src_user)
+        if rc != 0:
+            await _fail(f"docker commit 실패: {out}")
+            return
+
+        # 2. asyncssh 이중 연결로 이미지 스트리밍 (소스 → 대상)
+        await _msg("이미지 전송 중… (수 분 소요)")
+        try:
+            async with asyncssh.connect(
+                src_ip, username=src_user, password=SSH_PASSWORD,
+                known_hosts=None, connect_timeout=30,
+            ) as src_conn:
+                async with asyncssh.connect(
+                    tgt_ip, username=tgt_user, password=SSH_PASSWORD,
+                    known_hosts=None, connect_timeout=30,
+                ) as tgt_conn:
+                    tgt_proc = await tgt_conn.create_process("docker load", encoding=None)
+                    async with src_conn.create_process(
+                        f"docker save {tmp_image}", encoding=None
+                    ) as src_proc:
+                        while True:
+                            chunk = await src_proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                            tgt_proc.stdin.write(chunk)
+                            await tgt_proc.stdin.drain()
+                        tgt_proc.stdin.write_eof()
+                    await tgt_proc.wait()
+        except Exception as e:
+            await _fail(f"이미지 전송 오류: {e}")
+            return
+
+        # 3. 대상 노드에서 공유 폴더 생성
+        share_dir = _share_dir(owner, tgt_user)
+        await _ssh(tgt_ip, f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}", tgt_user)
+
+        # 4. 대상 노드 포트 할당
+        await _msg("대상 PC에서 세션 시작 중…")
+        port = await _allocate_port(tgt_node["id"], tgt_ip, tgt_user)
+        ttyd_port = _ttyd_port(port)
+        kasm_url = tgt_node.get("kasm_url", "")
+
+        n_existing = len([x for _, x in _sc_list(status=["active", "starting"]) if x.get("node_id") == tgt_node["id"]])
+        cpu_per, ram_per = _resource_limits_for_node(tgt_node, n_existing + 1)
+        resource_flags = f"--cpus {cpu_per} --memory {ram_per}g " if cpu_per > 0 and ram_per > 0 else ""
+        mount = _mount_arg(owner, tgt_user)
+
+        # 5. docker run (GPU → CPU fallback)
+        cmd = (
+            f"docker run -d --name {container} --restart unless-stopped "
+            f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {mount} "
+            f"-e VNC_PW=test1234 {tmp_image}"
+        )
+        out, rc = await _ssh(tgt_ip, cmd, tgt_user)
+        if rc != 0:
+            await _ssh(tgt_ip, f"docker rm -f {container} 2>/dev/null || true", tgt_user)
+            cmd_no_gpu = (
+                f"docker run -d --name {container} --restart unless-stopped "
+                f"--shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {mount} "
+                f"-e VNC_PW=test1234 {tmp_image}"
+            )
+            out, rc = await _ssh(tgt_ip, cmd_no_gpu, tgt_user)
+            if rc != 0:
+                await _fail(f"docker run 실패: {out}")
+                return
+
+        # 6. nginx 업데이트 (대상 노드)
+        await _nginx_update(tgt_node["id"], tgt_ip, tgt_user, kasm_url)
+
+        # 7. 세션 스토어 업데이트
+        now_ts = time.time()
+        expires_delta = (duration_days * 86400) if duration_days > 0 else 999 * 86400
+        updates = {
+            "status": "starting",
+            "node_id": tgt_node["id"],
+            "port": port,
+            "url": _session_url(session_id, kasm_url),
+            "terminal_url": _terminal_url(session_id, kasm_url),
+            "created_at": now_ts,
+            "expires_at": now_ts + expires_delta,
+            "migration_msg": None,
+            "migration_source_node": None,
+        }
+        _sc_update(session_id, updates)
+        try:
+            await db.collection(COL_SESSIONS).document(session_id).update(updates)
+        except Exception:
+            pass
+
+        # 8. 소스 정리 (컨테이너 + 임시 이미지)
+        await _ssh(src_ip, f"docker rm -f {container} 2>/dev/null || true && docker rmi {tmp_image} 2>/dev/null || true", src_user)
+        await _ssh(tgt_ip, f"docker rmi {tmp_image} 2>/dev/null || true", tgt_user)
+
+        logger.info("[migrate] %s: %s → %s 완료", session_id, src_node["id"], tgt_node["id"])
+
+    except Exception as e:
+        await _fail(str(e))
+
+
+@app.post("/session/{session_id}/migrate", dependencies=[Depends(require_key), Depends(require_user)])
+async def migrate_session(
+    session_id: str,
+    body: MigrateBody,
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    me = x_user_email.lower()
+    is_admin = x_user_admin == "1"
+
+    s = _sc_get(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+    if not is_admin and s.get("owner") != me:
+        raise HTTPException(status_code=403, detail="본인 세션만 이전할 수 있습니다.")
+    if s.get("status") not in ("suspended",):
+        raise HTTPException(status_code=400, detail="일시 중지된 세션만 이전할 수 있습니다.")
+    if body.target_node_id == s["node_id"]:
+        raise HTTPException(status_code=400, detail="같은 PC입니다. 이어하기를 사용하세요.")
+
+    src_node = await _get_node(s["node_id"])
+    tgt_node = await _get_node(body.target_node_id)
+
+    # 대상 노드 용량 확인
+    tgt_active = [x for _, x in _sc_list(status=["active", "starting"]) if x.get("node_id") == body.target_node_id]
+    if len(tgt_active) >= 2:
+        raise HTTPException(status_code=503, detail="대상 PC가 꽉 찼습니다. 다른 PC를 선택해주세요.")
+
+    duration_days = body.duration_days if body.duration_days is not None else 7
+
+    # migrating으로 마킹 (소스 node_id 보존, migration_source_node 기록)
+    _sc_update(session_id, {
+        "status": "migrating",
+        "migration_source_node": s["node_id"],
+        "migration_msg": "컨테이너 스냅샷 생성 중…",
+    })
+
+    asyncio.create_task(_do_migration(session_id, s, src_node, tgt_node, duration_days, me))
+
+    return {"status": "migrating", "session_id": session_id}
 
 
 @app.delete("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])
@@ -1834,6 +2404,11 @@ async def delete_session(
         _sc_del(session_id)
         await db.collection(COL_SESSIONS).document(session_id).delete()
         await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+        # 남은 활성 컨테이너 한도 확장
+        remaining = [(sid, ss) for sid, ss in _sc_list(status=["active", "starting"]) if ss.get("node_id") == s["node_id"]]
+        if remaining:
+            cpu_per, ram_per = _resource_limits_for_node(node, len(remaining))
+            await _update_node_container_limits(node["ip"], _suser, [_container_name(sid) for sid, _ in remaining], cpu_per, ram_per)
         await _log_activity(
             s.get("owner", me),
             "session_delete",
@@ -1850,6 +2425,11 @@ async def delete_session(
     _sc_update(session_id, {"status": "suspended", "suspended_at": time.time()})
     await db.collection(COL_SESSIONS).document(session_id).update({"status": "suspended", "suspended_at": time.time()})
     await _nginx_update(s["node_id"], node["ip"], _suser, kasm_url)
+    # 중지된 컨테이너는 리소스 반납 → 남은 활성 컨테이너 한도 확장
+    remaining = [(sid, ss) for sid, ss in _sc_list(status=["active", "starting"]) if ss.get("node_id") == s["node_id"]]
+    if remaining:
+        cpu_per, ram_per = _resource_limits_for_node(node, len(remaining))
+        await _update_node_container_limits(node["ip"], _suser, [_container_name(sid) for sid, _ in remaining], cpu_per, ram_per)
     await _log_activity(
         s.get("owner", me),
         "session_suspend",
@@ -1928,6 +2508,32 @@ async def get_history(
 # ── Routes: file upload ───────────────────────────────────────────────────────
 
 
+@app.get("/upload-ticket", dependencies=[Depends(require_key)])
+async def upload_ticket(x_user_email: str = Header("")):
+    """노드 직접 업로드용 서명 토큰 + 노드 URL 반환. Vercel API 라우트가 호출한다."""
+    me = x_user_email.lower()
+    if not me:
+        raise HTTPException(status_code=400, detail="x-user-email 헤더 필요")
+
+    active = _sc_list(owner=me, status=["active", "starting"])
+    suspended = _sc_list(owner=me, status="suspended")
+    target = (active or suspended or [None])[0]
+    if not target:
+        raise HTTPException(status_code=400, detail="먼저 PC 세션을 시작한 뒤 파일을 보낼 수 있습니다.")
+
+    session_id, s = target
+    node = await _get_node(s["node_id"])
+    container = _container_name(session_id)
+    upload_url = node.get("kasm_url", "")
+
+    exp = int(time.time()) + 300
+    payload = f"{me}|{container}|{exp}"
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
+    sig = hmac.new(UPLOAD_SECRET.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+
+    return {"token": f"{payload_b64}.{sig}", "upload_url": upload_url, "expires_at": exp}
+
+
 @app.post("/upload")
 async def upload_files(
     files: list[UploadFile] = File(...),
@@ -1965,18 +2571,23 @@ async def upload_files(
             known_hosts=None,
             connect_timeout=10,
         ) as conn:
-            async with conn.start_sftp_client() as sftp:
-                for f in files:
-                    fname = os.path.basename(f.filename or "file") or "file"
-                    remote = f"{share_dir}/{fname}"
-                    async with sftp.open(remote, "wb") as rf:
-                        while True:
-                            chunk = await f.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            await rf.write(chunk)
-                    await conn.run(f"chmod 666 {shlex.quote(remote)}")
-                    saved.append(fname)
+            for f in files:
+                fname = os.path.basename(f.filename or "file") or "file"
+                remote = f"{share_dir}/{fname}"
+                proc = await conn.create_process(
+                    f"cat > {shlex.quote(remote)}", encoding=None
+                )
+                while True:
+                    chunk = await f.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    proc.stdin.write(chunk)
+                proc.stdin.write_eof()
+                await proc.wait_closed()
+                if proc.returncode != 0:
+                    raise asyncssh.Error(f"파일 쓰기 실패: {fname}")
+                await conn.run(f"chmod 666 {shlex.quote(remote)}")
+                saved.append(fname)
 
             # 마운트 없이 이미 떠 있는 컨테이너에는 docker cp로 즉시 반영
             if not has_mount:
@@ -2064,6 +2675,7 @@ async def admin_nodes():
             "storage_used_gb": m.get("storage_used_gb", 0),
             "storage_total_gb": m.get("storage_total_gb") or n.get("storage_gb", 0),
             "top_process": m.get("top"),
+            "uptime_seconds": m.get("uptime_seconds"),
         }
 
         if n["id"] in active_by_node:
@@ -2235,6 +2847,10 @@ async def admin_sessions():
                 except Exception:
                     node_names[nid] = nid
             name = node_names[nid]
+        orig = s.get("original_created_at") or s.get("created_at", 0)
+        expires = s.get("expires_at", 0)
+        extend_blocked = (not s.get("extend_unlocked", False)) and \
+            ((expires - orig) / 86400 >= 40)
         result.append({
             "id": doc.id,
             "owner": s.get("owner"),
@@ -2242,8 +2858,10 @@ async def admin_sessions():
             "node_id": nid,
             "node_name": name,
             "status": s.get("status"),
-            "expires_at": s.get("expires_at"),
+            "expires_at": expires,
             "suspended_at": s.get("suspended_at"),
+            "original_created_at": orig,
+            "extend_blocked": extend_blocked,
         })
     order = {"active": 0, "starting": 1, "suspended": 2}
     result.sort(key=lambda r: order.get(r.get("status"), 3))

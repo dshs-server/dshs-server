@@ -31,7 +31,7 @@ export function PowerIcon() {
 }
 
 export function Overlay({ children }: { children: ReactNode }) {
-  return <div className={s.overlay}>{children}</div>;
+  return <div className={s.overlay} role="presentation">{children}</div>;
 }
 
 export function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -60,7 +60,13 @@ export function ConfirmSheet({
 }) {
   return (
     <Overlay>
-      <section className={s.uploadSheet} style={{ width: "min(440px, 94vw)" }}>
+      <section
+        className={s.uploadSheet}
+        style={{ width: "min(440px, 94vw)" }}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
         <header>
           <div>
             <h2>{title}</h2>

@@ -13,7 +13,8 @@ export type Status =
   | "ready"
   | "busy"
   | "queued"
-  | "error";
+  | "error"
+  | "migrating";
 
 export interface SessionStats {
   cpu_pct?: number;
@@ -27,18 +28,23 @@ export interface SessionStats {
   storage_pct?: number;
   storage_used_gb?: number;
   storage_total_gb?: number;
+  top_process?: string;
 }
 
 export interface SuspendedSession {
   id: string;
+  node_id?: string;
   project_name?: string;
   saved_at?: number;
   delete_after?: number;
   team_members?: string[];
+  original_created_at?: number;
+  extend_blocked?: boolean;
   resources?: {
     cpu_cores?: number;
     ram_gb?: number;
     storage_gb?: number;
+    storage_used_gb?: number;
     gpu?: string;
   };
 }
@@ -58,6 +64,7 @@ export interface SessionData {
   status: string;
   session_id?: string;
   url?: string;
+  terminal_url?: string;
   message?: string;
   expires_at?: number;
   owner?: string;
@@ -69,6 +76,8 @@ export interface SessionData {
   node_name?: string;
   node_gpu?: string;
   node_ip?: string;
+  original_created_at?: number;
+  extend_blocked?: boolean;
 }
 
 export interface ActiveMeta {
@@ -91,8 +100,9 @@ export function useSession() {
   const [status, setStatus] = useState<Status>("checking");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [url, setUrl] = useState<string | null>(null);
+  const [terminalUrl, setTerminalUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [elapsed, setElapsed] = useState(0);
+  const elapsedRef = useRef(0); // state로 두면 1초마다 전체 리렌더링 유발
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [remaining, setRemaining] = useState<number | null>(null);
   const [owner, setOwner] = useState<string | null>(null);
@@ -101,9 +111,11 @@ export function useSession() {
   const [stats, setStats] = useState<SessionStats | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [suspendedSessions, setSuspendedSessions] = useState<SuspendedSession[]>([]);
+  const [migratingMsg, setMigratingMsg] = useState<string | null>(null);
   const [activeMeta, setActiveMeta] = useState<ActiveMeta>({});
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [replaceSessionId, setReplaceSessionId] = useState<string | null>(null);
+  const [extendBlocked, setExtendBlocked] = useState(false);
 
   const captureMeta = useCallback((data: SessionData) => {
     setActiveMeta({
@@ -135,6 +147,7 @@ export function useSession() {
     if (data.owner) setOwner(data.owner);
     if (typeof data.queue_position === "number") setQueuePos(data.queue_position);
     if (Array.isArray(data.suspended_sessions)) setSuspendedSessions(data.suspended_sessions);
+    if (typeof data.extend_blocked === "boolean") setExtendBlocked(data.extend_blocked);
   }, []);
 
   const startStatsPolling = useCallback((sid: string) => {
@@ -161,12 +174,14 @@ export function useSession() {
           applyData(data);
           if (data.status === "ready") {
             setUrl(data.url || null);
+            setTerminalUrl(data.terminal_url || null);
             captureMeta(data);
             if (pollRef.current) clearInterval(pollRef.current);
             try {
               const sr = await fetch(`/api/session/${sid}/stats`);
               if (sr.ok) setStats(await sr.json());
             } catch {}
+            setMigratingMsg(null);
             setStatus("ready");
             startStatsPolling(sid);
             toast("데스크톱이 준비되었습니다!", "success");
@@ -175,6 +190,10 @@ export function useSession() {
             setStatus("error");
             clearIntervals();
             toast("세션 준비에 실패했습니다.", "error");
+          } else if (data.status === "migrating") {
+            if (data.message) setMigratingMsg(data.message);
+          } else if (data.status === "starting") {
+            setStatus((prev) => (prev === "migrating" ? "starting" : prev));
           }
         } catch {
           // keep polling
@@ -191,10 +210,10 @@ export function useSession() {
       setStatus("starting");
       setErrorMsg(null);
       setUrl(null);
-      setElapsed(0);
+      elapsedRef.current = 0;
       setSessionId(null);
       expiredRef.current = false;
-      timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
+      timerRef.current = setInterval(() => { elapsedRef.current += 1; }, 1000);
 
       try {
         const body = {
@@ -257,26 +276,37 @@ export function useSession() {
   );
 
   const handleResume = useCallback(
-    async (suspendedId: string) => {
+    async (suspendedId: string, durationDays: number) => {
       setStatus("starting");
       setErrorMsg(null);
       setUrl(null);
-      setElapsed(0);
+      elapsedRef.current = 0;
       setSessionId(null);
       expiredRef.current = false;
-      timerRef.current = setInterval(() => setElapsed((n) => n + 1), 1000);
+      timerRef.current = setInterval(() => { elapsedRef.current += 1; }, 1000);
 
       try {
         const extra =
           suspendedId !== "default" ? `&session_id=${encodeURIComponent(suspendedId)}` : "";
-        const res = await fetch(`/api/session?resume=true${extra}`, { method: "POST" });
+        const res = await fetch(`/api/session?resume=true${extra}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ duration_days: durationDays }),
+        });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "세션 재시작 실패");
+        if (!res.ok) {
+          if (res.status === 409 && data.container_gone) {
+            setSuspendedSessions((prev) => prev.filter((x) => x.id !== suspendedId));
+            setStatus("idle");
+            clearIntervals();
+            toast(data.error || "저장된 작업 파일이 없습니다. 새로 시작해주세요.", "error");
+            return;
+          }
+          throw new Error(data.error || "세션 재시작 실패");
+        }
         setSuspendedSessions((prev) => {
           const item = prev.find((x) => x.id === suspendedId);
-          if (item) {
-            setActiveMeta({ project_name: item.project_name });
-          }
+          if (item) setActiveMeta({ project_name: item.project_name });
           return prev.filter((x) => x.id !== suspendedId);
         });
         applyData(data);
@@ -314,6 +344,7 @@ export function useSession() {
       setStatus("idle");
       setSessionId(null);
       setUrl(null);
+      setTerminalUrl(null);
       setExpiresAt(null);
       setRemaining(null);
       setStats(null);
@@ -327,6 +358,30 @@ export function useSession() {
     [sessionId, clearIntervals, toast]
   );
 
+  const handleExtend = useCallback(async () => {
+    const sid = sessionId;
+    if (!sid) return;
+    try {
+      const res = await fetch(`/api/session/${sid}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ extend_days: 3 }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast(data.error || "연장에 실패했습니다.", "error");
+        return;
+      }
+      if (typeof data.expires_at === "number") {
+        setExpiresAt(data.expires_at);
+        // 연장 후 새 total 계산 → extendBlocked 재계산은 다음 poll/applyData에서 처리
+      }
+      toast("세션이 3일 연장되었습니다.", "success");
+    } catch {
+      toast("연장 중 오류가 발생했습니다.", "error");
+    }
+  }, [sessionId, toast]);
+
   const handlePermanentDelete = useCallback(
     async (id: string) => {
       try {
@@ -338,6 +393,39 @@ export function useSession() {
       toast("세션을 완전히 삭제했습니다.", "success");
     },
     [toast]
+  );
+
+  const handleMigrate = useCallback(
+    async (suspendedId: string, targetNodeId: string, durationDays: number) => {
+      setStatus("migrating");
+      setMigratingMsg("컨테이너 스냅샷 생성 중…");
+      setErrorMsg(null);
+      setUrl(null);
+      elapsedRef.current = 0;
+      setSessionId(suspendedId);
+      expiredRef.current = false;
+      timerRef.current = setInterval(() => { elapsedRef.current += 1; }, 1000);
+
+      try {
+        const res = await fetch(`/api/session/${suspendedId}/migrate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target_node_id: targetNodeId, duration_days: durationDays }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "이전 요청 실패");
+        }
+        setSuspendedSessions((prev) => prev.filter((x) => x.id !== suspendedId));
+        startPolling(suspendedId);
+        toast("환경을 다른 PC로 이전하고 있습니다…", "info");
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e instanceof Error ? e.message : "오류 발생");
+        clearIntervals();
+      }
+    },
+    [clearIntervals, startPolling, toast]
   );
 
   const handleCheckAvailability = useCallback(async () => {
@@ -462,6 +550,7 @@ export function useSession() {
         if (data.status === "ready" && data.url) {
           setSessionId(data.session_id || null);
           setUrl(data.url);
+          setTerminalUrl(data.terminal_url || null);
           captureMeta(data);
           if (data.session_id) {
             try {
@@ -507,15 +596,13 @@ export function useSession() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const progressPct = Math.min(elapsed * 3, 92);
-
   return {
     status,
     setStatus,
     sessionId,
     url,
+    terminalUrl,
     errorMsg,
-    elapsed,
     expiresAt,
     remaining,
     owner,
@@ -525,17 +612,20 @@ export function useSession() {
     notice,
     suspendedSessions,
     activeMeta,
-    progressPct,
     showNewSessionModal,
     setShowNewSessionModal,
     replaceSessionId,
     setReplaceSessionId,
     handleStartNew,
     handleResume,
+    handleMigrate,
     handleTerminate,
+    handleExtend,
     handlePermanentDelete,
     handleCheckAvailability,
     handleLogout,
+    extendBlocked,
+    migratingMsg,
   };
 }
 

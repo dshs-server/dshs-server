@@ -30,6 +30,7 @@ export async function GET(
       ram_total_gb?: number;
       storage_used_gb?: number;
       storage_total_gb?: number;
+      top_process?: string;
     }[] = data.nodes || [];
 
     const node = nodes.find((n) => n.status === "in_use");
@@ -54,6 +55,7 @@ export async function GET(
       storage_pct: storagePct,
       storage_used_gb: node.storage_used_gb,
       storage_total_gb: node.storage_total_gb,
+      top_process: node.top_process,
     });
   } catch {
     return NextResponse.json({});
