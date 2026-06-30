@@ -774,7 +774,18 @@ async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str
         if s.get("node_id") == node_id and s.get("port")
     ]
     inner = "\n".join(locations) if locations else "    # no sessions"
-    config = f"server {{\n    listen 80;\n    server_name {domain};\n{inner}\n}}"
+    config = (
+        f"server {{\n"
+        f"    listen 80;\n"
+        f"    server_name {domain};\n"
+        f"    client_max_body_size 500M;\n"
+        f"    location /upload {{\n"
+        f"        proxy_pass http://localhost:8100;\n"
+        f"        proxy_read_timeout 600;\n"
+        f"    }}\n"
+        f"{inner}\n"
+        f"}}"
+    )
     b64 = base64.b64encode(config.encode()).decode()
     cmd = (
         f"echo {b64} | base64 -d > /home/{ssh_user}/.nginx-kasm.conf "

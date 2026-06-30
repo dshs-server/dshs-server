@@ -33,9 +33,9 @@ export default function RequestSheet({
   const [members, setMembers] = useState<string[]>([]);
   const [memberInput, setMemberInput] = useState("");
   const [memberError, setMemberError] = useState<string | null>(null);
-  const [cpu, setCpu] = useState(8);
-  const [ram, setRam] = useState(16);
-  const [storage, setStorage] = useState(100);
+  const [cpu, setCpu] = useState(2);
+  const [ram, setRam] = useState(4);
+  const [storage, setStorage] = useState(50);
   const [duration, setDuration] = useState(7); // -1 = 28+, 0 = 무한
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
