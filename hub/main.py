@@ -1001,9 +1001,12 @@ _NGINX_LOCATION = """\
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
+        proxy_set_header Accept-Encoding "";
         proxy_buffering off;
         proxy_read_timeout 3600;
         proxy_send_timeout 3600;
+        sub_filter '</head>' '<script>document.addEventListener("keydown",function(e){{if(e.isComposing||e.key==="Process"){{e.stopImmediatePropagation();e.preventDefault();}}}}  ,true);</script></head>';
+        sub_filter_once on;
     }}
     location /{session_id}/ {{
         proxy_pass https://localhost:{port}/;
