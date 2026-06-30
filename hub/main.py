@@ -17,6 +17,7 @@ import re
 import shlex
 import time
 import uuid
+from binascii import Error as BinasciiError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore_async
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -52,6 +54,22 @@ IDLE_POLL_INTERVAL = int(os.environ.get("IDLE_POLL_INTERVAL", "60"))  # seconds 
 LOG_INTERVAL = int(os.environ.get("LOG_INTERVAL", "600"))             # seconds (10분)
 LOG_DIR = os.path.expanduser(os.environ.get("LOG_DIR", "~/hub/logs"))
 RECOVERY_INTERVAL = int(os.environ.get("RECOVERY_INTERVAL", "60"))  # 노드당 복구 체크 최소 간격 (초)
+
+# 활성 데스크톱의 최근 파일을 검사해 관리자 보안 경고를 만든다. 확장자 목록은
+# 쉼표로 덮어쓸 수 있으며 영숫자 확장자만 허용해 원격 셸 명령에 안전하게 넣는다.
+SECURITY_SCAN_ENABLED = os.environ.get("SECURITY_SCAN_ENABLED", "1").lower() not in {"0", "false", "no"}
+SECURITY_SCAN_LOOKBACK = int(os.environ.get("SECURITY_SCAN_LOOKBACK", str(max(LOG_INTERVAL * 2, 900))))
+SECURITY_ALERT_LIMIT = int(os.environ.get("SECURITY_ALERT_LIMIT", "200"))
+SECURITY_EXTENSIONS = tuple(
+    ext.strip().lower().lstrip(".")
+    for ext in os.environ.get(
+        "SECURITY_EXTENSIONS",
+        "exe,msi,bat,cmd,com,scr,pif,vbs,vbe,wsf,wsh,ps1,apk",
+    ).split(",")
+    if re.fullmatch(r"[a-zA-Z0-9]{1,12}", ext.strip().lstrip("."))
+)
+SECURITY_ALERT_DIR = os.path.join(LOG_DIR, "security-alerts")
+SECURITY_ALERTS_FILE = os.path.join(SECURITY_ALERT_DIR, "alerts.json")
 
 # 파일 전송 — 노드 호스트의 공유 폴더(사용자별) ↔ 컨테이너 바탕화면에 bind-mount.
 # 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
@@ -95,6 +113,9 @@ NODES_CACHE_FILE = os.path.expanduser("~/hub/nodes_cache.json")
 # Loaded from Firestore once at startup; falls back to local JSON file if quota exceeded.
 _sessions_cache: dict[str, dict] = {}
 SESSIONS_CACHE_FILE = os.path.expanduser("~/hub/sessions_cache.json")
+
+# 최신 항목부터 반환하지만 내부 저장은 오래된 순서로 유지한다.
+_security_alerts: list[dict] = []
 
 
 def _sc_get(session_id: str) -> dict | None:
@@ -428,6 +449,192 @@ async def _get_container_top3(node_ip: str, ssh_user: str, container: str) -> li
     return [l.strip() for l in stdout.splitlines() if l.strip()]
 
 
+def _load_security_alerts() -> None:
+    """Load persisted alerts. A damaged file must never stop the hub."""
+    _security_alerts.clear()
+    try:
+        with open(SECURITY_ALERTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            _security_alerts.extend(item for item in data if isinstance(item, dict))
+    except (OSError, json.JSONDecodeError):
+        return
+
+
+def _persist_security_alerts() -> None:
+    os.makedirs(SECURITY_ALERT_DIR, exist_ok=True)
+    tmp_path = SECURITY_ALERTS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(_security_alerts, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, SECURITY_ALERTS_FILE)
+
+
+def _store_security_alert(alert: dict) -> None:
+    _security_alerts.append(alert)
+    while len(_security_alerts) > max(1, SECURITY_ALERT_LIMIT):
+        removed = _security_alerts.pop(0)
+        screenshot = removed.get("screenshot")
+        if screenshot:
+            try:
+                os.remove(os.path.join(SECURITY_ALERT_DIR, os.path.basename(screenshot)))
+            except OSError:
+                pass
+    _persist_security_alerts()
+
+
+def _public_security_alert(alert: dict) -> dict:
+    return {
+        key: value
+        for key, value in alert.items()
+        if key not in {"fingerprints", "screenshot"}
+    } | {"has_screenshot": bool(alert.get("screenshot"))}
+
+
+def _security_fingerprint(session_id: str, path: str, mtime: float) -> str:
+    raw = f"{session_id}\0{path}\0{mtime:.6f}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _security_reason(path: str) -> tuple[str, str]:
+    """Return a Korean reason and severity for a suspicious filename."""
+    name = os.path.basename(path).lower()
+    risky = "|".join(re.escape(ext) for ext in SECURITY_EXTENSIONS)
+    if risky and re.search(rf"\.[a-z0-9]{{1,8}}\.({risky})$", name):
+        return "문서처럼 위장한 이중 확장자", "critical"
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    return f"실행 위험 확장자 .{ext}", "high"
+
+
+def _parse_security_scan(stdout: str, session_id: str) -> list[dict]:
+    """Parse base64(find -printf) output without breaking on spaces or newlines."""
+    if not stdout:
+        return []
+    try:
+        decoded = base64.b64decode(stdout, validate=True).decode("utf-8", "replace")
+    except (BinasciiError, ValueError, UnicodeDecodeError):
+        return []
+
+    found: list[dict] = []
+    for record in decoded.split("\0"):
+        if not record:
+            continue
+        parts = record.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            mtime, size = float(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        path = parts[2]
+        reason, severity = _security_reason(path)
+        found.append({
+            "path": path,
+            "size": size,
+            "mtime": mtime,
+            "reason": reason,
+            "severity": severity,
+            "fingerprint": _security_fingerprint(session_id, path, mtime),
+        })
+    return found
+
+
+def _security_scan_command(container: str) -> str:
+    minutes = max(2, (SECURITY_SCAN_LOOKBACK + 59) // 60)
+    patterns = " -o ".join(f"-iname {shlex.quote('*.%s' % ext)}" for ext in SECURITY_EXTENSIONS)
+    if not patterns:
+        return "true"
+    inner = (
+        "find /home/kasm-user/Desktop /home/kasm-user/Downloads "
+        "/home/kasm-user/받은파일 -xdev -type f "
+        f"-mmin -{minutes} \\( {patterns} \\) "
+        "-printf '%T@\\t%s\\t%p\\0' 2>/dev/null | head -z -n 100 | base64 -w0"
+    )
+    return f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(inner)}"
+
+
+async def _capture_container_screenshot(
+    node_ip: str,
+    ssh_user: str,
+    container: str,
+    alert_id: str,
+) -> Optional[str]:
+    """Capture a compact JPEG from the active Kasm X display and save it locally."""
+    inner = (
+        "export DISPLAY=${DISPLAY:-:1}; "
+        "import -window root png:- 2>/dev/null | "
+        "convert png:- -resize '1280x720>' -quality 70 jpg:- 2>/dev/null | base64 -w0"
+    )
+    stdout, rc = await _ssh(
+        node_ip,
+        f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(inner)}",
+        ssh_user,
+    )
+    if rc != 0 or not stdout:
+        return None
+    try:
+        image = base64.b64decode(stdout, validate=True)
+    except (BinasciiError, ValueError):
+        return None
+    if not image.startswith(b"\xff\xd8\xff") or len(image) > 3_000_000:
+        return None
+
+    os.makedirs(SECURITY_ALERT_DIR, exist_ok=True)
+    filename = f"{alert_id}.jpg"
+    with open(os.path.join(SECURITY_ALERT_DIR, filename), "wb") as f:
+        f.write(image)
+    return filename
+
+
+async def _scan_session_security(session: dict, node: dict) -> Optional[dict]:
+    if not SECURITY_SCAN_ENABLED or not SECURITY_EXTENSIONS:
+        return None
+    session_id = str(session.get("id") or "")
+    if not session_id:
+        return None
+    container = _container_name(session_id)
+    ssh_user = node.get("ssh_user", SSH_USER)
+    stdout, rc = await _ssh(node["ip"], _security_scan_command(container), ssh_user)
+    if rc != 0:
+        return None
+
+    already_seen = {
+        fingerprint
+        for alert in _security_alerts
+        for fingerprint in (alert.get("fingerprints") or [])
+    }
+    files = [item for item in _parse_security_scan(stdout, session_id) if item["fingerprint"] not in already_seen]
+    if not files:
+        return None
+
+    alert_id = uuid.uuid4().hex
+    screenshot = await _capture_container_screenshot(
+        node["ip"], ssh_user, container, alert_id
+    )
+    alert = {
+        "id": alert_id,
+        "created_at": time.time(),
+        "session_id": session_id,
+        "owner": session.get("owner", ""),
+        "project_name": session.get("project_name", ""),
+        "node_id": node.get("id", session.get("node_id", "")),
+        "node_name": node.get("name", node.get("id", "")),
+        "severity": "critical" if any(item["severity"] == "critical" for item in files) else "high",
+        "files": [{k: v for k, v in item.items() if k != "fingerprint"} for item in files],
+        "fingerprints": [item["fingerprint"] for item in files],
+        "screenshot": screenshot,
+        "acknowledged": False,
+    }
+    _store_security_alert(alert)
+    logger.warning(
+        "[security] %s 세션에서 위험 파일 %d개 감지 (owner=%s, node=%s)",
+        session_id,
+        len(files),
+        alert["owner"],
+        alert["node_id"],
+    )
+    return alert
+
+
 async def _write_log():
     os.makedirs(LOG_DIR, exist_ok=True)
     now = datetime.now()
@@ -461,6 +668,19 @@ async def _write_log():
                 r = top3_results[idx]
                 session_top3[s["id"]] = r if isinstance(r, list) else []
                 idx += 1
+
+    # 최근 위험 파일 검사도 세션별로 병렬 수행한다. 실패한 노드는 로그 작성을 막지 않는다.
+    security_alerts: list[dict] = []
+    if SECURITY_SCAN_ENABLED and active_sessions:
+        scan_results = await asyncio.gather(
+            *[
+                _scan_session_security(s, nodes[s["node_id"]])
+                for s in active_sessions
+                if s.get("node_id") in nodes
+            ],
+            return_exceptions=True,
+        )
+        security_alerts = [result for result in scan_results if isinstance(result, dict)]
 
     lines = [f"=== {now.strftime('%Y-%m-%d %H:%M:%S')} ===", ""]
 
@@ -499,6 +719,16 @@ async def _write_log():
             f"  [{s['id']}] {s.get('owner', '?')} @ {s.get('node_id', '?')}"
             f" (저장: {saved})"
         )
+
+    lines.append("")
+    lines.append(f"[보안 경고] 신규 {len(security_alerts)}건")
+    for alert in security_alerts:
+        lines.append(
+            f"  [{alert['session_id']}] {alert.get('owner', '?')} @ {alert.get('node_id', '?')}"
+            f" — 위험 파일 {len(alert.get('files', []))}개"
+        )
+        for item in alert.get("files", []):
+            lines.append(f"    {item.get('path', '?')} ({item.get('reason', '확인 필요')})")
 
     lines.append("")
 
@@ -557,6 +787,7 @@ async def _email_notification_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_security_alerts()
     await _init_sessions_cache()
     poll_task = asyncio.create_task(_poll_nodes_loop())
     log_task = asyncio.create_task(_log_loop())
@@ -1290,6 +1521,10 @@ class EmailPreviewBody(BaseModel):
     event_at: Optional[float] = None
     reason: Optional[str] = None
     actor: Optional[str] = None
+
+
+class SecurityAlertUpdate(BaseModel):
+    acknowledged: bool = True
 
 
 @app.get("/session", dependencies=[Depends(require_key), Depends(require_user)])
@@ -2068,6 +2303,39 @@ async def admin_cleanup(node_id: Optional[str] = Query(None)):
         stdout, rc = await _ssh(n["ip"], _CLEANUP_CMD, n.get("ssh_user", SSH_USER))
         results[n["id"]] = {"removed": stdout.strip(), "ok": rc == 0}
     return {"nodes": results}
+
+
+@app.get("/admin/security-alerts", dependencies=[Depends(require_key)])
+async def get_security_alerts():
+    alerts = [_public_security_alert(alert) for alert in reversed(_security_alerts)]
+    return {
+        "alerts": alerts,
+        "unacknowledged": sum(not alert.get("acknowledged", False) for alert in _security_alerts),
+        "scan_enabled": SECURITY_SCAN_ENABLED,
+        "extensions": list(SECURITY_EXTENSIONS),
+    }
+
+
+@app.patch("/admin/security-alerts/{alert_id}", dependencies=[Depends(require_key)])
+async def update_security_alert(alert_id: str, body: SecurityAlertUpdate):
+    for alert in _security_alerts:
+        if alert.get("id") == alert_id:
+            alert["acknowledged"] = body.acknowledged
+            alert["acknowledged_at"] = time.time() if body.acknowledged else None
+            _persist_security_alerts()
+            return _public_security_alert(alert)
+    raise HTTPException(status_code=404, detail="보안 경고를 찾을 수 없습니다.")
+
+
+@app.get("/admin/security-alerts/{alert_id}/screenshot", dependencies=[Depends(require_key)])
+async def get_security_alert_screenshot(alert_id: str):
+    alert = next((item for item in _security_alerts if item.get("id") == alert_id), None)
+    if not alert or not alert.get("screenshot"):
+        raise HTTPException(status_code=404, detail="스크린샷이 없습니다.")
+    screenshot_path = os.path.join(SECURITY_ALERT_DIR, os.path.basename(alert["screenshot"]))
+    if not os.path.isfile(screenshot_path):
+        raise HTTPException(status_code=404, detail="스크린샷 파일이 없습니다.")
+    return FileResponse(screenshot_path, media_type="image/jpeg", filename=f"security-{alert_id}.jpg")
 
 
 @app.get("/admin/log", dependencies=[Depends(require_key)])
