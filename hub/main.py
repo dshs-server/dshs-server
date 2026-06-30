@@ -1173,6 +1173,24 @@ async def poll_session(
     if x_user_admin != "1" and s.get("owner") != me:
         raise HTTPException(status_code=403, detail="본인 세션만 조회할 수 있습니다.")
 
+    # 이전 중: docker 상태 확인 없이 즉시 반환
+    if s.get("status") == "migrating":
+        src_node_id = s.get("migration_source_node") or s["node_id"]
+        try:
+            src_node = await _get_node(src_node_id)
+        except Exception:
+            src_node = {"name": src_node_id, "gpu": "", "ip": "", "kasm_url": ""}
+        return {
+            "status": "migrating",
+            "message": s.get("migration_msg", "환경 이전 중…"),
+            "project_name": s.get("project_name", ""),
+            "work_type": s.get("work_type", ""),
+            "node_id": src_node_id,
+            "node_name": src_node.get("name", src_node_id),
+            "node_gpu": src_node.get("gpu", ""),
+            "node_ip": src_node.get("ip", ""),
+        }
+
     node = await _get_node(s["node_id"])
     _suser = node.get("ssh_user", SSH_USER)
     dock = await _docker_status(node["ip"], _suser, _container_name(session_id))
@@ -1446,6 +1464,11 @@ class ExtendBody(BaseModel):
     extend_unlocked: Optional[bool] = None
 
 
+class MigrateBody(BaseModel):
+    target_node_id: str
+    duration_days: Optional[int] = 7
+
+
 @app.patch("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])
 async def patch_session(
     session_id: str,
@@ -1524,6 +1547,179 @@ async def patch_session(
         return {"expires_at": new_expires}
 
     raise HTTPException(status_code=400, detail="extend_days 또는 extend_unlocked 중 하나를 제공해야 합니다.")
+
+
+async def _do_migration(
+    session_id: str,
+    s: dict,
+    src_node: dict,
+    tgt_node: dict,
+    duration_days: int,
+    owner: str,
+) -> None:
+    """docker commit → asyncssh 파이프 → docker run 으로 컨테이너를 다른 노드로 이전한다."""
+    src_ip = src_node["ip"]
+    src_user = src_node.get("ssh_user", SSH_USER)
+    tgt_ip = tgt_node["ip"]
+    tgt_user = tgt_node.get("ssh_user", SSH_USER)
+    container = _container_name(session_id)
+    tmp_image = f"dshs-migrate-{session_id}"
+
+    async def _msg(msg: str) -> None:
+        _sc_update(session_id, {"migration_msg": msg})
+
+    async def _fail(reason: str) -> None:
+        logger.error("[migrate] %s 실패: %s", session_id, reason)
+        _sc_update(session_id, {"status": "suspended", "migration_msg": None, "migration_source_node": None})
+        try:
+            await db.collection(COL_SESSIONS).document(session_id).update({"status": "suspended"})
+        except Exception:
+            pass
+        # 소스 임시 이미지 정리
+        await _ssh(src_ip, f"docker rmi {tmp_image} 2>/dev/null || true", src_user)
+
+    try:
+        # 1. 소스 노드에서 컨테이너 커밋
+        await _msg("컨테이너 스냅샷 생성 중…")
+        out, rc = await _ssh(src_ip, f"docker commit {container} {tmp_image}", src_user)
+        if rc != 0:
+            await _fail(f"docker commit 실패: {out}")
+            return
+
+        # 2. asyncssh 이중 연결로 이미지 스트리밍 (소스 → 대상)
+        await _msg("이미지 전송 중… (수 분 소요)")
+        try:
+            async with asyncssh.connect(
+                src_ip, username=src_user, password=SSH_PASSWORD,
+                known_hosts=None, connect_timeout=30,
+            ) as src_conn:
+                async with asyncssh.connect(
+                    tgt_ip, username=tgt_user, password=SSH_PASSWORD,
+                    known_hosts=None, connect_timeout=30,
+                ) as tgt_conn:
+                    tgt_proc = await tgt_conn.create_process("docker load", encoding=None)
+                    async with src_conn.create_process(
+                        f"docker save {tmp_image}", encoding=None
+                    ) as src_proc:
+                        while True:
+                            chunk = await src_proc.stdout.read(65536)
+                            if not chunk:
+                                break
+                            tgt_proc.stdin.write(chunk)
+                            await tgt_proc.stdin.drain()
+                        tgt_proc.stdin.write_eof()
+                    await tgt_proc.wait()
+        except Exception as e:
+            await _fail(f"이미지 전송 오류: {e}")
+            return
+
+        # 3. 대상 노드에서 공유 폴더 생성
+        share_dir = _share_dir(owner, tgt_user)
+        await _ssh(tgt_ip, f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}", tgt_user)
+
+        # 4. 대상 노드 포트 할당
+        await _msg("대상 PC에서 세션 시작 중…")
+        port = await _allocate_port(tgt_node["id"], tgt_ip, tgt_user)
+        ttyd_port = _ttyd_port(port)
+        kasm_url = tgt_node.get("kasm_url", "")
+
+        n_existing = len([x for _, x in _sc_list(status=["active", "starting"]) if x.get("node_id") == tgt_node["id"]])
+        cpu_per, ram_per = _resource_limits_for_node(tgt_node, n_existing + 1)
+        resource_flags = f"--cpus {cpu_per} --memory {ram_per}g " if cpu_per > 0 and ram_per > 0 else ""
+        mount = _mount_arg(owner, tgt_user)
+
+        # 5. docker run (GPU → CPU fallback)
+        cmd = (
+            f"docker run -d --name {container} --restart unless-stopped "
+            f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {mount} "
+            f"-e VNC_PW=test1234 {tmp_image}"
+        )
+        out, rc = await _ssh(tgt_ip, cmd, tgt_user)
+        if rc != 0:
+            await _ssh(tgt_ip, f"docker rm -f {container} 2>/dev/null || true", tgt_user)
+            cmd_no_gpu = (
+                f"docker run -d --name {container} --restart unless-stopped "
+                f"--shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {mount} "
+                f"-e VNC_PW=test1234 {tmp_image}"
+            )
+            out, rc = await _ssh(tgt_ip, cmd_no_gpu, tgt_user)
+            if rc != 0:
+                await _fail(f"docker run 실패: {out}")
+                return
+
+        # 6. nginx 업데이트 (대상 노드)
+        await _nginx_update(tgt_node["id"], tgt_ip, tgt_user, kasm_url)
+
+        # 7. 세션 스토어 업데이트
+        now_ts = time.time()
+        expires_delta = (duration_days * 86400) if duration_days > 0 else 999 * 86400
+        updates = {
+            "status": "starting",
+            "node_id": tgt_node["id"],
+            "port": port,
+            "url": _session_url(session_id, kasm_url),
+            "terminal_url": _terminal_url(session_id, kasm_url),
+            "created_at": now_ts,
+            "expires_at": now_ts + expires_delta,
+            "migration_msg": None,
+            "migration_source_node": None,
+        }
+        _sc_update(session_id, updates)
+        try:
+            await db.collection(COL_SESSIONS).document(session_id).update(updates)
+        except Exception:
+            pass
+
+        # 8. 소스 정리 (컨테이너 + 임시 이미지)
+        await _ssh(src_ip, f"docker rm -f {container} 2>/dev/null || true && docker rmi {tmp_image} 2>/dev/null || true", src_user)
+        await _ssh(tgt_ip, f"docker rmi {tmp_image} 2>/dev/null || true", tgt_user)
+
+        logger.info("[migrate] %s: %s → %s 완료", session_id, src_node["id"], tgt_node["id"])
+
+    except Exception as e:
+        await _fail(str(e))
+
+
+@app.post("/session/{session_id}/migrate", dependencies=[Depends(require_key), Depends(require_user)])
+async def migrate_session(
+    session_id: str,
+    body: MigrateBody,
+    x_user_email: str = Header(""),
+    x_user_admin: str = Header("0"),
+):
+    me = x_user_email.lower()
+    is_admin = x_user_admin == "1"
+
+    s = _sc_get(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+    if not is_admin and s.get("owner") != me:
+        raise HTTPException(status_code=403, detail="본인 세션만 이전할 수 있습니다.")
+    if s.get("status") not in ("suspended",):
+        raise HTTPException(status_code=400, detail="일시 중지된 세션만 이전할 수 있습니다.")
+    if body.target_node_id == s["node_id"]:
+        raise HTTPException(status_code=400, detail="같은 PC입니다. 이어하기를 사용하세요.")
+
+    src_node = await _get_node(s["node_id"])
+    tgt_node = await _get_node(body.target_node_id)
+
+    # 대상 노드 용량 확인
+    tgt_active = [x for _, x in _sc_list(status=["active", "starting"]) if x.get("node_id") == body.target_node_id]
+    if len(tgt_active) >= 2:
+        raise HTTPException(status_code=503, detail="대상 PC가 꽉 찼습니다. 다른 PC를 선택해주세요.")
+
+    duration_days = body.duration_days if body.duration_days is not None else 7
+
+    # migrating으로 마킹 (소스 node_id 보존, migration_source_node 기록)
+    _sc_update(session_id, {
+        "status": "migrating",
+        "migration_source_node": s["node_id"],
+        "migration_msg": "컨테이너 스냅샷 생성 중…",
+    })
+
+    asyncio.create_task(_do_migration(session_id, s, src_node, tgt_node, duration_days, me))
+
+    return {"status": "migrating", "session_id": session_id}
 
 
 @app.delete("/session/{session_id}", dependencies=[Depends(require_key), Depends(require_user)])

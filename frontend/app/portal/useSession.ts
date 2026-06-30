@@ -13,7 +13,8 @@ export type Status =
   | "ready"
   | "busy"
   | "queued"
-  | "error";
+  | "error"
+  | "migrating";
 
 export interface SessionStats {
   cpu_pct?: number;
@@ -32,6 +33,7 @@ export interface SessionStats {
 
 export interface SuspendedSession {
   id: string;
+  node_id?: string;
   project_name?: string;
   saved_at?: number;
   delete_after?: number;
@@ -109,6 +111,7 @@ export function useSession() {
   const [stats, setStats] = useState<SessionStats | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [suspendedSessions, setSuspendedSessions] = useState<SuspendedSession[]>([]);
+  const [migratingMsg, setMigratingMsg] = useState<string | null>(null);
   const [activeMeta, setActiveMeta] = useState<ActiveMeta>({});
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [replaceSessionId, setReplaceSessionId] = useState<string | null>(null);
@@ -178,6 +181,7 @@ export function useSession() {
               const sr = await fetch(`/api/session/${sid}/stats`);
               if (sr.ok) setStats(await sr.json());
             } catch {}
+            setMigratingMsg(null);
             setStatus("ready");
             startStatsPolling(sid);
             toast("데스크톱이 준비되었습니다!", "success");
@@ -186,6 +190,10 @@ export function useSession() {
             setStatus("error");
             clearIntervals();
             toast("세션 준비에 실패했습니다.", "error");
+          } else if (data.status === "migrating") {
+            if (data.message) setMigratingMsg(data.message);
+          } else if (data.status === "starting") {
+            setStatus((prev) => (prev === "migrating" ? "starting" : prev));
           }
         } catch {
           // keep polling
@@ -387,6 +395,39 @@ export function useSession() {
     [toast]
   );
 
+  const handleMigrate = useCallback(
+    async (suspendedId: string, targetNodeId: string, durationDays: number) => {
+      setStatus("migrating");
+      setMigratingMsg("컨테이너 스냅샷 생성 중…");
+      setErrorMsg(null);
+      setUrl(null);
+      elapsedRef.current = 0;
+      setSessionId(suspendedId);
+      expiredRef.current = false;
+      timerRef.current = setInterval(() => { elapsedRef.current += 1; }, 1000);
+
+      try {
+        const res = await fetch(`/api/session/${suspendedId}/migrate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target_node_id: targetNodeId, duration_days: durationDays }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "이전 요청 실패");
+        }
+        setSuspendedSessions((prev) => prev.filter((x) => x.id !== suspendedId));
+        startPolling(suspendedId);
+        toast("환경을 다른 PC로 이전하고 있습니다…", "info");
+      } catch (e) {
+        setStatus("error");
+        setErrorMsg(e instanceof Error ? e.message : "오류 발생");
+        clearIntervals();
+      }
+    },
+    [clearIntervals, startPolling, toast]
+  );
+
   const handleCheckAvailability = useCallback(async () => {
     try {
       const r = await fetch("/api/session");
@@ -577,12 +618,14 @@ export function useSession() {
     setReplaceSessionId,
     handleStartNew,
     handleResume,
+    handleMigrate,
     handleTerminate,
     handleExtend,
     handlePermanentDelete,
     handleCheckAvailability,
     handleLogout,
     extendBlocked,
+    migratingMsg,
   };
 }
 

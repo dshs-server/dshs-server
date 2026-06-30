@@ -105,7 +105,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
         <section className={s.stage}>
           <main className={s.main}>
             {page === "work" && <WorkPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} />}
-            {page === "saved" && <SavedPage ctrl={ctrl} onNavigate={setPage} />}
+            {page === "saved" && <SavedPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} />}
             {page === "history" && <HistoryPage />}
             {page === "guide" && <GuidePage />}
             {page === "admin" && isAdmin && <AdminArea />}

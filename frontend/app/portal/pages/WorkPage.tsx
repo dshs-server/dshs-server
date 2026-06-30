@@ -8,7 +8,7 @@ import type { SessionController, Status, SessionStats } from "../useSession";
 import type { Page } from "../PortalShell";
 import { UploadButton } from "@/components/upload";
 
-type WorkMark = "ready" | "idle" | "starting" | "queued" | "error";
+type WorkMark = "ready" | "idle" | "starting" | "queued" | "error" | "migrating";
 
 const markFor: Record<Status, WorkMark> = {
   checking: "starting",
@@ -18,6 +18,7 @@ const markFor: Record<Status, WorkMark> = {
   busy: "error",
   queued: "queued",
   error: "error",
+  migrating: "migrating",
 };
 
 const markLabel: Record<WorkMark, string> = {
@@ -26,7 +27,9 @@ const markLabel: Record<WorkMark, string> = {
   starting: "준비 중",
   queued: "대기 중",
   error: "연결 오류",
+  migrating: "이전 중",
 };
+
 
 export default function WorkPage({
   ctrl,
@@ -80,6 +83,7 @@ export default function WorkPage({
           )}
           {status === "queued" && <QueuedAssignment ctrl={ctrl} />}
           {status === "busy" && <BusyAssignment ctrl={ctrl} />}
+          {status === "migrating" && <MigratingAssignment message={ctrl.migratingMsg} />}
           {status === "error" && <ErrorAssignment ctrl={ctrl} />}
         </section>
 
@@ -290,6 +294,29 @@ function StartingAssignment({ nodeName }: { nodeName?: string }) {
           </li>
           <li>
             원격 접속 확인 <span>대기</span>
+          </li>
+        </ol>
+      </div>
+    </div>
+  );
+}
+
+function MigratingAssignment({ message }: { message?: string | null }) {
+  return (
+    <div className={s.prepState}>
+      <span className={s.stateCode}>02</span>
+      <div>
+        <h2>다른 PC로 환경을 이전하고 있습니다.</h2>
+        <p>{message || "저장된 환경을 전송하고 있습니다. 수 분이 소요될 수 있습니다."}</p>
+        <ol>
+          <li data-done="true">
+            PC 선택 <span>완료</span>
+          </li>
+          <li data-now="true">
+            환경 이미지 전송 <span>진행 중</span>
+          </li>
+          <li>
+            새 PC에서 시작 <span>대기</span>
           </li>
         </ol>
       </div>
