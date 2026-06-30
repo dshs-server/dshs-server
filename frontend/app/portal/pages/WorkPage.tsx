@@ -111,7 +111,7 @@ function ReadyAssignment({
   nodes: NodeInfo[];
   onTerminate: () => void;
 }) {
-  const { activeMeta, remaining, expiresAt, stats, url, extendBlocked } = ctrl;
+  const { activeMeta, remaining, expiresAt, stats, url, terminalUrl, extendBlocked } = ctrl;
   const timeLevel =
     remaining == null ? "normal" : remaining <= 300 ? "critical" : remaining <= 1800 ? "warning" : "normal";
   const idx = nodes.findIndex((n) => n.id === activeMeta.node_id);
@@ -181,6 +181,16 @@ function ReadyAssignment({
         >
           데스크톱 열기 <span>↗</span>
         </a>
+        {terminalUrl && (
+          <a
+            className={s.lineButton}
+            href={terminalUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            터미널 <span>↗</span>
+          </a>
+        )}
         <span />
         <button className={s.powerButton} aria-label="작업 종료" title="작업 종료" onClick={onTerminate}>
           <PowerIcon />

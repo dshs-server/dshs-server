@@ -96,7 +96,6 @@ export default function RequestSheet({
             <span>작업 신청서</span>
             <h2>새 PC 배정</h2>
           </div>
-          <button onClick={onClose}>닫기</button>
         </header>
 
         <div className={s.formGrid}>

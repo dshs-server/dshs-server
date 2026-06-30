@@ -735,6 +735,12 @@ async def _update_node_container_limits(
 def _session_url(session_id: str, kasm_url: str) -> str:
     return f"{kasm_url.rstrip('/')}/{session_id}/?path={session_id}/websockify"
 
+def _terminal_url(session_id: str, kasm_url: str) -> str:
+    return f"{kasm_url.rstrip('/')}/{session_id}/terminal/"
+
+def _ttyd_port(vnc_port: int) -> int:
+    return vnc_port + 200  # VNC: 8081-8199, ttyd: 8281-8399
+
 async def _allocate_port(node_id: str, node_ip: str, ssh_user: str) -> int:
     used = {s.get("port") for _, s in _sc_list(status=["active", "starting", "suspended"]) if s.get("node_id") == node_id and s.get("port")}
     # 실제 docker 포트도 확인 (Firestore에 없는 orphaned 컨테이너 대비)
@@ -754,6 +760,14 @@ async def _allocate_port(node_id: str, node_ip: str, ssh_user: str) -> int:
     raise HTTPException(503, "노드 포트 부족 — 최대 세션 수 초과")
 
 _NGINX_LOCATION = """\
+    location /{session_id}/terminal/ {{
+        proxy_pass http://localhost:{ttyd_port}/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+    }}
     location /{session_id}/ {{
         proxy_pass https://localhost:{port}/;
         proxy_set_header Authorization "Basic a2FzbV91c2VyOnRlc3QxMjM0";
@@ -769,7 +783,7 @@ _NGINX_LOCATION = """\
 async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str):
     domain = kasm_url.removeprefix("https://").rstrip("/")
     locations = [
-        _NGINX_LOCATION.format(session_id=sid, port=s["port"])
+        _NGINX_LOCATION.format(session_id=sid, port=s["port"], ttyd_port=_ttyd_port(s["port"]))
         for sid, s in _sc_list(status=["active", "starting", "suspended"])
         if s.get("node_id") == node_id and s.get("port")
     ]
@@ -1099,7 +1113,8 @@ async def get_session(
     }
 
     if dock == "running":
-        url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
+        _kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
+        url = _session_url(session_id, _kasm_url)
         orig = s.get("original_created_at") or s.get("created_at", time.time())
         expires = s.get("expires_at", time.time())
         extend_blocked = (not s.get("extend_unlocked", False)) and \
@@ -1108,6 +1123,7 @@ async def get_session(
             "status": "ready",
             "session_id": session_id,
             "url": url,
+            "terminal_url": _terminal_url(session_id, _kasm_url),
             "expires_at": expires,
             "original_created_at": orig,
             "extend_blocked": extend_blocked,
@@ -1171,8 +1187,9 @@ async def poll_session(
     }
 
     if dock == "running":
-        url = _session_url(session_id, node.get("kasm_url", "https://kasm.dshs-app.net"))
-        return {"status": "ready", "url": url, **meta}
+        _kasm_url = node.get("kasm_url", "https://kasm.dshs-app.net")
+        url = _session_url(session_id, _kasm_url)
+        return {"status": "ready", "url": url, "terminal_url": _terminal_url(session_id, _kasm_url), **meta}
     if dock in ("exited", "dead"):
         return {"status": "error", "message": "컨테이너가 예기치 않게 종료되었습니다."}
     return {"status": "starting", **meta}
@@ -1344,6 +1361,7 @@ async def create_session(
     new_id = uuid.uuid4().hex[:8]
     port = await _allocate_port(node_id, node["ip"], _suser)
     container = _container_name(new_id)
+    ttyd_port = _ttyd_port(port)
 
     # 사용자별 공유 폴더 준비 후 컨테이너 바탕화면에 bind-mount → 업로드한 파일이 보임
     share_dir = _share_dir(me, _suser)
@@ -1360,7 +1378,7 @@ async def create_session(
 
     cmd = (
         f"docker run -d --name {container} --restart unless-stopped "
-        f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 {_mount_arg(me, _suser)} "
+        f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {_mount_arg(me, _suser)} "
         f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
     )
     stdout, rc = await _ssh(node["ip"], cmd, _suser)
@@ -1369,7 +1387,7 @@ async def create_session(
         await _ssh(node["ip"], f"docker rm -f {container} 2>/dev/null || true", _suser)
         cmd_no_gpu = (
             f"docker run -d --name {container} --restart unless-stopped "
-            f"--shm-size=2gb {resource_flags}-p {port}:6901 {_mount_arg(me, _suser)} "
+            f"--shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {_mount_arg(me, _suser)} "
             f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
         )
         stdout, rc = await _ssh(node["ip"], cmd_no_gpu, _suser)
@@ -1400,6 +1418,7 @@ async def create_session(
         "resources": (body.resources if body else None) or {},
         "port": port,
         "url": _session_url(new_id, kasm_url),
+        "terminal_url": _terminal_url(new_id, kasm_url),
     }
     _sc_set(new_id, session_data)
     await db.collection(COL_SESSIONS).document(new_id).set(session_data)

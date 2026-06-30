@@ -62,6 +62,7 @@ export interface SessionData {
   status: string;
   session_id?: string;
   url?: string;
+  terminal_url?: string;
   message?: string;
   expires_at?: number;
   owner?: string;
@@ -97,6 +98,7 @@ export function useSession() {
   const [status, setStatus] = useState<Status>("checking");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [url, setUrl] = useState<string | null>(null);
+  const [terminalUrl, setTerminalUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const elapsedRef = useRef(0); // state로 두면 1초마다 전체 리렌더링 유발
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
@@ -169,6 +171,7 @@ export function useSession() {
           applyData(data);
           if (data.status === "ready") {
             setUrl(data.url || null);
+            setTerminalUrl(data.terminal_url || null);
             captureMeta(data);
             if (pollRef.current) clearInterval(pollRef.current);
             try {
@@ -333,6 +336,7 @@ export function useSession() {
       setStatus("idle");
       setSessionId(null);
       setUrl(null);
+      setTerminalUrl(null);
       setExpiresAt(null);
       setRemaining(null);
       setStats(null);
@@ -505,6 +509,7 @@ export function useSession() {
         if (data.status === "ready" && data.url) {
           setSessionId(data.session_id || null);
           setUrl(data.url);
+          setTerminalUrl(data.terminal_url || null);
           captureMeta(data);
           if (data.session_id) {
             try {
@@ -555,6 +560,7 @@ export function useSession() {
     setStatus,
     sessionId,
     url,
+    terminalUrl,
     errorMsg,
     expiresAt,
     remaining,
