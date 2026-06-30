@@ -1000,6 +1000,8 @@ _NGINX_LOCATION = """\
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_buffering off;
         proxy_read_timeout 3600;
         proxy_send_timeout 3600;
     }}
@@ -2524,7 +2526,7 @@ async def upload_ticket(x_user_email: str = Header("")):
     session_id, s = target
     node = await _get_node(s["node_id"])
     container = _container_name(session_id)
-    upload_url = node.get("kasm_url", "")
+    upload_url = "https://hub.dshs-app.net"
 
     exp = int(time.time()) + 300
     payload = f"{me}|{container}|{exp}"

@@ -110,7 +110,7 @@ RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_
     chmod +x /usr/local/bin/ttyd
 
 # supervisord로 ttyd 자동 시작
-RUN printf '[program:ttyd]\ncommand=/usr/local/bin/ttyd -p 7681 bash\nautostart=true\nautorestart=true\nuser=kasm-user\nstdout_logfile=/var/log/ttyd.log\nstderr_logfile=/var/log/ttyd.log\n' \
+RUN printf '[program:ttyd]\ncommand=/usr/local/bin/ttyd -W -p 7681 bash\nautostart=true\nautorestart=true\nuser=kasm-user\nstdout_logfile=/var/log/ttyd.log\nstderr_logfile=/var/log/ttyd.log\n' \
     > /etc/supervisor/conf.d/ttyd.conf
 
 USER 1000
