@@ -249,7 +249,7 @@ function Metric({
 }
 
 function IdleAssignment({ nodes, onRequest }: { nodes: NodeInfo[]; onRequest: () => void }) {
-  const free = nodes.filter((n) => nodeState(n) === "available").length;
+  const free = nodes.filter((n) => { const st = nodeState(n); return st === "available" || st === "partial"; }).length;
   return (
     <div className={s.plainState}>
       <span className={s.stateCode}>00</span>
@@ -342,7 +342,7 @@ function ErrorAssignment({ ctrl }: { ctrl: SessionController }) {
 }
 
 function MachineLedger({ nodes }: { nodes: NodeInfo[] }) {
-  const free = nodes.filter((n) => nodeState(n) === "available").length;
+  const free = nodes.filter((n) => { const st = nodeState(n); return st === "available" || st === "partial"; }).length;
   const stateLabel = (st: "available" | "partial" | "suspended" | "active" | "offline") => {
     if (st === "active") return "사용 중";
     if (st === "offline") return "오프라인";

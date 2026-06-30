@@ -45,7 +45,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
 
   const isAdmin = !!ctrl.me?.isAdmin;
   const onlineCount = nodes.filter((n) => !isOffline(n)).length;
-  const nonOfflineCount = nodes.filter((n) => !isOffline(n)).length;
+  const totalCount = nodes.length;
 
   return (
     <div className={s.root} data-variant="ivory" data-modal={ctrl.showNewSessionModal || undefined}>
@@ -94,7 +94,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
               <i /> 운영 중
             </span>
             <strong>
-              {onlineCount} / {nonOfflineCount || "—"}
+              {onlineCount} / {totalCount || "—"}
             </strong>
             <small>온라인 장비</small>
           </div>
