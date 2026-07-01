@@ -201,6 +201,16 @@ function ReadyAssignment({
         </button>
       </div>
 
+      <div className={s.keyboardHint} role="note" aria-label="한영 전환 안내">
+        <span>한/영 전환</span>
+        <strong>
+          <kbd>Shift</kbd>
+          <i>+</i>
+          <kbd>Space</kbd>
+        </strong>
+        <small>데스크톱 화면을 먼저 클릭하세요</small>
+      </div>
+
       {showExtendRow && !extendBlocked && (
         <div className={s.extendRow}>
           <span>세션 종료 2일 이내 · 3일 연장 가능</span>
