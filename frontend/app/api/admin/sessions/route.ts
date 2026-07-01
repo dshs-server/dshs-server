@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSessionEmail, isAdmin } from "@/lib/auth";
+import { getSessionEmail, isAdminFull } from "@/lib/auth";
 
 const BACKEND_URL = process.env.BACKEND_URL;
 const API_KEY = process.env.API_KEY;
 
 async function adminHeaders() {
   const email = await getSessionEmail();
-  if (!isAdmin(email)) return null;
+  if (!(await isAdminFull(email))) return null;
   return {
     "x-api-key": API_KEY!,
     "x-user-email": email!,
@@ -52,6 +52,32 @@ export async function PATCH(request: NextRequest) {
     if (!res.ok) {
       const detail = typeof data.detail === "string" ? data.detail : null;
       return NextResponse.json({ error: detail || "처리 실패" }, { status: res.status });
+    }
+    return NextResponse.json(data);
+  } catch {
+    return NextResponse.json({ error: "백엔드 연결 실패" }, { status: 503 });
+  }
+}
+
+// 관리자가 특정 세션 강제 종료
+export async function DELETE(request: NextRequest) {
+  const headers = await adminHeaders();
+  if (!headers) return NextResponse.json({ error: "권한 없음" }, { status: 403 });
+  if (!BACKEND_URL) return NextResponse.json({ error: "설정 오류" }, { status: 500 });
+
+  const { searchParams } = new URL(request.url);
+  const sessionId = searchParams.get("session_id");
+  if (!sessionId) return NextResponse.json({ error: "session_id 필요" }, { status: 400 });
+
+  try {
+    const res = await fetch(
+      `${BACKEND_URL}/session/${encodeURIComponent(sessionId)}?permanent=true`,
+      { method: "DELETE", headers }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = typeof data.detail === "string" ? data.detail : null;
+      return NextResponse.json({ error: detail || "종료 실패" }, { status: res.status });
     }
     return NextResponse.json(data);
   } catch {

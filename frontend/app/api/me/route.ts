@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSessionEmail, isAdmin } from "@/lib/auth";
+import { getSessionEmail, isAdminFull } from "@/lib/auth";
 
 export async function GET() {
   const email = await getSessionEmail();
@@ -9,6 +9,6 @@ export async function GET() {
   return NextResponse.json({
     authenticated: true,
     email,
-    isAdmin: isAdmin(email),
+    isAdmin: await isAdminFull(email),
   });
 }

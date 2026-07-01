@@ -32,6 +32,8 @@ interface AdminUser {
   email: string;
   max_sessions: number;
   active_sessions?: number;
+  blocked?: boolean;
+  is_admin?: boolean;
 }
 
 interface AdminSession {
@@ -111,6 +113,7 @@ export default function AdminArea() {
   const [behalfDuration, setBehalfDuration] = useState(7);
   const [behalfNodeId, setBehalfNodeId] = useState("");
   const [adminNodes2, setAdminNodes2] = useState<{ id: string; name?: string }[]>([]);
+  const [terminateUserEmail, setTerminateUserEmail] = useState<string | null>(null);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -316,6 +319,46 @@ export default function AdminArea() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function patchUser(email: string, fields: Partial<Pick<AdminUser, "blocked" | "is_admin">>) {
+    setBusy(true);
+    try {
+      const r = await fetch("/api/admin/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, ...fields }),
+      });
+      if (r.ok) {
+        toast("저장했습니다.", "success");
+        loadUsers();
+      } else toast("저장 실패", "error");
+    } catch {
+      toast("백엔드 연결 실패", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function terminateUserSessions(email: string) {
+    const targets = sessions.filter((se) => se.owner === email && se.status !== "suspended");
+    if (!targets.length) return;
+    setBusy(true);
+    try {
+      await Promise.all(
+        targets.map((se) =>
+          fetch(`/api/admin/sessions?session_id=${encodeURIComponent(se.id)}`, { method: "DELETE" })
+        )
+      );
+      toast(`${email}의 세션 ${targets.length}개를 종료했습니다.`, "success");
+      loadSessions();
+      loadUsers();
+    } catch {
+      toast("종료 실패", "error");
+    } finally {
+      setBusy(false);
+    }
+    setTerminateUserEmail(null);
   }
 
   async function deleteContainer(name: string) {
@@ -585,39 +628,101 @@ export default function AdminArea() {
       )}
 
       {tab === "people" && (
-        <AdminTable title="사용자 관리" headers={["계정", "활성 세션", "최대 허용", ""]}>
-          {users.length === 0 ? (
-            <div className={s.adminRow}>
-              <span>
-                <strong>등록된 사용자가 없습니다.</strong>
-              </span>
-            </div>
-          ) : (
-            users.map((u) => (
-              <div className={s.adminRow} key={u.email}>
+        <>
+          <AdminTable title="사용자 관리" headers={["계정", "활성 세션", "최대 허용", "블랙리스트", "관리자", ""]}>
+            {users.length === 0 ? (
+              <div className={s.adminRow}>
                 <span>
-                  <strong>{u.email}</strong>
+                  <strong>사용자가 없습니다.</strong>
                 </span>
-                <span>{u.active_sessions ?? 0}개</span>
-                <span>
-                  <select
-                    defaultValue={u.max_sessions}
-                    onChange={(e) => updateUserLimit(u.email, Number(e.target.value))}
-                    disabled={busy}
-                  >
-                    {[1, 2, 3, 4, 5].map((v) => (
-                      <option key={v} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                  대
-                </span>
-                <button disabled>—</button>
               </div>
-            ))
+            ) : (
+              users.map((u) => {
+                const activeSessions = sessions.filter(
+                  (se) => se.owner === u.email && se.status !== "suspended"
+                );
+                return (
+                  <div className={s.adminRow} key={u.email}>
+                    <span>
+                      <strong>{u.email}</strong>
+                      {activeSessions.length > 0 && (
+                        <small>
+                          {activeSessions.map((se) => se.node_name || se.node_id).join(", ")}
+                        </small>
+                      )}
+                    </span>
+                    <span>{u.active_sessions ?? 0}개</span>
+                    <span>
+                      <select
+                        defaultValue={u.max_sessions}
+                        onChange={(e) => updateUserLimit(u.email, Number(e.target.value))}
+                        disabled={busy}
+                      >
+                        {[1, 2, 3, 4, 5].map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                      대
+                    </span>
+                    <span>
+                      <button
+                        onClick={() => patchUser(u.email, { blocked: !u.blocked })}
+                        disabled={busy}
+                        style={u.blocked ? { color: "#e53e3e" } : {}}
+                      >
+                        {u.blocked ? "해제" : "차단"}
+                      </button>
+                    </span>
+                    <span>
+                      <button
+                        onClick={() => patchUser(u.email, { is_admin: !u.is_admin })}
+                        disabled={busy}
+                        style={u.is_admin ? { color: "#a78bfa" } : {}}
+                      >
+                        {u.is_admin ? "해제" : "부여"}
+                      </button>
+                    </span>
+                    <button
+                      onClick={() => setTerminateUserEmail(u.email)}
+                      disabled={busy || activeSessions.length === 0}
+                      style={activeSessions.length > 0 ? { color: "#e53e3e" } : {}}
+                    >
+                      {activeSessions.length > 0 ? "종료" : "—"}
+                    </button>
+                  </div>
+                );
+              })
+            )}
+          </AdminTable>
+
+          {terminateUserEmail && (
+            <div className={s.overlay}>
+              <section className={s.uploadSheet} style={{ width: "min(440px, 94vw)" }}>
+                <header>
+                  <div><h2>세션 강제 종료</h2></div>
+                  <button onClick={() => setTerminateUserEmail(null)}>닫기</button>
+                </header>
+                <p style={{ margin: "22px 24px", lineHeight: 1.6 }}>
+                  <strong>{terminateUserEmail}</strong>의 활성 세션을 모두 종료합니다.
+                  저장되지 않은 작업이 손실될 수 있습니다.
+                </p>
+                <footer>
+                  <span style={{ flex: 1 }} />
+                  <button className={s.lineButton} onClick={() => setTerminateUserEmail(null)}>취소</button>
+                  <button
+                    className={s.solidButton}
+                    style={{ color: "#e53e3e" }}
+                    onClick={() => terminateUserSessions(terminateUserEmail)}
+                  >
+                    강제 종료
+                  </button>
+                </footer>
+              </section>
+            </div>
           )}
-        </AdminTable>
+        </>
       )}
 
       {tab === "notice" && (

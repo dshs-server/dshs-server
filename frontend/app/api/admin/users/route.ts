@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
-import { getSessionEmail, isAdmin } from "@/lib/auth";
+import { getSessionEmail, isAdminFull } from "@/lib/auth";
 
 const BACKEND_URL = process.env.BACKEND_URL!;
 const API_KEY = process.env.API_KEY!;
 
 async function guard() {
   const email = await getSessionEmail();
-  return isAdmin(email) ? email : null;
+  return (await isAdminFull(email)) ? email : null;
 }
 
 export async function GET() {
@@ -26,13 +26,17 @@ export async function GET() {
 export async function POST(request: Request) {
   if (!(await guard())) return NextResponse.json({ error: "권한 없음" }, { status: 403 });
   try {
-    const { email: targetEmail, max_sessions } = await request.json();
+    const { email: targetEmail, ...fields } = await request.json();
+    const allowed: Record<string, unknown> = {};
+    if ("max_sessions" in fields) allowed.max_sessions = fields.max_sessions;
+    if ("blocked" in fields) allowed.blocked = fields.blocked;
+    if ("is_admin" in fields) allowed.is_admin = fields.is_admin;
     const res = await fetch(
       `${BACKEND_URL}/admin/users/${encodeURIComponent(targetEmail)}`,
       {
         method: "PATCH",
         headers: { "x-api-key": API_KEY, "Content-Type": "application/json" },
-        body: JSON.stringify({ max_sessions }),
+        body: JSON.stringify(allowed),
       }
     );
     const data = await res.json().catch(() => ({}));

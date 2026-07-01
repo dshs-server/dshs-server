@@ -86,3 +86,17 @@ export function isAdmin(email: string | null): boolean {
     .filter(Boolean);
   return admins.includes(lower);
 }
+
+/** 환경변수 + Firestore is_admin 필드 통합 체크 (서버사이드 전용). */
+export async function isAdminFull(email: string | null): Promise<boolean> {
+  if (!email) return false;
+  if (isAdmin(email)) return true;
+  try {
+    const res = await fetch(
+      `${process.env.BACKEND_URL}/admin/users/${encodeURIComponent(email)}`,
+      { headers: { "x-api-key": process.env.API_KEY! }, cache: "no-store" }
+    );
+    if (res.ok) return (await res.json()).is_admin === true;
+  } catch {}
+  return false;
+}

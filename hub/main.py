@@ -931,9 +931,14 @@ async def _get_node(node_id: str) -> dict:
     return {"id": doc.id, **doc.to_dict()}
 
 
-async def _get_user_max_sessions(email: str) -> int:
+async def _get_user_doc(email: str) -> dict:
     doc = await db.collection(COL_USERS).document(email).get()
-    return doc.to_dict().get("max_sessions", 1) if doc.exists else 1
+    return doc.to_dict() if doc.exists else {}
+
+
+async def _get_user_max_sessions(email: str) -> int:
+    d = await _get_user_doc(email)
+    return d.get("max_sessions", 1)
 
 
 def _count_active_sessions(email: str) -> int:
@@ -1959,8 +1964,11 @@ async def create_session(
     # ── New session ────────────────────────────────────────────────────────────
 
     if not is_admin:
+        user_d = await _get_user_doc(me)
+        if user_d.get("blocked"):
+            raise HTTPException(status_code=403, detail="사용이 제한된 계정입니다.")
         active_count = _count_active_sessions(me)
-        max_s = await _get_user_max_sessions(me)
+        max_s = user_d.get("max_sessions", 1)
         if active_count >= max_s:
             raise HTTPException(status_code=429, detail="이미 활성 PC가 있습니다.")
 
@@ -2703,33 +2711,66 @@ async def admin_nodes():
 
 @app.get("/admin/users", dependencies=[Depends(require_key)])
 async def list_users():
-    users_snap = await db.collection(COL_USERS).get()
-    active_counts: dict[str, int] = {}
-    for _, s in _sc_list(status=["active", "starting"]):
-        owner = s.get("owner", "")
-        active_counts[owner] = active_counts.get(owner, 0) + 1
+    # Firestore quota 초과 방어: 실패 시 in-memory 세션 데이터로 fallback
+    user_docs: dict[str, dict] = {}
+    try:
+        users_snap = await db.collection(COL_USERS).get()
+        user_docs = {doc.id: doc.to_dict() for doc in users_snap}
+    except Exception:
+        pass
 
+    active_counts: dict[str, int] = {}
+    known_owners: set[str] = set()
+    for _, s in _sc_list():
+        owner = s.get("owner", "")
+        if not owner:
+            continue
+        known_owners.add(owner)
+        if s.get("status") in ("active", "starting"):
+            active_counts[owner] = active_counts.get(owner, 0) + 1
+
+    all_emails = sorted(set(user_docs.keys()) | known_owners)
     return {
         "users": [
             {
-                "email": doc.id,
-                "max_sessions": doc.to_dict().get("max_sessions", 1),
-                "active_sessions": active_counts.get(doc.id, 0),
+                "email": email,
+                "max_sessions": user_docs.get(email, {}).get("max_sessions", 1),
+                "active_sessions": active_counts.get(email, 0),
+                "blocked": user_docs.get(email, {}).get("blocked", False),
+                "is_admin": user_docs.get(email, {}).get("is_admin", False),
             }
-            for doc in users_snap
+            for email in all_emails
         ]
+    }
+
+
+@app.get("/admin/users/{email}", dependencies=[Depends(require_key)])
+async def get_user(email: str):
+    try:
+        d = await _get_user_doc(email)
+    except Exception:
+        d = {}
+    return {
+        "email": email,
+        "max_sessions": d.get("max_sessions", 1),
+        "blocked": d.get("blocked", False),
+        "is_admin": d.get("is_admin", False),
     }
 
 
 @app.patch("/admin/users/{email}", dependencies=[Depends(require_key)])
 async def update_user(email: str, body: dict):
-    max_sessions = body.get("max_sessions")
-    if max_sessions is None:
-        raise HTTPException(status_code=400, detail="max_sessions required")
-    await db.collection(COL_USERS).document(email).set(
-        {"max_sessions": int(max_sessions)}, merge=True
-    )
-    return {"email": email, "max_sessions": int(max_sessions)}
+    update: dict = {}
+    if "max_sessions" in body:
+        update["max_sessions"] = int(body["max_sessions"])
+    if "blocked" in body:
+        update["blocked"] = bool(body["blocked"])
+    if "is_admin" in body:
+        update["is_admin"] = bool(body["is_admin"])
+    if not update:
+        raise HTTPException(status_code=400, detail="변경할 필드 없음")
+    await db.collection(COL_USERS).document(email).set(update, merge=True)
+    return {"email": email, **update}
 
 
 # ── Routes: node registry (admin) ─────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSessionEmail, isAdmin } from "@/lib/auth";
+import { getSessionEmail, isAdminFull } from "@/lib/auth";
 
 const BACKEND_URL = process.env.BACKEND_URL;
 const API_KEY = process.env.API_KEY;
@@ -20,7 +20,7 @@ const LOCAL_FALLBACK_NODES = [
 
 export async function GET() {
   const email = await getSessionEmail();
-  if (!isAdmin(email)) return NextResponse.json({ error: "권한 없음" }, { status: 403 });
+  if (!(await isAdminFull(email))) return NextResponse.json({ error: "권한 없음" }, { status: 403 });
 
   if (!BACKEND_URL || !API_KEY) {
     return NextResponse.json({ nodes: LOCAL_FALLBACK_NODES });

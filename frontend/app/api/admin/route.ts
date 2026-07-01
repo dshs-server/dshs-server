@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
-import { getSessionEmail, isAdmin } from "@/lib/auth";
+import { getSessionEmail, isAdminFull } from "@/lib/auth";
 
 const BACKEND_URL = process.env.BACKEND_URL!;
 const API_KEY = process.env.API_KEY!;
 
 async function guard() {
   const email = await getSessionEmail();
-  return isAdmin(email) ? email : null;
+  return (await isAdminFull(email)) ? email : null;
 }
 
 export async function GET() {

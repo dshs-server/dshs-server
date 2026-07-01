@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getApps } from "firebase-admin/app";
 import "@/lib/firebase-admin";
 import { getAuth } from "firebase-admin/auth";
-import { makeToken, isAllowedDomain, COOKIE_NAME } from "@/lib/auth";
+import { makeToken, isAllowedDomain, isAdmin, COOKIE_NAME } from "@/lib/auth";
 
 export async function POST(request: NextRequest) {
   let idToken: string;
@@ -32,7 +32,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "unverified" }, { status: 403 });
   }
 
-  if (!isAllowedDomain(email)) {
+  if (!isAllowedDomain(email) && !isAdmin(email)) {
     return NextResponse.json({ error: "domain" }, { status: 403 });
   }
 
