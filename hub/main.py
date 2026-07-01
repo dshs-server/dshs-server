@@ -81,6 +81,8 @@ SHARED_BASE = os.environ.get("SHARED_BASE", "")
 DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/받은파일")
 # 업로드 토큰 서명 키 — Vercel과 공유. 별도 설정 없으면 API_KEY 재사용.
 UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET", API_KEY)
+# 전용 WiFi 공유기를 통한 LAN 직접 업로드 URL (예: http://192.168.0.1:8001). 미설정 시 Cloudflare 전용.
+HUB_LAN_URL = os.environ.get("HUB_LAN_URL", "").rstrip("/")
 
 GMAIL_CREDENTIALS = os.environ.get("GMAIL_CREDENTIALS", "")
 GMAIL_TOKEN = os.environ.get("GMAIL_TOKEN", "")
@@ -2532,11 +2534,14 @@ async def upload_ticket(x_user_email: str = Header("")):
     upload_url = "https://hub.dshs-app.net"
 
     exp = int(time.time()) + 300
-    payload = f"{me}|{container}|{exp}"
+    payload = f"{me}|{exp}"
     payload_b64 = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
     sig = hmac.new(UPLOAD_SECRET.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
 
-    return {"token": f"{payload_b64}.{sig}", "upload_url": upload_url, "expires_at": exp}
+    result: dict = {"token": f"{payload_b64}.{sig}", "upload_url": upload_url, "expires_at": exp}
+    if HUB_LAN_URL:
+        result["lan_url"] = HUB_LAN_URL
+    return result
 
 
 @app.post("/upload")
