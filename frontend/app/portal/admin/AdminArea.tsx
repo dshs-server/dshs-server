@@ -644,7 +644,37 @@ export default function AdminArea() {
                 return (
                   <div className={s.adminRow} key={u.email}>
                     <span>
-                      <strong>{u.email}</strong>
+                      <strong>
+                        {u.email}
+                        {u.is_admin && (
+                          <span style={{
+                            marginLeft: "6px",
+                            padding: "1px 6px",
+                            background: "rgba(167,139,250,.18)",
+                            border: "1px solid rgba(167,139,250,.4)",
+                            borderRadius: "4px",
+                            color: "#a78bfa",
+                            fontSize: "7px",
+                            fontWeight: 600,
+                            letterSpacing: ".04em",
+                            verticalAlign: "middle",
+                          }}>관리자</span>
+                        )}
+                        {u.blocked && (
+                          <span style={{
+                            marginLeft: "6px",
+                            padding: "1px 6px",
+                            background: "rgba(229,62,62,.13)",
+                            border: "1px solid rgba(229,62,62,.35)",
+                            borderRadius: "4px",
+                            color: "#e53e3e",
+                            fontSize: "7px",
+                            fontWeight: 600,
+                            letterSpacing: ".04em",
+                            verticalAlign: "middle",
+                          }}>차단됨</span>
+                        )}
+                      </strong>
                       {activeSessions.length > 0 && (
                         <small>
                           {activeSessions.map((se) => se.node_name || se.node_id).join(", ")}
@@ -681,7 +711,7 @@ export default function AdminArea() {
                         disabled={busy}
                         style={u.is_admin ? { color: "#a78bfa" } : {}}
                       >
-                        {u.is_admin ? "해제" : "부여"}
+                        {u.is_admin ? "제거" : "부여"}
                       </button>
                     </span>
                     <button

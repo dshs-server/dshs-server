@@ -2883,27 +2883,17 @@ _CLEANUP_CMD = (
 
 @app.get("/admin/sessions", dependencies=[Depends(require_key)])
 async def admin_sessions():
-    snap = await db.collection(COL_SESSIONS).get()
-    node_names: dict[str, str] = {}
+    node_name_map = {n["id"]: n.get("name", n["id"]) for n in _nodes_cache}
     result = []
-    for doc in snap:
-        s = doc.to_dict()
+    for sid, s in _sessions_cache.items():
         nid = s.get("node_id")
-        name = nid
-        if nid:
-            if nid not in node_names:
-                try:
-                    ndoc = await db.collection(COL_NODES).document(nid).get()
-                    node_names[nid] = (ndoc.to_dict() or {}).get("name", nid) if ndoc.exists else nid
-                except Exception:
-                    node_names[nid] = nid
-            name = node_names[nid]
+        name = node_name_map.get(nid, nid) if nid else nid
         orig = s.get("original_created_at") or s.get("created_at", 0)
         expires = s.get("expires_at", 0)
         extend_blocked = (not s.get("extend_unlocked", False)) and \
             ((expires - orig) / 86400 >= 40)
         result.append({
-            "id": doc.id,
+            "id": sid,
             "owner": s.get("owner"),
             "project_name": s.get("project_name"),
             "node_id": nid,
@@ -2913,6 +2903,7 @@ async def admin_sessions():
             "suspended_at": s.get("suspended_at"),
             "original_created_at": orig,
             "extend_blocked": extend_blocked,
+            "extend_unlocked": s.get("extend_unlocked", False),
         })
     order = {"active": 0, "starting": 1, "suspended": 2}
     result.sort(key=lambda r: order.get(r.get("status"), 3))
