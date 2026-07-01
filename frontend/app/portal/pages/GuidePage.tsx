@@ -24,13 +24,6 @@ const RULES: [string, string, string][] = [
   ["04", "보안 확인", "운영 안전을 위해 위험 확장자 파일이 감지되면 파일 정보와 당시 화면이 관리자 보안 경고에 기록될 수 있습니다."],
 ];
 
-const INPUT_GUIDE: [string, string, string][] = [
-  ["01", "화면 먼저 클릭", "원격 데스크톱 안쪽을 한 번 클릭해 키보드 입력이 브라우저가 아닌 원격 PC로 전달되게 합니다."],
-  ["02", "Shift + Space", "Shift 키를 누른 상태에서 Space를 눌러 한글과 영어를 전환합니다. 브라우저 원격 접속에서는 키보드의 한/영 키보다 이 조합이 안정적입니다."],
-  ["03", "전환이 안 될 때", "화면 상단의 키보드·IBus 아이콘에서 ‘Korean - Hangul’을 선택한 뒤 Shift + Space를 다시 누르세요. 아이콘이 없으면 데스크톱을 새로고침합니다."],
-  ["04", "입력 상태 확인", "메모장이나 터미널에 짧게 입력해 현재 언어를 확인하세요. 키 조합이 브라우저에 동작했다면 원격 화면 안쪽을 다시 클릭하고 전환합니다."],
-];
-
 export default function GuidePage() {
   return (
     <div className={s.enter}>
@@ -70,17 +63,16 @@ export default function GuidePage() {
       <div className={s.contactLine}>
         <div className={s.titleLine}>
           <strong>한/영 전환</strong>
-          <HelpTip text="원격 데스크톱에서는 Shift + Space를 사용합니다." />
         </div>
       </div>
-      <section className={s.guideSheet} style={{ marginTop: "14px" }}>
-        {INPUT_GUIDE.map((row) => (
-          <article key={row[0]}>
-            <span>KEY {row[0]}</span>
-            <h2>{row[1]}</h2>
-            <p>{row[2]}</p>
-          </article>
-        ))}
+      <section className={s.keyboardGuide}>
+        <span>원격 화면을 먼저 클릭한 뒤</span>
+        <strong>
+          <kbd>Shift</kbd>
+          <i>+</i>
+          <kbd>Space</kbd>
+        </strong>
+        <p>전환이 안 되면 원격 데스크톱 탭을 새로고침하고 다시 눌러보세요.</p>
       </section>
 
       <div className={s.contactLine}>
