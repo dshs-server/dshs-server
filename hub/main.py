@@ -2096,7 +2096,7 @@ async def create_session(
     cmd = (
         f"docker run -d --name {container} --restart unless-stopped "
         f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {_mount_arg(me, _suser)} "
-        f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
+        f"-e VNC_PW=test1234 -e IDLE_TIMEOUT=0 {KASM_IMAGE}:latest"
     )
     stdout, rc = await _ssh(node["ip"], cmd, _suser)
     if rc != 0:
@@ -2105,7 +2105,7 @@ async def create_session(
         cmd_no_gpu = (
             f"docker run -d --name {container} --restart unless-stopped "
             f"--shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {_mount_arg(me, _suser)} "
-            f"-e VNC_PW=test1234 {KASM_IMAGE}:latest"
+            f"-e VNC_PW=test1234 -e IDLE_TIMEOUT=0 {KASM_IMAGE}:latest"
         )
         stdout, rc = await _ssh(node["ip"], cmd_no_gpu, _suser)
         if rc != 0:
@@ -2343,7 +2343,7 @@ async def _do_migration(
         cmd = (
             f"docker run -d --name {container} --restart unless-stopped "
             f"--gpus all --shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {mount} "
-            f"-e VNC_PW=test1234 {tmp_image}"
+            f"-e VNC_PW=test1234 -e IDLE_TIMEOUT=0 {tmp_image}"
         )
         out, rc = await _ssh(tgt_ip, cmd, tgt_user)
         if rc != 0:
@@ -2351,7 +2351,7 @@ async def _do_migration(
             cmd_no_gpu = (
                 f"docker run -d --name {container} --restart unless-stopped "
                 f"--shm-size=2gb {resource_flags}-p {port}:6901 -p {ttyd_port}:7681 {mount} "
-                f"-e VNC_PW=test1234 {tmp_image}"
+                f"-e VNC_PW=test1234 -e IDLE_TIMEOUT=0 {tmp_image}"
             )
             out, rc = await _ssh(tgt_ip, cmd_no_gpu, tgt_user)
             if rc != 0:
