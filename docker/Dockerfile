@@ -104,6 +104,14 @@ RUN cd /home/kasm-default-profile/Desktop && \
 RUN echo 'kasm-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kasm-user && \
     chmod 440 /etc/sudoers.d/kasm-user
 
+# Desktop 디렉토리를 kasm-user 소유로 미리 생성.
+# bind-mount(-v .../Desktop/받은파일) 시 Docker가 부모인 Desktop을 root:root로 자동 생성하면
+# 컨테이너 startup 스크립트가 Desktop/Uploads 심볼릭 링크 생성에 실패(Permission denied)하고
+# ExitCode=1 재시작 루프에 빠진다. 이미지에 Desktop이 1000:1000으로 존재하면 Docker가 새로
+# 만들지 않으므로 권한이 유지된다.
+RUN mkdir -p /home/kasm-user/Desktop && \
+    chown 1000:1000 /home/kasm-user/Desktop
+
 # ttyd 설치 (브라우저 터미널, port 7681)
 RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
         -o /usr/local/bin/ttyd && \
