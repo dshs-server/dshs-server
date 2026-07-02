@@ -324,6 +324,45 @@ async def _collect_metrics(node_id: str, ip: str, ssh_user: str = SSH_USER) -> d
         return {"offline": True}
 
 
+def _collect_hub_metrics() -> dict:
+    """허브 서버(admin-swai-00) 자체 메트릭 — psutil 없이 /proc 읽기."""
+    m: dict = {}
+    try:
+        with open("/proc/uptime") as f:
+            m["uptime_seconds"] = int(float(f.read().split()[0]))
+    except Exception:
+        pass
+    try:
+        with open("/proc/loadavg") as f:
+            load1 = float(f.read().split()[0])
+        cpu_count = os.cpu_count() or 1
+        m["cpu"] = round(min(100.0, load1 / cpu_count * 100), 1)
+    except Exception:
+        pass
+    try:
+        mem: dict[str, int] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    mem[parts[0].rstrip(":")] = int(parts[1])
+        total_kb = mem.get("MemTotal", 0)
+        avail_kb = mem.get("MemAvailable", 0)
+        m["ram_total_gb"] = round(total_kb / 1024 / 1024, 1)
+        m["ram_used_gb"] = round((total_kb - avail_kb) / 1024 / 1024, 1)
+    except Exception:
+        pass
+    try:
+        st = os.statvfs("/")
+        total_b = st.f_blocks * st.f_frsize
+        free_b = st.f_bfree * st.f_frsize
+        m["storage_total_gb"] = round(total_b / 1e9, 1)
+        m["storage_used_gb"] = round((total_b - free_b) / 1e9, 1)
+    except Exception:
+        pass
+    return m
+
+
 async def _recover_services(node_id: str, node_ip: str, ssh_user: str, metrics: dict) -> None:
     """메트릭에서 감지된 다운 서비스를 SSH로 자동 재시작한다."""
     cmds = []
@@ -2468,12 +2507,16 @@ async def get_history(
     lt = time.localtime(now)
     month_start = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
 
-    act_snap = await db.collection(COL_ACTIVITY).where("owner", "==", me).get()
-    events = sorted(
-        (d.to_dict() for d in act_snap),
-        key=lambda e: e.get("ts", 0),
-        reverse=True,
-    )
+    events: list[dict] = []
+    try:
+        act_snap = await db.collection(COL_ACTIVITY).where("owner", "==", me).limit(200).get()
+        events = sorted(
+            (d.to_dict() for d in act_snap),
+            key=lambda e: e.get("ts", 0),
+            reverse=True,
+        )
+    except Exception:
+        pass
 
     sessions_started = sum(
         1
@@ -2486,11 +2529,9 @@ async def get_history(
         if e.get("type") == "file_upload" and e.get("ts", 0) >= month_start
     )
 
-    # 이번 달에 걸친 세션 활성 구간 합산 (근사치)
-    sess_snap = await db.collection(COL_SESSIONS).where("owner", "==", me).get()
+    # 이번 달 사용 시간: in-memory 캐시에서 계산 (Firestore 추가 읽기 없음)
     usage_seconds = 0
-    for d in sess_snap:
-        s = d.to_dict()
+    for sid, s in _sc_list(owner=me):
         created = s.get("created_at")
         if not isinstance(created, (int, float)):
             continue
@@ -2637,6 +2678,7 @@ async def upload_files(
         raise HTTPException(status_code=502, detail=f"노드 전송 실패: {e}")
 
     if saved:
+        total_bytes = sum(getattr(f, "size", 0) or 0 for f in files)
         await _log_activity(
             email,
             "file_upload",
@@ -2644,6 +2686,7 @@ async def upload_files(
             ", ".join(saved[:3]) + (f" 외 {len(saved) - 3}개" if len(saved) > 3 else ""),
             node_id=target.get("node_id"),
             project_name=target.get("project_name"),
+            byte_count=total_bytes if total_bytes > 0 else None,
         )
 
     return {
@@ -2682,7 +2725,21 @@ async def admin_nodes():
     nodes = await _get_nodes()
     active_by_node = {s.get("node_id"): s for _, s in _sc_list(status=["active", "starting"])}
 
-    result = []
+    # 허브 서버 자체 메트릭을 첫 번째 항목으로 추가
+    hub_m = _collect_hub_metrics()
+    result: list[dict] = [{
+        "id": "hub",
+        "name": "허브 (admin-swai-00)",
+        "status": "idle",
+        "cpu_usage": hub_m.get("cpu", 0),
+        "gpu_usage": 0,
+        "ram_used_gb": hub_m.get("ram_used_gb", 0),
+        "ram_total_gb": hub_m.get("ram_total_gb", 0),
+        "storage_used_gb": hub_m.get("storage_used_gb", 0),
+        "storage_total_gb": hub_m.get("storage_total_gb", 0),
+        "uptime_seconds": hub_m.get("uptime_seconds"),
+    }]
+
     for n in nodes:
         m = _metrics.get(n["id"], {})
 
@@ -2714,7 +2771,7 @@ async def admin_nodes():
 
         result.append(entry)
 
-    return {"nodes": result}
+    return {"nodes": result, "collected_at": time.time()}
 
 
 # ── Routes: admin users ───────────────────────────────────────────────────────
