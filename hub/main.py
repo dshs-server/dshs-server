@@ -78,7 +78,7 @@ REBOOT_VERIFY_TIMEOUT = int(os.environ.get("REBOOT_VERIFY_TIMEOUT", "600"))  # �
 # 비우면 노드별 ssh_user 홈(/home/<ssh_user>/dshs-shared) 아래에 두어 sudo 없이 쓰기 가능.
 SHARED_BASE = os.environ.get("SHARED_BASE", "")
 # 컨테이너 안에서 사용자에게 보이는 경로 (Kasm 기본 사용자 kasm-user의 바탕화면)
-DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/받은파일")
+DESKTOP_SHARE = os.environ.get("DESKTOP_SHARE", "/home/kasm-user/Desktop/받은파일")
 # 업로드 토큰 서명 키 — Vercel과 공유. 별도 설정 없으면 API_KEY 재사용.
 UPLOAD_SECRET = os.environ.get("UPLOAD_SECRET", API_KEY)
 # 전용 WiFi 공유기를 통한 LAN 직접 업로드 URL (예: http://192.168.0.1:8001). 미설정 시 Cloudflare 전용.
@@ -1049,7 +1049,7 @@ async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str
     )
     b64 = base64.b64encode(config.encode()).decode()
     cmd = (
-        f"echo {b64} | base64 -d > /home/{ssh_user}/.nginx-kasm.conf "
+        f"echo {b64} | base64 -d | sudo tee /etc/nginx/sites-available/kasm > /dev/null "
         f"&& sudo nginx -s reload"
     )
     await _ssh(node_ip, cmd, ssh_user)
@@ -2579,8 +2579,15 @@ async def upload_files(
 
     await _ssh(host, f"mkdir -p {shlex.quote(share_dir)} && chmod 777 {shlex.quote(share_dir)}", ssh_user)
     has_mount = await _container_has_share_mount(host, upload_container, ssh_user)
+    container_running_out, _ = await _ssh(
+        host,
+        f"docker inspect -f '{{{{.State.Running}}}}' {upload_container}",
+        ssh_user,
+    )
+    container_running = container_running_out.strip() == "true"
 
     saved: list[str] = []
+    cp_live = False
     try:
         async with asyncssh.connect(
             host,
@@ -2607,21 +2614,25 @@ async def upload_files(
                 await conn.run(f"chmod 666 {shlex.quote(remote)}")
                 saved.append(fname)
 
-            # 마운트 없이 이미 떠 있는 컨테이너에는 docker cp로 즉시 반영
-            if not has_mount:
+            # bind-mount 없이 실행 중인 컨테이너에는 docker cp로 즉시 반영
+            if not has_mount and container_running:
                 await conn.run(
-                    f"docker exec -u root {upload_container} mkdir -p {shlex.quote(DESKTOP_SHARE)}"
+                    f"docker exec -u root {upload_container} mkdir -p {shlex.quote(DESKTOP_SHARE)}",
+                    check=True,
                 )
                 for fname in saved:
                     remote = f"{share_dir}/{fname}"
                     await conn.run(
                         f"docker cp {shlex.quote(remote)} "
-                        f"{upload_container}:{shlex.quote(DESKTOP_SHARE + '/')}"
+                        f"{upload_container}:{shlex.quote(DESKTOP_SHARE + '/')}",
+                        check=True,
                     )
                 await conn.run(
                     f"docker exec -u root {upload_container} "
-                    f"chown -R 1000:1000 {shlex.quote(DESKTOP_SHARE)}"
+                    f"chown -R 1000:1000 {shlex.quote(DESKTOP_SHARE)}",
+                    check=True,
                 )
+                cp_live = True
     except (OSError, asyncssh.Error) as e:
         raise HTTPException(status_code=502, detail=f"노드 전송 실패: {e}")
 
@@ -2639,7 +2650,7 @@ async def upload_files(
         "uploaded": saved,
         "count": len(saved),
         "node": node.get("name", target["node_id"]),
-        "live": has_mount or target.get("status") in ("active", "starting"),
+        "live": has_mount or cp_live,
     }
 
 
