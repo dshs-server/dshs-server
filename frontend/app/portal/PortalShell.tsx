@@ -27,6 +27,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   const { nodes } = useNodes();
   const [page, setPage] = useState<Page>(initialPage);
   const [navWarn, setNavWarn] = useState(false);
+  const [childModalOpen, setChildModalOpen] = useState(false);
 
   const onLogout = () => {
     if (ctrl.status === "starting") setNavWarn(true);
@@ -48,7 +49,7 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
   const totalCount = nodes.length;
 
   return (
-    <div className={s.root} data-variant="ivory" data-modal={ctrl.showNewSessionModal || undefined}>
+    <div className={s.root} data-variant="ivory" data-modal={ctrl.showNewSessionModal || navWarn || childModalOpen || undefined}>
       <div className={s.field} aria-hidden="true">
         <i />
         <i />
@@ -104,8 +105,8 @@ export default function PortalShell({ initialPage = "work" }: { initialPage?: Pa
 
         <section className={s.stage}>
           <main className={s.main}>
-            {page === "work" && <WorkPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} />}
-            {page === "saved" && <SavedPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} />}
+            {page === "work" && <WorkPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} onModalChange={setChildModalOpen} />}
+            {page === "saved" && <SavedPage ctrl={ctrl} nodes={nodes} onNavigate={setPage} onModalChange={setChildModalOpen} />}
             {page === "history" && <HistoryPage />}
             {page === "guide" && <GuidePage />}
             {page === "admin" && isAdmin && <AdminArea />}

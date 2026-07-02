@@ -34,7 +34,8 @@ export function useNodes(pollMs = 8000) {
           const fresh: NodeInfo[] = d.nodes || [];
           // 실제 변경이 있을 때만 state 업데이트 — 폴링마다 새 배열 참조 생성 방지
           const key = JSON.stringify(fresh.map((n) => ({
-            id: n.id, av: n.available, ss: n.session_state, sc: n.session_count, off: n.offline, ld: n.load === null,
+            id: n.id, av: n.available, ss: n.session_state, sc: n.session_count, off: n.offline,
+            cpu: n.load?.cpu_pct ?? null,
           })));
           if (alive && key !== prevKeyRef.current) {
             prevKeyRef.current = key;

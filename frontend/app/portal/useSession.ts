@@ -131,15 +131,18 @@ export function useSession() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const statsRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const queuePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const expiredRef = useRef(false);
 
   const clearIntervals = useCallback(() => {
     if (pollRef.current) clearInterval(pollRef.current);
     if (timerRef.current) clearInterval(timerRef.current);
     if (statsRef.current) clearInterval(statsRef.current);
+    if (queuePollRef.current) clearInterval(queuePollRef.current);
     pollRef.current = null;
     timerRef.current = null;
     statsRef.current = null;
+    queuePollRef.current = null;
   }, []);
 
   const applyData = useCallback((data: SessionData) => {
@@ -488,13 +491,14 @@ export function useSession() {
   // busy/queued 동안 자리 확인 폴링
   useEffect(() => {
     if (status !== "busy" && status !== "queued") return;
-    const iv = setInterval(async () => {
+    queuePollRef.current = setInterval(async () => {
       try {
         const r = await fetch("/api/session");
         const data: SessionData = await r.json();
         applyData(data);
         if (data.status === "your_turn") {
-          clearInterval(iv);
+          if (queuePollRef.current) clearInterval(queuePollRef.current);
+          queuePollRef.current = null;
           toast("이제 사용할 수 있습니다!", "success");
           setStatus("idle");
           setShowNewSessionModal(true);
@@ -504,7 +508,8 @@ export function useSession() {
         } else if (data.status === "busy") {
           setOwner(data.owner || null);
         } else if (data.status === "none" || data.status === "suspended") {
-          clearInterval(iv);
+          if (queuePollRef.current) clearInterval(queuePollRef.current);
+          queuePollRef.current = null;
           if (data.status === "suspended") {
             setSuspendedSessions((prev) =>
               prev.some((s) => s.id === (data.session_id || "default"))
@@ -518,9 +523,11 @@ export function useSession() {
         // keep polling
       }
     }, 5000);
-    return () => clearInterval(iv);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status]);
+    return () => {
+      if (queuePollRef.current) clearInterval(queuePollRef.current);
+      queuePollRef.current = null;
+    };
+  }, [status, applyData, toast]);
 
   // 최초 진입: me / notice / 세션 복원
   useEffect(() => {

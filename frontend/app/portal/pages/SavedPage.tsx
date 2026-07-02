@@ -14,10 +14,12 @@ export default function SavedPage({
   ctrl,
   nodes,
   onNavigate,
+  onModalChange,
 }: {
   ctrl: SessionController;
   nodes: NodeInfo[];
   onNavigate: (p: Page) => void;
+  onModalChange?: (open: boolean) => void;
 }) {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [pendingResumeId, setPendingResumeId] = useState<string | null>(null);
@@ -34,6 +36,12 @@ export default function SavedPage({
     setSelectedMigrateNode(null);
     setPendingResumeNodeId(currentNodeId ?? null);
     setPendingResumeId(id);
+    onModalChange?.(true);
+  }
+
+  function closeResume() {
+    setPendingResumeId(null);
+    onModalChange?.(false);
   }
 
   function confirmResume() {
@@ -43,7 +51,7 @@ export default function SavedPage({
     } else {
       ctrl.handleResume(pendingResumeId, resumeDuration);
     }
-    setPendingResumeId(null);
+    closeResume();
     onNavigate("work");
   }
 
@@ -124,7 +132,7 @@ export default function SavedPage({
                       <button className={s.solidButton} onClick={() => openResume(item.id, item.node_id)}>
                         이어하기
                       </button>
-                      <button className={s.quietButton} onClick={() => setPendingDelete(item.id)}>
+                      <button className={s.quietButton} onClick={() => { setPendingDelete(item.id); onModalChange?.(true); }}>
                         삭제
                       </button>
                     </>
@@ -231,7 +239,7 @@ export default function SavedPage({
             </div>
             <footer>
               <span style={{ flex: 1 }} />
-              <button className={s.lineButton} onClick={() => setPendingResumeId(null)}>취소</button>
+              <button className={s.lineButton} onClick={closeResume}>취소</button>
               <button
                 className={s.solidButton}
                 disabled={!canConfirm}
@@ -250,8 +258,8 @@ export default function SavedPage({
           message="저장된 세션의 모든 파일과 설치된 패키지가 영구 삭제됩니다. 이 작업은 되돌릴 수 없습니다."
           confirmLabel="영구 삭제"
           danger
-          onConfirm={() => { ctrl.handlePermanentDelete(pendingDelete); setPendingDelete(null); }}
-          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => { ctrl.handlePermanentDelete(pendingDelete); setPendingDelete(null); onModalChange?.(false); }}
+          onCancel={() => { setPendingDelete(null); onModalChange?.(false); }}
         />
       )}
     </div>

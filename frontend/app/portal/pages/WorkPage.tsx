@@ -34,13 +34,18 @@ const markLabel: Record<WorkMark, string> = {
 export default function WorkPage({
   ctrl,
   nodes,
+  onModalChange,
 }: {
   ctrl: SessionController;
   nodes: NodeInfo[];
   onNavigate: (p: Page) => void;
+  onModalChange?: (open: boolean) => void;
 }) {
   const { status } = ctrl;
   const [confirmTerminate, setConfirmTerminate] = useState(false);
+
+  const openConfirm = () => { setConfirmTerminate(true); onModalChange?.(true); };
+  const closeConfirm = () => { setConfirmTerminate(false); onModalChange?.(false); };
   const [date, setDate] = useState("");
 
   useEffect(() => {
@@ -75,7 +80,7 @@ export default function WorkPage({
           </div>
 
           {status === "ready" && (
-            <ReadyAssignment ctrl={ctrl} nodes={nodes} onTerminate={() => setConfirmTerminate(true)} />
+            <ReadyAssignment ctrl={ctrl} nodes={nodes} onTerminate={openConfirm} />
           )}
           {status === "idle" && <IdleAssignment nodes={nodes} onRequest={openNew} />}
           {(status === "starting" || status === "checking") && (
@@ -96,10 +101,10 @@ export default function WorkPage({
           message="세션을 종료하시겠습니까? 현재 환경은 보관함에 저장되어 나중에 이어서 사용할 수 있습니다."
           confirmLabel="종료"
           onConfirm={() => {
-            setConfirmTerminate(false);
+            closeConfirm();
             ctrl.handleTerminate(false);
           }}
-          onCancel={() => setConfirmTerminate(false)}
+          onCancel={closeConfirm}
         />
       )}
     </div>
