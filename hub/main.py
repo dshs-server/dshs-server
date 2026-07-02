@@ -466,7 +466,7 @@ async def _poll_nodes_loop():
                                 _sc_update(sid, {"status": "active"})
                                 await db.collection(COL_SESSIONS).document(sid).update({"status": "active"})
 
-                # 서비스 자동 복구 (온라인 노드, RECOVERY_INTERVAL 간격)
+                # 서비스 자동 복구 + nginx 동기화 (온라인 노드, RECOVERY_INTERVAL 간격)
                 now_t = time.time()
                 recovery_tasks = []
                 for node in nodes_to_poll:
@@ -476,6 +476,16 @@ async def _poll_nodes_loop():
                         recovery_tasks.append(
                             _recover_services(node["id"], node["ip"], node.get("ssh_user", SSH_USER), m)
                         )
+                        # 활성 세션 있는 노드는 nginx 라우팅 설정도 재동기화.
+                        # 세션 생성 시 SSH 일시 장애로 nginx 업데이트가 누락된 경우를 복구한다.
+                        if node["id"] in active_node_ids and node.get("kasm_url"):
+                            recovery_tasks.append(
+                                _nginx_update(
+                                    node["id"], node["ip"],
+                                    node.get("ssh_user", SSH_USER),
+                                    node["kasm_url"],
+                                )
+                            )
                 if recovery_tasks:
                     await asyncio.gather(*recovery_tasks, return_exceptions=True)
         except Exception:
@@ -1066,7 +1076,8 @@ _NGINX_LOCATION = """\
         proxy_send_timeout 3600;
     }}"""
 
-async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str):
+async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str) -> bool:
+    """nginx 세션 라우팅 설정을 갱신한다. 실패 시 3회 재시도 후 False 반환."""
     domain = kasm_url.removeprefix("https://").rstrip("/")
     locations = [
         _NGINX_LOCATION.format(session_id=sid, port=s["port"], ttyd_port=_ttyd_port(s["port"]))
@@ -1087,11 +1098,22 @@ async def _nginx_update(node_id: str, node_ip: str, ssh_user: str, kasm_url: str
         f"}}"
     )
     b64 = base64.b64encode(config.encode()).decode()
-    cmd = (
-        f"echo {b64} | base64 -d | sudo tee /etc/nginx/sites-available/kasm > /dev/null "
-        f"&& sudo nginx -s reload"
-    )
-    await _ssh(node_ip, cmd, ssh_user)
+    # conf.d/kasm-sessions.conf → ~/.nginx-kasm.conf symlink 구조를 사용한다.
+    # sites-available/kasm 은 conf.d 보다 나중에 include되어 conflicting server_name으로
+    # nginx에 무시된다. 실제 활성 설정 파일인 ~/.nginx-kasm.conf 를 직접 갱신한다.
+    conf_path = f"/home/{ssh_user}/.nginx-kasm.conf"
+    cmd = f"echo {b64} | base64 -d > {conf_path} && sudo nginx -s reload"
+    for attempt in range(3):
+        stdout, rc = await _ssh(node_ip, cmd, ssh_user)
+        if rc == 0:
+            return True
+        logger.warning(
+            f"[nginx] {node_id} 업데이트 실패 attempt={attempt + 1}/3 rc={rc}: {stdout!r}"
+        )
+        if attempt < 2:
+            await asyncio.sleep(2 ** attempt)
+    logger.error(f"[nginx] {node_id} nginx 업데이트 3회 모두 실패 — poll loop에서 재시도 예정")
+    return False
 
 
 def _node_session_state(node_id: str, sessions: list[dict]) -> str:
