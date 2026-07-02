@@ -2628,6 +2628,7 @@ async def upload_files(
     container_running = container_running_out.strip() == "true"
 
     saved: list[str] = []
+    file_bytes: dict[str, int] = {}
     cp_live = False
     try:
         async with asyncssh.connect(
@@ -2643,17 +2644,20 @@ async def upload_files(
                 proc = await conn.create_process(
                     f"cat > {shlex.quote(remote)}", encoding=None
                 )
+                written = 0
                 while True:
                     chunk = await f.read(4 * 1024 * 1024)
                     if not chunk:
                         break
                     proc.stdin.write(chunk)
+                    written += len(chunk)
                 proc.stdin.write_eof()
                 await proc.wait_closed()
                 if proc.returncode != 0:
                     raise asyncssh.Error(f"파일 쓰기 실패: {fname}")
                 await conn.run(f"chmod 666 {shlex.quote(remote)}")
                 saved.append(fname)
+                file_bytes[fname] = written
 
             # bind-mount 없이 실행 중인 컨테이너에는 docker cp로 즉시 반영
             if not has_mount and container_running:
@@ -2678,7 +2682,7 @@ async def upload_files(
         raise HTTPException(status_code=502, detail=f"노드 전송 실패: {e}")
 
     if saved:
-        total_bytes = sum(getattr(f, "size", 0) or 0 for f in files)
+        total_bytes = sum(file_bytes.values())
         await _log_activity(
             email,
             "file_upload",

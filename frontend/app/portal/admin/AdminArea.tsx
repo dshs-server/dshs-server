@@ -94,6 +94,7 @@ export default function AdminArea() {
   const [tab, setTab] = useState<AdminTab>("status");
   const [status, setStatus] = useState<AdminStatusData | null>(null);
   const [nodes, setNodes] = useState<NodeStatus[]>([]);
+  const [nodesUpdatedAt, setNodesUpdatedAt] = useState<number | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [sessions, setSessions] = useState<AdminSession[]>([]);
   const [containers, setContainers] = useState<StoppedContainer[]>([]);
@@ -124,7 +125,11 @@ export default function AdminArea() {
   const loadNodes = useCallback(async () => {
     try {
       const r = await fetch("/api/admin/nodes");
-      if (r.ok) setNodes((await r.json()).nodes || []);
+      if (r.ok) {
+        const d = await r.json();
+        setNodes(d.nodes || []);
+        if (d.collected_at) setNodesUpdatedAt(d.collected_at);
+      }
     } catch {}
   }, []);
   const loadUsers = useCallback(async () => {
@@ -440,41 +445,54 @@ export default function AdminArea() {
             <section className={s.opsSheet}>
               <div className={s.blockHeading}>
                 <h2>장비 상태</h2>
+                {nodesUpdatedAt && (
+                  <small style={{ color: "var(--faint)", fontSize: "11px", fontWeight: 400 }}>
+                    업데이트 {formatTimeOnly(nodesUpdatedAt)}
+                  </small>
+                )}
               </div>
-              {nodes.map((n, i) => (
-                <div className={s.opsMachine} key={n.id}>
-                  <span>{String(i + 1).padStart(2, "0")}</span>
-                  <div>
-                    <strong>{n.name || n.id}</strong>
-                    <small>{n.top_process || "—"}</small>
-                  </div>
-                  <em data-state={n.status === "idle" ? "available" : n.status === "in_use" ? "busy" : "offline"}>
-                    {n.status === "idle" ? "대기" : n.status === "in_use" ? "사용 중" : "오프라인"}
-                  </em>
-                  <div>
-                    <strong>{n.owner || "—"}</strong>
-                    <small>{n.project_name || "작업 없음"}</small>
-                  </div>
-                  <dl>
-                    <div>
-                      <dt>CPU</dt>
-                      <dd>{(n.cpu_usage ?? 0).toFixed(0)}%</dd>
+              {(() => {
+                let nodeCounter = 0;
+                return nodes.map((n) => {
+                  const isHub = n.id === "hub";
+                  if (!isHub) nodeCounter++;
+                  const label = isHub ? "HUB" : String(nodeCounter).padStart(2, "0");
+                  return (
+                    <div className={s.opsMachine} key={n.id}>
+                      <span style={isHub ? { fontWeight: 700, fontSize: "10px", color: "var(--faint)" } : undefined}>{label}</span>
+                      <div>
+                        <strong>{n.name || n.id}</strong>
+                        <small>{isHub ? "관리 서버" : (n.top_process || "—")}</small>
+                      </div>
+                      <em data-state={isHub ? "available" : n.status === "idle" ? "available" : n.status === "in_use" ? "busy" : "offline"}>
+                        {isHub ? "온라인" : n.status === "idle" ? "대기" : n.status === "in_use" ? "사용 중" : "오프라인"}
+                      </em>
+                      <div>
+                        <strong>{isHub ? "—" : (n.owner || "—")}</strong>
+                        <small>{isHub ? "" : (n.project_name || "작업 없음")}</small>
+                      </div>
+                      <dl>
+                        <div>
+                          <dt>CPU</dt>
+                          <dd>{(n.cpu_usage ?? 0).toFixed(0)}%</dd>
+                        </div>
+                        <div>
+                          <dt>GPU</dt>
+                          <dd>{isHub ? "—" : `${(n.gpu_usage ?? 0).toFixed(0)}%`}</dd>
+                        </div>
+                        <div>
+                          <dt>SSD</dt>
+                          <dd>{n.storage_total_gb ? `${(n.storage_used_gb ?? 0).toFixed(0)}/${Math.round(n.storage_total_gb)}G` : "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>가동</dt>
+                          <dd>{formatUptime(n.uptime_seconds)}</dd>
+                        </div>
+                      </dl>
                     </div>
-                    <div>
-                      <dt>GPU</dt>
-                      <dd>{(n.gpu_usage ?? 0).toFixed(0)}%</dd>
-                    </div>
-                    <div>
-                      <dt>SSD</dt>
-                      <dd>{n.storage_total_gb ? `${(n.storage_used_gb ?? 0).toFixed(0)}/${Math.round(n.storage_total_gb)}G` : "—"}</dd>
-                    </div>
-                    <div>
-                      <dt>가동</dt>
-                      <dd>{formatUptime(n.uptime_seconds)}</dd>
-                    </div>
-                  </dl>
-                </div>
-              ))}
+                  );
+                });
+              })()}
             </section>
             <aside className={s.waitSheet}>
               <h2>대기열</h2>
@@ -1028,6 +1046,10 @@ function sessionStatusLabel(st?: string) {
   if (st === "starting") return "준비 중";
   if (st === "suspended") return "보관됨";
   return st || "—";
+}
+
+function formatTimeOnly(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function formatUptime(seconds?: number): string {
